@@ -720,6 +720,16 @@ class MegatronPolicyWorker:
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if get_rank_safe() == 0:
+            from nemo_rl.utils.nvml import get_free_memory_bytes
+            free_memory_bytes = get_free_memory_bytes(torch.cuda.current_device())
+            memory_allocated_bytes = torch.cuda.memory_allocated(torch.cuda.current_device())
+            memory_reserved_bytes = torch.cuda.memory_reserved(torch.cuda.current_device())
+            print("[megatron_policy_worker] before train")
+            print(f"[megatron_policy_worker] free memory before train: {free_memory_bytes / (1024**2)} MB")
+            print(f"[megatron_policy_worker] memory allocated before train: {memory_allocated_bytes / (1024**2)} MB")
+            print(f"[megatron_policy_worker] memory reserved before train: {memory_reserved_bytes / (1024**2)} MB")
+
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
