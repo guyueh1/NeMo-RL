@@ -108,6 +108,7 @@ from nemo_rl.models.megatron.community_import import import_model_from_hf_name
 from nemo_rl.models.megatron.converters.common import MegatronToHFConverter
 from nemo_rl.models.megatron.refit_utils import (
     gather_params,
+    gather_params_cached_model_state_dict,
     get_local_key_to_global_keys,
     get_param_info,
 )
@@ -1500,14 +1501,19 @@ class MegatronPolicyWorker:
             for dtype, total_size in ipc_buffer_size.items()
         }
 
+        state_dict = self.model.state_dict()
+        named_modules_dict = dict(self.model.named_modules())
+
         for mcore_key, offsets_in_ipc_buffer in zip(
             self.grouped_param_keys[group_idx],
             self.grouped_hf_param_offset_in_ipc_buffer[group_idx],
         ):
-            gathered_megatron_params = gather_params(
+            gathered_megatron_params = gather_params_cached_model_state_dict(
                 self.model,
                 [mcore_key],
                 key_to_global_keys=self.local_key_to_global_keys,
+                state_dict=state_dict,
+                named_modules_dict=named_modules_dict,
             )
             gathered_hf_params = self.megatron_to_hf_converter.convert(
                 gathered_megatron_params, self.model.config

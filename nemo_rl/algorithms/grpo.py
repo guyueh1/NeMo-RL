@@ -434,6 +434,9 @@ def refit_policy_generation(
                 _refit_buffer_size_gb=_refit_buffer_size_gb
             )
             if need_update_from_previous_call:
+                print(
+                    f"[Refit] Prepare for weight update for {len(grouped_param_keys)} groups"
+                )
                 policy_generation.prepare_for_update_weights_from_ipc_handles(
                     policy.prepare_for_get_weight_ipc_handles(grouped_param_keys)
                 )
@@ -445,7 +448,7 @@ def refit_policy_generation(
             for i in range(len(grouped_param_keys)):
                 ipc_handles = policy.get_weights_ipc_handles(i)
                 update_success = policy_generation.update_weights_from_ipc_handles(
-                    i, ipc_handles
+                    ipc_handles, i
                 )
                 if not update_success:
                     break
