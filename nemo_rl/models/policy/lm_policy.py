@@ -460,16 +460,53 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
-        return results[0]
-
+        self.refit_param_info_hf, self.refit_param_info_mcore = results[0]
+        return self.refit_param_info_hf
+    
     def prepare_weights_for_ipc(
         self, _refit_buffer_size_gb: Optional[int] = None
-    ) -> list[list[str]]:
+    ) -> tuple[bool, Optional[list[list[str]]]]:
         """Prepare the weights for IPC.
 
         Returns:
             list: A list containing the keys of the parameters, which is grouped by size.
         """
+        # Get the free memory bytes for refit
+        futures = self.worker_group.run_all_workers_single_data("get_free_memory_bytes_for_refit")
+        results = ray.get(futures)
+        if _refit_buffer_size_gb is not None:
+            total_available_bytes = _refit_buffer_size_gb * (1024**3)
+        else:
+            total_available_bytes = min(result for result in results)
+        
+        if (
+            not hasattr(self, "total_available_bytes") or
+            total_available_bytes < self.total_available_bytes
+        ):
+            self.total_available_bytes = total_available_bytes
+            
+            # Group tensors by size
+            cur_available_bytes = total_available_bytes
+            grouped_param_keys: list[list[str]] = []
+            keys: list[str] = []
+
+            for key, size_in_bytes in self.refit_param_info_mcore:
+                if size_in_bytes > cur_available_bytes:
+                    if keys:
+                        grouped_param_keys.append(keys)
+                        keys = []
+                    cur_available_bytes = total_available_bytes
+
+                keys.append(key)
+                cur_available_bytes -= size_in_bytes
+
+            if keys:
+                grouped_param_keys.append(keys)
+            self.grouped_param_keys = grouped_param_keys
+            return True, grouped_param_keys
+        else:
+            return False, self.grouped_param_keys
+
         # Get the state_dict_info and available memory from all workers
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_weights_for_ipc"
@@ -504,8 +541,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             grouped_param_keys.append(keys)
 
         return grouped_param_keys
-
-    def get_weights_ipc_handles(self, keys: list[str]) -> dict[str, Any]:
+    
+    def prepare_for_get_weight_ipc_handles(self, grouped_param_keys: list[list[str]]) -> dict[str, Any]:
+        """Update the grouped param keys for refit."""
+        futures = self.worker_group.run_all_workers_single_data("prepare_for_get_weight_ipc_handles", grouped_param_keys=grouped_param_keys)
+        results = ray.get(futures)
+        all_results = {}
+        for result in results:
+            all_results.update(result)
+        return all_results
+    
+    def get_weights_ipc_handles(self, group_idx: int) -> dict[str, Any]:
         """Fetch weight IPC handles from all workers.
 
         Returns:
@@ -514,7 +560,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Collect IPC handles from all workers
         worker_handles: list[dict[str, Any]] = ray.get(
             [
-                worker.get_weights_ipc_handles.remote(keys=keys)
+                worker.get_weights_ipc_handles.remote(group_idx=group_idx)
                 for worker in self.worker_group.workers
             ]
         )

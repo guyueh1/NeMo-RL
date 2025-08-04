@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
@@ -233,7 +233,12 @@ class GenerationInterface(ABC):
         """Prepare the info for refit."""
         raise NotImplementedError
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    @abstractmethod
+    def prepare_for_update_weights_from_ipc_handles(self, all_args: dict[str, Any]) -> None:
+        pass
+
+    @abstractmethod
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any], group_idx: Optional[int] = None) -> bool:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
 

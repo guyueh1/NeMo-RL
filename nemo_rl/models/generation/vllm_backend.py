@@ -113,6 +113,14 @@ class VllmInternalWorkerExtension:
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
+    def prepare_for_update_weights_from_ipc_handles(self, all_args: dict[str, Any]) -> None:
+        """Prepare for update weights from ipc handles."""
+        (
+            self.grouped_hf_param_keys, 
+            self.grouped_hf_param_offset_in_ipc_buffer,
+        ) = all_args
+        return True
+
     def update_weights_from_global_ipc_handles(self, global_device_ipc_handles):
         """Update weights from global IPC handles.
 
@@ -126,7 +134,7 @@ class VllmInternalWorkerExtension:
         local_device_ipc_handles = global_device_ipc_handles[device_uuid]
         return self.update_weights_from_local_ipc_handles(local_device_ipc_handles)
 
-    def update_weights_from_local_ipc_handles(self, local_device_ipc_handles):
+    def update_weights_from_local_ipc_handles(self, group_idx, local_device_ipc_handles):
         """Update weights from local IPC handles.
 
         Args:
@@ -135,6 +143,32 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
+
+        hf_param_keys = self.grouped_hf_param_keys[group_idx]
+        hf_param_offset_in_ipc_buffer = self.grouped_hf_param_offset_in_ipc_buffer[group_idx]
+        
+        dtype_to_packed_tensor = {}
+        for dtype, tensor_handle in local_device_ipc_handles:
+            func = rebuild_cuda_tensor
+            args = tensor_handle[0]
+            list_args = list(args)
+            list_args[6] = self.device.index
+            tensor = func(*list_args)
+            dtype_to_packed_tensor[dtype] = tensor
+        
+        weights = []
+        for hf_keys, hf_param_offsets in zip(hf_param_keys, hf_param_offset_in_ipc_buffer):
+            for hf_key, hf_param_offset in zip(hf_keys, hf_param_offsets):
+                shape, dtype, size = self.state_dict_info[hf_key]
+                assert hf_param_offset + size <= dtype_to_packed_tensor[dtype].numel(), (
+                    f"hf_param_offset + size ({hf_param_offset + size}) is greater than the number of elements in the packed tensor ({dtype_to_packed_tensor[dtype].numel()}). "
+                    f"This indicates the keys list order doesn't match the order used when packing tensors."
+                )
+                weight = dtype_to_packed_tensor[dtype][hf_param_offset : hf_param_offset + size].view(*shape)
+                weights.append((hf_key, weight))
+        self.model_runner.model.load_weights(weights=weights)
+        return True
+
         try:
             is_tensor_packed = local_device_ipc_handles[0]
             if is_tensor_packed:

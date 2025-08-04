@@ -52,9 +52,9 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.module import Float16Module
-from megatron.inference.text_generation.mcore_engine_server import (
-    run_mcore_engine,
-)
+# from megatron.inference.text_generation.mcore_engine_server import (
+#     run_mcore_engine,
+# )
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from nemo.tron import fault_tolerance
 from nemo.tron.checkpointing import checkpoint_exists, load_checkpoint, save_checkpoint
@@ -1393,7 +1393,8 @@ class MegatronPolicyWorker:
         )
 
         # Collect tensor metadata for refit
-        refit_param_info_hf = {}
+        self.refit_param_info_hf = {}
+        self.megatron_key_to_hf_keys = {}
         for key, _ in self.refit_param_info_mcore:
             # gather megatron params
             gathered_megatron_params = gather_params(
@@ -1406,14 +1407,16 @@ class MegatronPolicyWorker:
                 gathered_megatron_params, self.model.config
             )
             # collect tensor metadata
+            hf_keys = list(gathered_hf_params.keys())
+            self.megatron_key_to_hf_keys[key] = hf_keys
             for name, tensor in gathered_hf_params.items():
-                refit_param_info_hf[name] = (
+                self.refit_param_info_hf[name] = (
                     tensor.shape,
                     tensor.dtype,
                     tensor.numel(),
                 )
 
-        return refit_param_info_hf
+        return self.refit_param_info_hf, self.refit_param_info_mcore
 
     def prepare_weights_for_ipc(self) -> tuple[list[tuple[str, int]], float]:
         """Prepare Megatron model weights for IPC transfer to vLLM.
@@ -1421,9 +1424,11 @@ class MegatronPolicyWorker:
         Collects information about weight tensors (names and sizes).
         Returns a list of (parameter_name, size_in_bytes) tuples.
         """
-        from nemo_rl.utils.nvml import get_free_memory_bytes
+        return self.refit_param_info_mcore, self.get_free_memory_bytes_for_refit()
 
-        # Collect current available memory for refit
+    def get_free_memory_bytes_for_refit(self) -> float:
+        """Get the free memory bytes of the current device."""
+        from nemo_rl.utils.nvml import get_free_memory_bytes
         ## Get current device index from torch
         device_idx = torch.cuda.current_device()
         ## Get device free memory using NVML
@@ -1431,12 +1436,47 @@ class MegatronPolicyWorker:
         ## default to 20% to get some more speedup than 10%, OOM if set to 30%
         memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
         total_available_bytes *= float(memory_ratio)
+        return total_available_bytes
+    
+    def prepare_for_get_weight_ipc_handles(self, grouped_param_keys: list[list[str]]) -> None:
+        """Update the grouped param keys for refit."""
 
-        return self.refit_param_info_mcore, total_available_bytes
+        self.grouped_param_keys = grouped_param_keys
+        grouped_hf_param_keys = []
+        self.grouped_hf_param_offset_in_ipc_buffer = []
+        self.grouped_ipc_buffer_sizes = []
+        for group in grouped_param_keys:
+            hf_param_keys = []
+            fake_type_to_total_size = defaultdict(lambda: 0)
+            hf_key_to_offset_in_ipc_buffer = []
+            for mcore_key in group:
+                hf_keys = self.megatron_key_to_hf_keys[mcore_key]
+                hf_param_keys.append(hf_keys)
+
+                offsets = []
+                for hf_key in hf_keys:
+                    _, dtype, numel = self.refit_param_info_hf[hf_key]
+                    offsets.append(fake_type_to_total_size[dtype])
+                    fake_type_to_total_size[dtype] += numel
+                hf_key_to_offset_in_ipc_buffer.append(offsets)
+
+            grouped_hf_param_keys.append(hf_param_keys)
+
+            self.grouped_hf_param_offset_in_ipc_buffer.append(hf_key_to_offset_in_ipc_buffer)
+
+            self.grouped_ipc_buffer_sizes.append(fake_type_to_total_size)
+        
+        return {
+            self.report_device_id(): (
+                grouped_hf_param_keys,
+                self.grouped_hf_param_offset_in_ipc_buffer,
+            )
+        }
+
 
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
-    def get_weights_ipc_handles(self, *, keys: list[str]) -> dict[str, Any]:
+    def get_weights_ipc_handles(self, *, group_idx: int) -> dict[str, Any]:
         """Get IPC handles for the requested Megatron model weights.
 
         Args:
@@ -1447,6 +1487,47 @@ class MegatronPolicyWorker:
         if self._held_gather_buffer is not None:
             del self._held_gather_buffer
             self._held_gather_buffer = None
+        
+        # prepare ipc buffers
+        ipc_buffer_size = self.grouped_ipc_buffer_sizes[group_idx]
+        packed_tensors = {
+            dtype: torch.empty(
+                total_size,
+                device=torch.cuda.current_device(),
+                dtype=dtype,
+                requires_grad=False,
+            )
+            for dtype, total_size in ipc_buffer_size.items()
+        }
+
+        for mcore_key, offsets_in_ipc_buffer in zip(
+            self.grouped_param_keys[group_idx],
+            self.grouped_hf_param_offset_in_ipc_buffer[group_idx],
+        ):
+            gathered_megatron_params = gather_params(
+                self.model,
+                [mcore_key],
+                key_to_global_keys=self.local_key_to_global_keys,
+            )
+            gathered_hf_params = self.megatron_to_hf_converter.convert(
+                gathered_megatron_params, self.model.config
+            )
+            assert len(gathered_hf_params) == len(offsets_in_ipc_buffer)
+            for i, (k, tensor) in enumerate(gathered_hf_params.items()):
+                _, dtype, numel = self.refit_param_info_hf[k]
+                packed_tensors[dtype][offsets_in_ipc_buffer[i] : offsets_in_ipc_buffer[i] + numel].copy_(tensor.detach().view(-1))
+            
+        # Create IPC handles for consolidated tensors
+        all_handles = [
+            (dtype, get_handle_from_tensor(tensor))
+            for dtype, tensor in packed_tensors.items()
+        ]
+
+        self._held_gather_buffer = packed_tensors
+
+        return {
+            self.report_device_id(): all_handles
+        }
 
         gathered_megatron_params = gather_params(
             self.model,

@@ -1028,8 +1028,58 @@ class VllmGenerationWorker:
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+    
+    def prepare_for_update_weights_from_ipc_handles(self, all_args: dict[str, Any]) -> None:
+        try:
+            assert self.llm is not None, (
+                "Attempting to prepare for get weight ipc handles with either an uninitialized vLLM or non-model-owner"
+            )
+            
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "prepare_for_update_weights_from_ipc_handles cannot be used with async_engine=True. Use prepare_for_update_weights_from_ipc_handles_async instead."
+                )
+            
+            if self.tensor_parallel_size == 1:
+                # UniProcExecutor
+                assert len(self.vllm_device_ids) == 1
+                result_or_coro = self.llm.collective_rpc(
+                    "prepare_for_update_weights_from_ipc_handles", args=(all_args[self.vllm_device_ids[0]],)
+                )
+            else:
+                """
+                DO NOT USE VLLM's collective_rpc: This code causes duplicate IPC data transfer across Ray workers,
+                leading to unnecessary network serialization overhead and potential performance degradation.
+                """
+                ray_worker_outputs = []
+                for worker, device_id in zip(self.llm.llm_engine.model_executor.workers, self.vllm_device_ids):
+                    ray_worker_outputs.append(
+                        worker.execute_method.remote(
+                            "prepare_for_update_weights_from_ipc_handles",
+                            all_args[device_id],
+                        )
+                    )
+                result_or_coro = ray.get(ray_worker_outputs)
+            
+            worker_result = result_or_coro[0]
+            
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to prepare for prepare for get weight ipc handles. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for prepare_for_update_weights_from_ipc_handles: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    async def prepare_for_update_weights_from_ipc_handles_async(self, all_args: dict[str, Any]) -> bool:
+        """Async version of prepare_for_update_weights_from_ipc_handles."""
+        raise NotImplementedError("Async version of prepare_for_update_weights_from_ipc_handles is not implemented.")
+    
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any], group_idx: Optional[int] = None) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
         Args:
@@ -1053,7 +1103,7 @@ class VllmGenerationWorker:
                 assert len(self.vllm_device_ids) == 1
                 result_or_coro = self.llm.collective_rpc(
                     "update_weights_from_local_ipc_handles",
-                    args=(ipc_handles[self.vllm_device_ids[0]],),
+                    args=(ipc_handles[self.vllm_device_ids[0]], group_idx),
                 )
             else:
                 """
@@ -1073,6 +1123,7 @@ class VllmGenerationWorker:
                         worker.execute_method.remote(
                             "update_weights_from_local_ipc_handles",
                             ipc_handles[device_id],
+                            group_idx,
                         )
                     )
 
@@ -1935,7 +1986,38 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         ray.get(futures)
 
-    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+    def prepare_for_update_weights_from_ipc_handles(self, all_args: dict[str, Any]) -> None:
+        """Update the weights info for IPC."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        
+        method_name = (
+            "prepare_for_update_weights_from_ipc_handles_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "prepare_for_update_weights_from_ipc_handles"
+        )
+
+        args_list = []
+        for worker_device_uuids in self.device_uuids:
+            worker_args = {
+                device_uuid: all_args[device_uuid]
+                for device_uuid in worker_device_uuids
+            }
+            args_list.append(worker_args)
+        
+        try:
+            futures = self.worker_group.run_all_workers_multiple_data(
+                method_name,
+                all_args=args_list,
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            )
+            results = ray.get(futures)
+            return all(result for result in results if result is not None)
+        except Exception as e:
+            print(f"Error during prepare for update weights from ipc handles: {e}")
+            return False
+
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any], group_idx: Optional[int] = None) -> bool:
         """Update weights of the policy using IPC handles, considering tensor parallelism.
 
         For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
@@ -1970,6 +2052,7 @@ class VllmGeneration(GenerationInterface):
             futures = self.worker_group.run_all_workers_multiple_data(
                 method_name,
                 ipc_handles=ipc_handles_list,
+                common_kwargs={"group_idx": group_idx},
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
             )
             # Wait for all futures to complete

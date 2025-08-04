@@ -427,18 +427,25 @@ def refit_policy_generation(
         update_success = False
         if colocated_inference:
             # get model param keys, which is grouped by size
-            grouped_param_keys = policy.prepare_weights_for_ipc(
+            (
+                need_update_from_previous_call, 
+                grouped_param_keys,
+            ) = policy.prepare_weights_for_ipc(
                 _refit_buffer_size_gb=_refit_buffer_size_gb
             )
+            if need_update_from_previous_call:
+                policy_generation.prepare_for_update_weights_from_ipc_handles(
+                    policy.prepare_for_get_weight_ipc_handles(grouped_param_keys)
+                )
             total_num_keys = sum(len(k) for k in grouped_param_keys)
             print(
                 f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
             )
             # do update
-            for keys in grouped_param_keys:
-                ipc_handles = policy.get_weights_ipc_handles(keys)
+            for i in range(len(grouped_param_keys)):
+                ipc_handles = policy.get_weights_ipc_handles(i)
                 update_success = policy_generation.update_weights_from_ipc_handles(
-                    ipc_handles
+                    i, ipc_handles
                 )
                 if not update_success:
                     break
@@ -553,7 +560,7 @@ def grpo_train(
             with timer.time("prepare_for_generation"):
                 if NEED_REFIT and POLICY_GENERATION_STALE:
                     refit_policy_generation(
-                        policy, policy_generation, colocated_inference, timer=timer
+                        policy, policy_generation, colocated_inference, master_config['policy'].get('refit_buffer_size_gb', None), timer=timer
                     )
                     POLICY_GENERATION_STALE = False
                 else:
@@ -686,7 +693,7 @@ def grpo_train(
             if val_period > 0 and (step + 1) % val_period == 0:
                 if NEED_REFIT and POLICY_GENERATION_STALE:
                     refit_policy_generation(
-                        policy, policy_generation, colocated_inference
+                        policy, policy_generation, colocated_inference, master_config['policy'].get('refit_buffer_size_gb', None)
                     )
                     POLICY_GENERATION_STALE = False
                 else:
