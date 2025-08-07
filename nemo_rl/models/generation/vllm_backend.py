@@ -134,7 +134,7 @@ class VllmInternalWorkerExtension:
         local_device_ipc_handles = global_device_ipc_handles[device_uuid]
         return self.update_weights_from_local_ipc_handles(local_device_ipc_handles)
 
-    def update_weights_from_local_ipc_handles(self, group_idx, local_device_ipc_handles):
+    def update_weights_from_local_ipc_handles(self, local_device_ipc_handles, group_idx):
         """Update weights from local IPC handles.
 
         Args:
