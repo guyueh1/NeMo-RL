@@ -426,22 +426,8 @@ def refit_policy_generation(
         # update weights
         update_success = False
         if colocated_inference:
-            # get model param keys, which is grouped by size
-            grouped_param_keys = policy.prepare_weights_for_ipc(
-                _refit_buffer_size_gb=_refit_buffer_size_gb
-            )
-            total_num_keys = sum(len(k) for k in grouped_param_keys)
-            print(
-                f"[Refit] Split {total_num_keys} keys into {len(grouped_param_keys)} groups"
-            )
-            # do update
-            for keys in grouped_param_keys:
-                ipc_handles = policy.get_weights_ipc_handles(keys)
-                update_success = policy_generation.update_weights_from_ipc_handles(
-                    ipc_handles
-                )
-                if not update_success:
-                    break
+            ipc_handles = policy_generation.get_weight_ipc_handles()
+            update_success = policy.update_weights_from_ipc_handles(ipc_handles)
         else:
             # update weights through nccl
             futures_train = policy.broadcast_weights_for_collective()

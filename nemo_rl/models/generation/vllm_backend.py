@@ -14,6 +14,7 @@
 import os
 from collections import defaultdict
 from typing import Any, Iterable, Optional
+from nemo_rl.models.policy.utils import get_handle_from_tensor
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
@@ -92,6 +93,10 @@ class VllmInternalWorkerExtension:
         self.model_update_group = PyNcclCommunicator(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             pg, device=self.device
         )
+
+    def set_tp_rank(self, tp_rank: int) -> None:
+        print(f"VllmInternalWorkerExtension Set TP rank to {tp_rank}")
+        self.tp_rank = tp_rank
 
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid
@@ -221,3 +226,24 @@ class VllmInternalWorkerExtension:
             return False
 
         return True
+
+    def get_weight_ipc_handles(self) -> dict[str, Any]:
+        """Get the IPC handles of the policy."""
+        param_dict = dict(self.model_runner.model.named_parameters())
+        ipc_handles = {}
+        for name, param in param_dict.items():
+            if param.data.device == torch.cuda.current_device():
+                if 'qkv_proj' in name:
+                    q, k, v = param.chunk(3, dim=-1)
+                    ipc_handles[name.replace('qkv_proj', 'q_proj')] = get_handle_from_tensor(q)
+                    ipc_handles[name.replace('qkv_proj', 'k_proj')] = get_handle_from_tensor(k)
+                    ipc_handles[name.replace('qkv_proj', 'v_proj')] = get_handle_from_tensor(v)
+                elif 'gate_up_proj' in name:
+                    gate, up = param.chunk(2, dim=-1)
+                    ipc_handles[name.replace('gate_up_proj', 'gate_proj')] = get_handle_from_tensor(gate)
+                    ipc_handles[name.replace('gate_up_proj', 'up_proj')] = get_handle_from_tensor(up)
+                else:
+                    ipc_handles[name] = get_handle_from_tensor(param.data)
+        return {
+            self.report_device_id(): (ipc_handles, self.tp_rank) # TODO pass tp rank
+        }

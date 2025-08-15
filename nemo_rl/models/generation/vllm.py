@@ -359,6 +359,12 @@ class VllmGenerationWorker:
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
+    def set_tp_ranks(self, tp_size, pp_size) -> None:
+        ray.get([
+            worker.execute_method.remote("set_tp_rank", (i % tp_size))
+            for i, worker in enumerate(self.llm.llm_engine.model_executor.workers)
+        ])
+
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int
     ) -> None:
@@ -1206,6 +1212,65 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
+    def get_weight_ipc_handles(self) -> dict[str, Any]:
+        """Get the IPC handles of the policy."""
+        try: 
+            assert self.llm is not None, (
+                "Attempting to get weight ipc handles with either an uninitialized vLLM or non-model-owner"
+            )
+            
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "get_weight_ipc_handles can only be used with async_engine=False. Use get_weight_ipc_handles_async instead."
+                )
+                
+            result_or_coro = self.llm.collective_rpc(
+                "get_weight_ipc_handles", args=tuple()
+            )
+
+            all_results = dict()
+            for result in result_or_coro:
+                all_results.update(result)
+            
+            return all_results
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight ipc handles: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
+    async def get_weight_ipc_handles_async(self) -> dict[str, Any]:
+        """Async version of get_weight_ipc_handles."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to get weight ipc handles with either an uninitialized vLLM or non-model-owner"
+            )
+            
+            if not self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "get_weight_ipc_handles_async can only be used with async_engine=True. Use get_weight_ipc_handles instead."
+                )
+                
+            result_or_coro = await self.llm.collective_rpc(
+                "get_weight_ipc_handles", args=tuple()
+            )
+            
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+            
+            all_results = dict()
+            for result in worker_results:
+                all_results.update(result)
+            
+            return all_results
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight ipc handles: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
         assert self.llm is not None, (
@@ -1415,6 +1480,20 @@ class VllmGeneration(GenerationInterface):
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
+
+        # set tp ranks
+        self.set_tp_ranks()
+
+    def set_tp_ranks(self) -> None:
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "set_tp_ranks",
+                run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                tp_size=self.sharding_annotations.get_axis_size("tensor_parallel"),
+                pp_size=self.sharding_annotations.get_axis_size("pipeline_parallel"),
+            )
+        )
+
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -1999,6 +2078,31 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
+    
+    def get_weight_ipc_handles(self) -> dict[str, Any]:
+        """Get the IPC handles of the policy."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "get_weight_ipc_handles_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "get_weight_ipc_handles"
+        )
+        
+        # Use run_all_workers_single_data to get the IPC handles
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        
+        # Wait for all futures to complete
+        results = ray.get(futures)
+        all_results = dict()
+        for result in results:
+            all_results.update(result)
+        return all_results
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

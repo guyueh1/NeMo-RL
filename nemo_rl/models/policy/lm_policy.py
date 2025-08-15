@@ -168,6 +168,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             self.use_sequence_packing = False
 
         self.cfg = config
+        self.worker_device_ids = None
+        self.worker_device_ids = self.get_device_ids()
 
     def init_collective(
         self, ip: str, port: int, world_size: int
@@ -525,6 +527,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             all_handles.update(handle)
 
         return all_handles
+
+    def get_device_ids(self) -> list[str]:
+        """Get the device IDs of the workers."""
+        futures = self.worker_group.run_all_workers_single_data("report_device_id")
+        results = ray.get(futures)
+        return results
+
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
+        """Update the weights from IPC handles."""
+        worker_handles = ray.get(
+            [
+                worker.update_weights_from_ipc_handles.remote(ipc_handles=ipc_handles[device_uuid])
+                for worker, device_uuid in zip(self.worker_group.workers, self.worker_device_ids)
+            ]
+        )
+        return all(worker_handles)
 
     def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""

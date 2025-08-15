@@ -110,6 +110,7 @@ from nemo_rl.models.megatron.refit_utils import (
     gather_params,
     get_local_key_to_global_keys,
     get_param_info,
+    get_tp_dim,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -124,6 +125,8 @@ from nemo_rl.models.policy.utils import (
     get_megatron_checkpoint_dir,
     get_runtime_env_for_policy_worker,
 )
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
+import re
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -1523,6 +1526,110 @@ class MegatronPolicyWorker:
             serialized = (False, all_handles)
 
         return {device_uuid: serialized}
+
+    def update_weights_from_ipc_handles(self, *, ipc_handles: tuple[dict[str, Any], int]) -> bool:
+        """Update the weights from IPC handles."""
+        ipc_handles, tp_rank = ipc_handles
+        print(f"[megatron_policy_worker rank {get_rank_safe()}] Updating {len(ipc_handles)} weights from IPC handles")
+        hf_param_dict = dict()
+        for name, (handle, preprocess_fn) in ipc_handles.items():
+            func = rebuild_cuda_tensor
+            args = handle[0]
+            list_args = list(args)
+            list_args[6] = torch.cuda.current_device()
+            tensor = func(*list_args)
+            hf_param_dict[name] = (tensor, preprocess_fn)            
+        
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_world_size = torch.distributed.get_world_size(tp_group)
+        etp_group = parallel_state.get_expert_tensor_parallel_group()
+        etp_world_size = torch.distributed.get_world_size(etp_group)
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        pp_world_size = torch.distributed.get_world_size(pp_group)
+        pp_global_ranks = torch.distributed.get_process_group_ranks(group=pp_group)
+        pp_local_rank_id = parallel_state.get_pipeline_model_parallel_rank()
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        ep_world_size = torch.distributed.get_world_size(ep_group)
+        
+        named_modules_dict = dict(self.model.named_modules())
+        state_dict = self.model.state_dict()
+        ep_pattern = re.compile(r"mlp\.experts.*\.weight\d*$")
+
+        for key, _ in self.refit_param_info_mcore:
+            local_key, owner_pp_local_rank_id, shape, dtype = key
+            if local_key in state_dict and owner_pp_local_rank_id == pp_local_rank_id:
+                param = state_dict[local_key]
+                tp_dim = get_tp_dim(self.model, local_key, named_modules_dict)
+                if tp_dim is not None:
+                    if ep_pattern.search(local_key):
+                        world_size = etp_world_size
+                        group = etp_group
+                    else:
+                        world_size = tp_world_size
+                        group = tp_group
+
+                    gathered_slices = [torch.empty_like(param) for _ in range(world_size)]
+                    torch.distributed.all_gather(gathered_slices, param, group=group)
+                    full_param = torch.cat(gathered_slices, dim=tp_dim)
+                else:
+                    full_param = param
+            else:
+                full_param = torch.empty(
+                    *shape, dtype=dtype, device=torch.cuda.current_device()
+                )
+
+            src_global_rank = pp_global_ranks[owner_pp_local_rank_id]
+            torch.distributed.broadcast(full_param, src=src_global_rank, group=pp_group)
+            pp_gathered_params = [full_param]
+
+            if ep_pattern.search(local_key):
+                stacked_pp_gathered_params = torch.stack(pp_gathered_params)
+                ep_gathered_params = [
+                    torch.empty(
+                        stacked_pp_gathered_params.shape, dtype=dtype, device=torch.cuda.current_device()
+                    )
+                    for _ in range(ep_world_size)
+                ]
+                torch.distributed.all_gather(
+                    ep_gathered_params, stacked_pp_gathered_params, group=ep_group
+                )
+                flat_gathered_params = [
+                    x for y in ep_gathered_params for x in torch.unbind(y)
+                ]
+            else:
+                flat_gathered_params = pp_gathered_params
+
+            flat_gathered_global_keys = self.local_key_to_global_keys[
+                (local_key, owner_pp_local_rank_id)
+            ]
+            gathered_megatron_params = {}
+            for k, p in zip(flat_gathered_global_keys, flat_gathered_params):
+                if k is not None:
+                    gathered_megatron_params[k] = p
+            
+            gathered_hf_params = self.megatron_to_hf_converter.convert(
+                gathered_megatron_params, self.model.config
+            )
+
+            for name, tensor in gathered_hf_params.items():
+                if name in hf_param_dict:
+                    target_tensor = hf_param_dict[name]
+                    assert target_tensor.dtype == tensor.dtype, f"dtype mismatch: {target_tensor.dtype} != {tensor.dtype}"
+                    assert target_tensor.device == tensor.device, f"device mismatch: {target_tensor.device} != {tensor.device}"
+                    if target_tensor.shape == tensor.shape:
+                        target_tensor.copy_(tensor)
+                    else:
+                        assert len(target_tensor.shape) == len(tensor.shape), f"Tensor dimension mismatch: {len(target_tensor.shape)} != {len(tensor.shape)}"
+                        mismatch = [ 1 if x != y else 0 for x, y in zip(target_tensor.shape, tensor.shape) ]
+                        assert sum(mismatch) == 1, f"More than one dimension mismatch, tensor shape: {tensor.shape}, target tensor shape: {target_tensor.shape}"
+                        tp_dim = mismatch.index(1)
+                        shard_size = target_tensor.shape[tp_dim]
+                        tensor = tensor.narrow(tp_dim, tp_rank * shard_size, shard_size)
+                        target_tensor.copy_(tensor)
+                else:
+                    print(f"[megatron_policy_worker rank {get_rank_safe()}] Parameter {name} not found in hf_param_dict")
+        return True
+
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
