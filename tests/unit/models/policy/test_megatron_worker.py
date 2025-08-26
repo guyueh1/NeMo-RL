@@ -100,6 +100,8 @@ def create_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "apply_rope_fusion": True,
             "defer_fp32_logits": defer_fp32_logits,
+            "fp8": None,
+            "fp8_recipe": "tensorwise",
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -335,6 +337,7 @@ def training_setup(request):
             {"activation_checkpointing": True},
         ),
         (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
+        (2, 2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
     ],
     indirect=True,
     ids=[
@@ -345,6 +348,7 @@ def training_setup(request):
         "2gpu_dp2_llama_bf16",
         "2gpu_dp2_llama_ac",
         "2gpu_tp2_llama_sp",
+        "2gpu_tp2_llama_fp8",
     ],
 )
 def test_megatron_policy_training(training_setup):
