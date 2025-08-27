@@ -283,7 +283,7 @@ log-sync-sidecar() {
           session_name=\$(basename "\$session_dir")
           mkdir -p "$LOG_DIR/ray/$node_i/\$session_name"
           if command -v rsync > /dev/null 2>&1; then
-            rsync -ahP "\$session_dir/logs/" $head_node_ip:$LOG_DIR/ray/$node_i/\$session_name/logs/ 2>/dev/null || true
+            rsync -ahP "\$session_dir/logs/" $LOG_DIR/ray/$node_i/\$session_name/logs/ 2>/dev/null || true
           else
             cp -r "\$session_dir/logs" $LOG_DIR/ray/$node_i/\$session_name/
           fi
