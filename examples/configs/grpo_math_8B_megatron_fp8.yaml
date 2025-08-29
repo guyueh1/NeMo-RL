@@ -13,14 +13,13 @@ policy:
     compilation_config:
       pass_config:
         enable_fusion: true
-        enable_reshape: true
   megatron_cfg:
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 1
     fp8_cfg:
       enabled: true
       fp8: "hybrid"
       fp8_recipe: "blockwise"
-      fp8_param: false
+      fp8_param: true
     optimizer:
       use_precision_aware_optimizer: false
     distributed_data_parallel_config:
