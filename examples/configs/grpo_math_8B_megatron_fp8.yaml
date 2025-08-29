@@ -10,5 +10,9 @@ policy:
       precision: 'fp8'
       use_deep_gemm: true
   megatron_cfg:
-    fp8: "hybrid"
-    fp8_recipe: "blockwise"
+    tensor_model_parallel_size: 2
+    fp8_cfg:
+      enabled: true
+      fp8: "hybrid"
+      fp8_recipe: "blockwise"
+      fp8_param: false

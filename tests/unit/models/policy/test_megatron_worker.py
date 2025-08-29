@@ -100,8 +100,6 @@ def create_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "apply_rope_fusion": True,
             "defer_fp32_logits": defer_fp32_logits,
-            "fp8": None,
-            "fp8_recipe": "tensorwise",
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
@@ -132,6 +130,12 @@ def create_megatron_test_config(
                 "overlap_param_gather": False,
                 "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
+            },
+            "fp8_cfg": {
+                "enabled": False,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": True,
             },
         },
         "optimizer": None,  # Remove default FSDP optimizer

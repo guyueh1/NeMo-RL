@@ -72,8 +72,6 @@ policy:
     apply_rope_fusion: True
     activation_checkpointing: True
     defer_fp32_logits: True
-    fp8: "hybrid"
-    fp8_recipe: "tensorwise"
 
     optimizer:
       optimizer: "adam"

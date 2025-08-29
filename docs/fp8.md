@@ -42,8 +42,10 @@ FP8 training requires megatron path, and is recommented to be configured with th
 ```
     policy:
         megatron_cfg:
-            fp8: "hybrid"               # choices: [hybrid, e4m3]
-            fp8_recipe: "tensorwise"    # choicse: [tensorwise, blockwise]
+            fp8_cfg:
+                fp8: "hybrid"               # choices: [hybrid, e4m3]
+                fp8_recipe: "tensorwise"    # choicse: [tensorwise, blockwise]
+                fp8_param: false            # boolean value
 ```
 
 ### Special note with using FP8 training with Deepseek-style FP8 (sub channel scaling)*
