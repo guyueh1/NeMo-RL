@@ -9,6 +9,11 @@ policy:
     vllm_cfg:
       precision: 'fp8'
       use_deep_gemm: true
+  vllm_kwargs:
+    compilation_config:
+      pass_config:
+        enable_fusion: true
+        enable_reshape: true
   megatron_cfg:
     tensor_model_parallel_size: 2
     fp8_cfg:
@@ -16,3 +21,8 @@ policy:
       fp8: "hybrid"
       fp8_recipe: "blockwise"
       fp8_param: false
+    optimizer:
+      use_precision_aware_optimizer: false
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_param_gather: true
