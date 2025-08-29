@@ -273,7 +273,6 @@ log-sync-sidecar() {
     echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
     return
   fi
-  mkdir -p $LOG_DIR/ray
   mkdir -p $LOG_DIR/ray/$node_i
   while true; do
     sleep $RAY_LOG_SYNC_FREQUENCY
