@@ -562,6 +562,8 @@ class MegatronPolicyWorker:
             "moe_router_bias_update_rate"
         ]
 
+        #model_cfg.moe_permute_fusion = False
+
         model_cfg.sequence_parallel = self.cfg["megatron_cfg"]["sequence_parallel"]
         model_cfg.bf16 = self.dtype == torch.bfloat16
         model_cfg.fp16 = self.dtype == torch.float16
