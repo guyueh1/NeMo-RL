@@ -60,7 +60,7 @@ from megatron.bridge.training.utils.train_utils import (
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed.custom_fsdp import (
+from megatron.core.distributed.fsdp import (
     FullyShardedDataParallel as custom_FSDP,
 )
 from megatron.core.inference.engines import (
@@ -594,6 +594,15 @@ class MegatronPolicyWorker:
                 model_cfg.fp8_param = fp8_cfg["fp8_param"]
             except KeyError as e:
                 raise KeyError(f"Missing key in fp8_cfg: {e}")
+        from megatron.core.quantization.utils import kitchen_quantization_recipe_config
+
+        recipe_num = int(os.getenv("KITCHEN_RECIPE", "5"))
+        model_cfg.use_kitchen = self.cfg["megatron_cfg"].get("use_kitchen", False)
+
+        kitchen_recipe = kitchen_quantization_recipe_config(recipe_num)
+        model_cfg.quant_recipe = kitchen_recipe
+        print(f"Kitchen recipe: {kitchen_recipe}")
+        print("use_kitchen: ", model_cfg.use_kitchen)
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,

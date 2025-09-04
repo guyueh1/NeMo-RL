@@ -83,6 +83,9 @@ mcore = [
     # sudo apt-get update
     # sudo apt-get install cudnn-cuda-12
 
+    "psx-formats",
+    "kitchen",
+
     # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
     # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
     # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
@@ -137,6 +140,8 @@ test = [
 ]
 
 [tool.uv.sources]
+psx-formats = { workspace = true }
+kitchen = { workspace = true }
 megatron-core = { workspace = true }
 nemo-automodel = { workspace = true }
 megatron-bridge = { workspace = true }
@@ -159,6 +164,8 @@ members = [
     "3rdparty/Megatron-LM-workspace",
     "3rdparty/Automodel-workspace/Automodel",
     "3rdparty/Megatron-Bridge-workspace",
+    "3rdparty/kitchen-workspace",
+    "3rdparty/psx-formats-workspace",
 ]
 
 [[tool.uv.index]]
