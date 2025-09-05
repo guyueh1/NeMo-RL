@@ -946,10 +946,11 @@ class MegatronPolicyWorker:
                         batch.get_microbatch_iterator_dynamic_shapes_len()
                     )
                 elif self.cfg["sequence_packing"]["enabled"]:
-                    if self.cfg["megatron_cfg"]["virtual_pipeline_model_parallel_size"] > 1:
+                    vp_size = self.cfg["megatron_cfg"].get("virtual_pipeline_model_parallel_size", None)
+                    if vp_size and vp_size > 1:
                         data_iterator = [
                             batch.make_microbatch_iterator_for_packable_sequences()
-                            for _ in range(self.cfg["megatron_cfg"]["virtual_pipeline_model_parallel_size"])
+                            for _ in range(vp_size)
                         ]
                     else:
                         data_iterator = batch.make_microbatch_iterator_for_packable_sequences()
