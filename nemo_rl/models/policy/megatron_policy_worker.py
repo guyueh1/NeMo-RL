@@ -549,6 +549,9 @@ class MegatronPolicyWorker:
         model_cfg.expert_model_parallel_size = self.cfg["megatron_cfg"][
             "expert_model_parallel_size"
         ]
+        if model_cfg.pipeline_parallel_size > 1 and model_cfg.virtual_pipeline_model_parallel_size is not None:
+            model_cfg.overlap_p2p_comm = True
+            model_cfg.batch_p2p_comm = False
 
         # Setting moe_router_dtype to higher precision (e.g. fp64) can improve numerical stability,
         # especially when using many experts.
