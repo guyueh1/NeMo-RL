@@ -21,6 +21,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 
 from nemo_rl.models.policy.utils import sliding_window_overwrite
 from nemo_rl.utils.flops_formulas import FLOPSConfig, llama2, llama3, qwen2, qwen3
@@ -64,6 +65,18 @@ def convert_config_to_flops_config(
             # for non-MoE models, we use the intermediate size as the ffn hidden size
             moe_ffn_hidden_size=config.intermediate_size,
             moe_router_topk=1,
+        ), qwen3
+    elif isinstance(config, Qwen3MoeConfig):
+        return FLOPSConfig(
+            gbs=0,
+            hs=config.hidden_size,
+            layers=config.num_hidden_layers,
+            ffn_hs=config.intermediate_size,
+            vocab_size=config.vocab_size,
+            query_groups=config.num_attention_heads / config.num_key_value_heads,
+            attention_heads=config.num_attention_heads,
+            moe_ffn_hidden_size=config.intermediate_size,
+            moe_router_topk=config.num_experts_per_tok,
         ), qwen3
     elif isinstance(config, LlamaConfig):
         return FLOPSConfig(

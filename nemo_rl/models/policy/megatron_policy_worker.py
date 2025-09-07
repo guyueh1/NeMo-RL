@@ -529,6 +529,8 @@ class MegatronPolicyWorker:
         model_cfg.virtual_pipeline_model_parallel_size = self.cfg["megatron_cfg"].get(
             "virtual_pipeline_model_parallel_size", None
         )
+        if model_cfg.virtual_pipeline_model_parallel_size == 1:
+            model_cfg.virtual_pipeline_model_parallel_size = None
         model_cfg.num_layers_in_first_pipeline_stage = self.cfg["megatron_cfg"][
             "num_layers_in_first_pipeline_stage"
         ]
@@ -1722,7 +1724,7 @@ class MegatronPolicyWorker:
                     if torch.is_tensor(v) and not v.is_cuda:
                         state[k] = v.to("cuda")
 
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
