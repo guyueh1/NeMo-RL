@@ -9,12 +9,14 @@ policy:
     vllm_cfg:
       precision: 'fp8'
       use_deep_gemm: true
+      gpu_memory_utilization: 0.5
     vllm_kwargs:
       compilation_config:
         pass_config:
           enable_fusion: true
           enable_noop: true
   megatron_cfg:
+    tensor_model_parallel_size: 2
     fp8_cfg:
       enabled: true
       fp8: "hybrid"
@@ -24,4 +26,10 @@ policy:
       use_precision_aware_optimizer: false
     distributed_data_parallel_config:
       grad_reduce_in_fp32: true
-      overlap_param_gather: true
+logger:
+  wandb_enabled: false
+  wandb:
+    project: "nemo-rl-grpo-dev-guyueh"
+    name: "grpo_math_8B_megatron_fp8_debug"
+checkpointing:
+  enabled: false

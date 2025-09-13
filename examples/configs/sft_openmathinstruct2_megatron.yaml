@@ -3,7 +3,7 @@ defaults: sft_openmathinstruct2.yaml
 
 sft:
   max_num_epochs: 1
-  max_num_steps: 1000000
+  max_num_steps: 5
   val_period: 500
   val_batches: 4
   val_global_batch_size: 128
@@ -12,7 +12,7 @@ sft:
   seed: 42
 
 checkpointing:
-  enabled: true
+  enabled: false
   checkpoint_dir: "results/sft_openmathinstruct2"
   metric_name: "val_loss"
   higher_is_better: false
@@ -25,6 +25,7 @@ policy:
     name: meta-llama/Llama-3.1-8B-Instruct
   train_global_batch_size: 512
   train_micro_batch_size: 1
+  logprob_batch_size: 4
   max_total_sequence_length: 4096
   precision: "bfloat16"
 
@@ -66,7 +67,7 @@ policy:
       #fp8_recipe: delayed
 
     pipeline_dtype: bfloat16
-    pipeline_model_parallel_size: 1
+    pipeline_model_parallel_size: 2
     scheduler:
       end_weight_decay: 0.01
       lr_decay_iters: null
@@ -76,7 +77,7 @@ policy:
       start_weight_decay: 0.01
       weight_decay_incr_style: constant
     sequence_parallel: false
-    tensor_model_parallel_size: 4 ## TODO: should not need this large TP size
+    tensor_model_parallel_size: 2 ## TODO: should not need this large TP size
 
     freeze_moe_router: true
     moe_router_dtype: "fp64"
@@ -84,6 +85,12 @@ policy:
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
+
+    fp8_cfg:
+      enabled: true
+      fp8: "hybrid"
+      fp8_recipe: "blockwise"
+      fp8_param: false
 
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
@@ -106,8 +113,9 @@ policy:
   sequence_packing:
     enabled: True
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
+    sequence_length_round: 16
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
@@ -128,7 +136,7 @@ data:
 
 logger:
   log_dir: "logs"  # Base directory for all logs
-  wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
+  wandb_enabled: false # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
@@ -146,5 +154,5 @@ logger:
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 2
+  num_nodes: 1
                                                   

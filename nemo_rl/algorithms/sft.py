@@ -426,6 +426,13 @@ def sft_train(
                 with timer.time("policy_training"):
                     train_results = policy.train(train_data, loss_fn)
 
+                print(" Calculating logprob...")
+                with timer.time("logprobs"):
+                    fprop_logprobs = policy.get_logprobs(train_data)["logprobs"]
+                    train_results["prev_logprobs"] = fprop_logprobs
+                log_data = {"logprobs": fprop_logprobs.tolist()}
+                logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{total_steps + 1}.jsonl")
+
                 is_last_step = total_steps + 1 >= master_config["sft"][
                     "max_num_steps"
                 ] or (
