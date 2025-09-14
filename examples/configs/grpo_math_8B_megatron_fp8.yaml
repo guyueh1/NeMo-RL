@@ -9,6 +9,7 @@ policy:
     vllm_cfg:
       precision: 'fp8'
       use_deep_gemm: true
+      gpu_memory_utilization: 0.5
     vllm_kwargs:
       compilation_config:
         pass_config:
@@ -25,3 +26,5 @@ policy:
     distributed_data_parallel_config:
       grad_reduce_in_fp32: true
       overlap_param_gather: true
+    env_vars:
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
