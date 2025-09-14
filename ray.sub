@@ -262,7 +262,7 @@ ray start --head \
     --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
     \
-    --block
+    --block --ray-debugger-external
 EOFINNER
 chmod +x /launch-head.sh
 
@@ -360,7 +360,7 @@ ray start --address "$ip_head" \
           --dashboard-agent-listen-port=${DASHBOARD_AGENT_LISTEN_PORT} \
           --metrics-export-port=${METRICS_EXPORT_PORT} \
           \
-          --block
+          --block --ray-debugger-external
 EOFINNER
 
 count=0

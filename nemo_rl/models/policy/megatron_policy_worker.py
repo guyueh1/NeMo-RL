@@ -943,7 +943,7 @@ class MegatronPolicyWorker:
                     seqlen_key = "input_lengths"
                     tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
                     cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
-                    pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+                    pad_factor = 16 #cp_size * 2 * tp_size if cp_size > 1 else tp_size
                     if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
                         _, pad_full_seq_to = (
                             batch.get_microbatch_iterator_for_packable_sequences_len()
@@ -1148,7 +1148,7 @@ class MegatronPolicyWorker:
                 pp_size = self.cfg["megatron_cfg"]["pipeline_model_parallel_size"]
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                 cp_rank = get_context_parallel_rank()
-                pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+                pad_factor = 16 #cp_size * 2 * tp_size if cp_size > 1 else tp_size
                 (
                     input_ids,
                     input_ids_cp_sharded,
