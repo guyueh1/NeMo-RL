@@ -592,6 +592,15 @@ class MegatronPolicyWorker:
                 "https://github.com/NVIDIA/Megatron-LM/blob/1ab876ddc4c1893c76f26d775226a8d1dcdfb3d2/megatron/core/transformer/mlp.py#L174."
             )
         model_cfg.apply_rope_fusion = self.cfg["megatron_cfg"]["apply_rope_fusion"]
+        fp8_cfg = self.cfg["megatron_cfg"].get("fp8_cfg", None)
+        self.fp8_cfg = fp8_cfg
+        if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+            try:
+                model_cfg.fp8 = fp8_cfg["fp8"]
+                model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
+                model_cfg.fp8_param = fp8_cfg["fp8_param"]
+            except KeyError as e:
+                raise KeyError(f"Missing key in fp8_cfg: {e}")
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
@@ -942,6 +951,8 @@ class MegatronPolicyWorker:
                     tp_size = self.cfg["megatron_cfg"]["tensor_model_parallel_size"]
                     cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                     pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+                    if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
+                        pad_factor = max(pad_factor, 16)
                     if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
                         _, pad_full_seq_to = (
                             batch.get_microbatch_iterator_for_packable_sequences_len()
@@ -1147,6 +1158,9 @@ class MegatronPolicyWorker:
                 cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                 cp_rank = get_context_parallel_rank()
                 pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+                if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
+                    # if fp8 is enabled, pad the sequence length to multiples of 16
+                    pad_factor = max(pad_factor, 16)
                 (
                     input_ids,
                     input_ids_cp_sharded,
