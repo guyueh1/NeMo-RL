@@ -15,6 +15,8 @@ policy:
         pass_config:
           enable_fusion: true
           enable_noop: true
+  sequence_packing:
+    sequence_length_round: 16
   megatron_cfg:
     fp8_cfg:
       enabled: true
@@ -23,8 +25,5 @@ policy:
       fp8_param: true
     optimizer:
       use_precision_aware_optimizer: false
-    distributed_data_parallel_config:
-      grad_reduce_in_fp32: true
-      overlap_param_gather: true
     env_vars:
       NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
