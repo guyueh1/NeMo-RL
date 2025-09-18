@@ -12,11 +12,12 @@ policy:
   sequence_packing:
     sequence_length_round: 16
   megatron_cfg:
+    pipeline_model_parallel_size: 8
     fp8_cfg:
       enabled: true
       fp8: "hybrid"
       fp8_recipe: "blockwise"
-      fp8_param: true
+      fp8_param: false
     optimizer:
       use_precision_aware_optimizer: false
     env_vars:
