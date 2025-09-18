@@ -14,6 +14,7 @@
 import gc
 import os
 import time
+import zmq
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -867,6 +868,14 @@ class MegatronPolicyWorker:
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
+        self.zmq_context = zmq.Context()
+        self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+        self.zmq_socket.bind(self.zmq_address)
+    
+    @property
+    def zmq_address(self):
+        return f"ipc:///{self.report_device_id()}.sock"
+
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
         """Initialize the collective communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -1580,6 +1589,84 @@ class MegatronPolicyWorker:
                 metadata = (tensor.shape, tensor.dtype)
             refit_param_info_hf[name] = metadata
         return refit_param_info_hf
+    
+    def send_weights_ipc_handles(self) -> None:
+        if self._held_gather_buffer is not None:
+            del self._held_gather_buffer
+            self._held_gather_buffer = None
+        tensor_number_threshold = os.getenv(
+            "NEMO_RL_MEGATRON_IPC_TENSOR_PACKING_THRESHOLD", "32"
+        )  # an arbitrary threshold
+        from nemo_rl.utils.nvml import get_free_memory_bytes
+
+        # Collect current available memory for refit
+        ## Get current device index from torch
+        device_idx = torch.cuda.current_device()
+        ## Get device free memory using NVML
+        total_available_bytes = get_free_memory_bytes(device_idx)
+        ## default to 20% to get some more speedup than 10%, OOM if set to 30%
+        memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
+        total_available_bytes *= float(memory_ratio)
+        
+        hf_params_generator = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+        )
+        gathered_hf_params = {}
+        type_to_total_size = defaultdict(lambda: 0)
+        used_bytes = 0
+        for name, tensor in hf_params_generator:
+            used_bytes += tensor.numel() * type_to_total_size[tensor.dtype] 
+            gathered_hf_params[name] = tensor
+            type_to_total_size[tensor.dtype] += tensor.numel()
+            if used_bytes > total_available_bytes:
+                packed_tensors = {
+                    dtype: torch.empty(
+                        total_size,
+                        device=next(iter(gathered_hf_params.values())).device,
+                        dtype=dtype,
+                        requires_grad=False,
+                    )
+                    for dtype, total_size in type_to_total_size.items()
+                }
+
+                dtype_to_offset = defaultdict(lambda: 0)
+                # Copy tensors into consolidated buffers
+                for key, tensor in gathered_hf_params.items():
+                    dtype = tensor.dtype
+                    size = tensor.numel()
+                    packed_tensors[dtype][
+                        dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
+                    ].copy_(tensor.detach().view(-1))
+                    dtype_to_offset[dtype] += size
+
+                # Create IPC handles for consolidated tensors
+                all_handles = [
+                    (dtype, get_handle_from_tensor(tensor))
+                    for dtype, tensor in packed_tensors.items()
+                ]
+
+                # Store reference to prevent garbage collection
+                self._held_gather_buffer = packed_tensors
+                serialized = (
+                    pack_tensor_for_ipc,
+                    all_handles,
+                    tuple(gathered_hf_params.keys()),
+                )
+
+                self.zmq_socket.send_pyobj(serialized)
+                self.zmq_socket.recv()
+                del self._held_gather_buffer
+                self._held_gather_buffer = None
+                gathered_hf_params = {}
+                type_to_total_size = defaultdict(lambda: 0)
+                used_bytes = 0
+        self.zmq_socket.send_pyobj(None)
+        self.zmq_socket.recv()
+        self.zmq_socket.close()
+        del self._held_gather_buffer
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
