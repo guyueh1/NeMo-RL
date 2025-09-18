@@ -173,15 +173,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
+            sequence_length_pad_multiple = cp_size * 2 * tp_size if cp_size > 1 else tp_size
+            if config["megatron_cfg"]["enabled"] \
+                and config["megatron_cfg"].get("fp8_cfg", {}).get("enabled", False):
+                sequence_length_pad_multiple = max(16, sequence_length_pad_multiple)
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
-                "sequence_length_pad_multiple": (
-                    config["sequence_packing"].get("sequence_length_round", 
-                    cp_size * 2 * tp_size if cp_size > 1 else tp_size
-                    )
-                )
+                "sequence_length_pad_multiple": sequence_length_pad_multiple
             }
             assert not config["dynamic_batching"]["enabled"], (
                 "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
