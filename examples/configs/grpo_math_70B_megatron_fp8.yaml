@@ -9,7 +9,6 @@ policy:
     vllm_cfg:
       precision: "fp8"
       use_deep_gemm: true
-      gpu_memory_utilization: 0.8
   sequence_packing:
     sequence_length_round: 16
   megatron_cfg:
