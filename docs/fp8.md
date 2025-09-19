@@ -1,10 +1,37 @@
 FP8 Quantization Tools for NeMo RL
 
-This module provides a suite of tools to enable FP8 quantization for large language models. This module is still in developement. Currently we support 
+This module provides a suite of tools to enable FP8 quantization for large language models.  
+It is currently under active development.
+
+## Supported Features
+
+### FP8 Generation
+- Implements **Deepseek-style FP8** quantization using **sub-channel scaling**.
+
+### FP8 Training
+- Uses **TransformerEngine** for linear layer implementation.
+- Supports both **Deepseek-style sub-channel scaling** and **per-tensor scaling**.
+
+## Integration with NeMo RL
+
+NeMo RL applies monkey patches to several core `vLLM` components to enable FP8 generation for reinforcement learning.  
+When the `init_fp8` function is called, it modifies the following:
+
+### RayDistributedExecutor
+- For multi-GPU inference, each worker process is patched to apply FP8 modifications **before model initialization**.
+
+### Quantization Utilities
+- Functions within `vllm.model_executor.layers.quantization` are replaced with custom implementations that support:
+  - **Power-of-2 scaling**
+  - Other custom features
+
+### Weight Loading
+- A custom `load_weights` function performs **on-the-fly quantization** of model weights from higher-precision formats to FP8.
+- Applies the correct **scaling factors** during conversion.
 
 * FP8 generation, using Deepseek style FP8 (sub channel scaling)
 * FP8 training, using TransformerEngine as linear layer implementation, supporting Deepseek style FP8 (sub channel scaling) and per-tensor scaling
-
+The following settings are recommended for FP8 generation:
 NeMo-RL monkey patches several vLLM functions to enable FP8 generations for reinforcement learning. The `init_fp8` function patches key `vLLM` components when initialized:
 1.  **`RayDistributedExecutor`**: For multi-GPU inference, the executor is patched to ensure that every worker process applies the same FP8 patches before model initialization.
 2.  **Quantization Utilities**: Functions within `vllm.model_executor.layers.quantization` are replaced with versions that support power-of-2 scaling and other custom features.
@@ -37,20 +64,23 @@ FP8 generations are recommended to be configured with the following settings:
                 use_activation_pow2_scale: False
 ```
 
-FP8 training requires megatron path, and is recommented to be configured with the following settings:
+"To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```
     policy:
         megatron_cfg:
             fp8_cfg:
                 fp8: "hybrid"               # choices: [hybrid, e4m3]
-                fp8_recipe: "tensorwise"    # choicse: [tensorwise, blockwise]
+                fp8_recipe: "tensorwise"    # choices: [tensorwise, blockwise]
                 fp8_param: false            # boolean value
 ```
 
-### Special note with using FP8 training with Deepseek-style FP8 (sub channel scaling)*
+## Compatibility Note for Deepseek-Style FP8 Training
 
-The TransformerEngine implementation of this recipe requires cublas version >= 12.9; however, nemo-rl currently depends on torch 2.7.1 which depends on cuda 12.8; therefore, using the default way will cause the following error 
+When using FP8 training with Deepseek-style FP8 (sub-channel scaling), be aware of the following compatibility issue:
+
+The TransformerEngine implementation for this recipe requires **cuBLAS version ≥ 12.9**. However, `nemo-rl` currently depends on **Torch 2.7.1**, which in turn requires **CUDA 12.8**. As a result, attempting to use the default setup will trigger the following error:
+
 ```
 File "/opt/ray_venvs/nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker/lib/python3.12/site-packages/transformer_engine/pytorch/fp8.py", line 646, in fp8_autocast
 FP8GlobalStateManager.fp8_autocast_enter(
@@ -59,10 +89,15 @@ assert fp8_block_available, reason_for_no_fp8_block
            ^^^^^^^^^^^^^^^^^^^
 AssertionError: FP8 block scaled GEMM requires Hopper and CUDA >= 12.9.
 ```
-The issue will be resolved when we bump torch version to >=2.8.0 in the future. For now, the following temporal solutions can be used to try Deepseek style FP8 training:
-* Build the NGC pytorch based container from `docker/Dockerfile.ngc_pytorch`. In this way you will use the torch in system python environment, which has cuda version 12.9 or higher.
+This issue will be resolved once the Torch version is upgraded to **≥ 2.8.0**. In the meantime, you can enable Deepseek-style FP8 training using the following workaround:
+
+- **Build the NGC PyTorch container** from `docker/Dockerfile.ngc_pytorch`.  
+  This setup uses the system Python environment, which includes **CUDA version 12.9 or higher**, meeting the requirements for TransformerEngine’s FP8 implementation.
+
 
 
 ## Accuracy
 
-We observe on the Llama 8b recipe a ~5% accuracy loss is incurred with FP8 generations. Convergence is still under active research and FP8 generations should be used with caution. We are investigating ways to close the accuracy gap and further improve performance. 
+In the Llama 8B recipe, FP8 generation results in approximately a **5% drop in accuracy**.  
+Convergence behavior remains an active area of research, and FP8 generation should be used with caution.  
+Efforts are ongoing to reduce the accuracy gap and further optimize performance.
