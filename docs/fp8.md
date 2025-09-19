@@ -1,7 +1,6 @@
-FP8 Quantization Tools for NeMo RL
+# FP8 Quantization in NeMo RL
 
-This module provides a suite of tools to enable FP8 quantization for large language models.  
-It is currently under active development.
+This module provides a suite of tools to enable FP8 quantization for large language models. It is currently under active development.
 
 ## Supported Features
 
@@ -18,7 +17,7 @@ NeMo RL applies monkey patches to several core `vLLM` components to enable FP8 g
 When the `init_fp8` function is called, it modifies the following:
 
 ### RayDistributedExecutor
-- For multi-GPU inference, each worker process is patched to apply FP8 modifications **before model initialization**.
+- For multi-GPU inference, the executor is patched to ensure that every worker process applies the same FP8 patches **before model initialization**.
 
 ### Quantization Utilities
 - Functions within `vllm.model_executor.layers.quantization` are replaced with custom implementations that support:
@@ -26,18 +25,8 @@ When the `init_fp8` function is called, it modifies the following:
   - Other custom features
 
 ### Weight Loading
-- A custom `load_weights` function performs **on-the-fly quantization** of model weights from higher-precision formats to FP8.
-- Applies the correct **scaling factors** during conversion.
+- A custom `load_weights` function performs on-the-fly quantization of model weights from higher-precision formats to FP8.
 
-* FP8 generation, using Deepseek style FP8 (sub channel scaling)
-* FP8 training, using TransformerEngine as linear layer implementation, supporting Deepseek style FP8 (sub channel scaling) and per-tensor scaling
-The following settings are recommended for FP8 generation:
-NeMo-RL monkey patches several vLLM functions to enable FP8 generations for reinforcement learning. The `init_fp8` function patches key `vLLM` components when initialized:
-1.  **`RayDistributedExecutor`**: For multi-GPU inference, the executor is patched to ensure that every worker process applies the same FP8 patches before model initialization.
-2.  **Quantization Utilities**: Functions within `vllm.model_executor.layers.quantization` are replaced with versions that support power-of-2 scaling and other custom features.
-3.  **Weight Loading**: A custom `load_weights` function handles the on-the-fly quantization of model weights from a higher-precision format to FP8 with the correct scaling factors.
-
----
 
 ## Usage
 
@@ -54,10 +43,10 @@ FP8 generations are recommended to be configured with the following settings:
                 precision: 'fp8'
                 # DeepGemm is much more performant than vLLM's default cutlass fp8 subchannel scaling kernels
                 use_deep_gemm: true
-                # Keeping the first and last three layers in bf16 reduces the multi-token error without
-                # a signficant effect to performance
-                num_last_layers_in_bf16: 3
-                num_first_layers_in_bf16: 1
+                # Users can specify number of layers to be kept in BF16 precision in their experiments
+                # and by default they are set to 0
+                num_last_layers_in_bf16: 0
+                num_first_layers_in_bf16: 0
                 # Use FP32 scaling factors. Rounding scaling factors to the nearest pow2 may improve quantization 
                 # fidelity however this feature is still under research.
                 use_weight_pow2_scale: False
@@ -98,6 +87,6 @@ This issue will be resolved once the Torch version is upgraded to **≥ 2.8.0**.
 
 ## Accuracy
 
-In the Llama 8B recipe, FP8 generation results in approximately a **5% drop in accuracy**.  
+In the Llama 8B recipe, FP8 rollout and BF16 training results in approximately a **5% drop in accuracy**.  
 Convergence behavior remains an active area of research, and FP8 generation should be used with caution.  
 Efforts are ongoing to reduce the accuracy gap and further optimize performance.
