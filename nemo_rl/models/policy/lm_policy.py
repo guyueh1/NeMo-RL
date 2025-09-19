@@ -176,6 +176,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             sequence_length_pad_multiple = cp_size * 2 * tp_size if cp_size > 1 else tp_size
             if config["megatron_cfg"]["enabled"] \
                 and config["megatron_cfg"].get("fp8_cfg", {}).get("enabled", False):
+                # if fp8 is enabled, pad the sequence length to multiples of 16
+                # Ref: https://github.com/NVIDIA/TransformerEngine/blob/5b3092a0e40654436bec5ea0a0b0f7ad2887b20d/transformer_engine/pytorch/utils.py#L437-L441
                 sequence_length_pad_multiple = max(16, sequence_length_pad_multiple)
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": config["sequence_packing"]["algorithm"],
