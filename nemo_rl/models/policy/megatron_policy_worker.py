@@ -19,6 +19,7 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar
+import math
 
 import ray
 import torch
@@ -961,7 +962,8 @@ class MegatronPolicyWorker:
                     cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
                     pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
                     if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
-                        pad_factor = max(pad_factor, 16)
+                        # if fp8 is enabled, ensure the sequence is padded to multiples of 16
+                        pad_factor = math.lcm(16, pad_factor)
                     if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
                         _, pad_full_seq_to = (
                             batch.get_microbatch_iterator_for_packable_sequences_len()
@@ -1168,8 +1170,8 @@ class MegatronPolicyWorker:
                 cp_rank = get_context_parallel_rank()
                 pad_factor = cp_size * 2 * tp_size if cp_size > 1 else tp_size
                 if self.fp8_cfg is not None and self.fp8_cfg.get("enabled", False):
-                    # if fp8 is enabled, pad the sequence length to multiples of 16
-                    pad_factor = max(pad_factor, 16)
+                    # if fp8 is enabled, ensure the sequence is padded to multiples of 16
+                    pad_factor = math.lcm(16, pad_factor)
                 (
                     input_ids,
                     input_ids_cp_sharded,

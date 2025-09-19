@@ -10,8 +10,6 @@ policy:
       precision: "fp8"
       use_deep_gemm: true
       gpu_memory_utilization: 0.5
-  sequence_packing:
-    sequence_length_round: 16
   megatron_cfg:
     fp8_cfg:
       enabled: true
