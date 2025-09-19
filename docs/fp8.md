@@ -1,4 +1,4 @@
-# FP8 for NeMo-RL
+FP8 Quantization Tools for NeMo RL
 
 This module provides a suite of tools to enable FP8 quantization for large language models. This module is still in developement. Currently we support 
 
