@@ -14,6 +14,7 @@
 
 import os
 from dataclasses import dataclass, field
+from functools import partial
 from unittest.mock import patch
 
 import ray
@@ -117,6 +118,8 @@ def apply_fp8_patches(self, fp8_config):
     # which this patch can be removed.
     func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
     patcher1 = patch(func1_path, process_weights_after_loading)
+    func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
+    patcher2 = patch(func2_path, partial(process_weights_after_loading, is_moe=True))
     fp8_state.vllm_patches.append(patcher1)
     # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
     # SNR compared to plain fp32 scaling factors. This feature is still under active research.
@@ -137,10 +140,6 @@ def apply_fp8_patches(self, fp8_config):
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
     config = AutoConfig.from_pretrained(model_name)
-    if hasattr(config, "num_experts"):
-        assert config.num_experts == 0, (
-            "FP8 generation for MoE models is currently not supported"
-        )
 
     global global_fp8_config
     global_fp8_config = FP8Config(
@@ -389,7 +388,7 @@ def cast_tensor_to_fp8_blockwise(
     return fp_data, descale_fp
 
 
-def process_weights_after_loading(self, layer) -> None:
+def process_weights_after_loading(self, layer, is_moe: bool = False) -> None:
     from torch.nn import Parameter
     from vllm.model_executor.parameter import (
         BlockQuantScaleParameter,
@@ -415,6 +414,47 @@ def process_weights_after_loading(self, layer) -> None:
 
         param.subclass_type = type(custom_param)
         return param
+
+    if is_moe:
+        w13_weight = layer.w13_weight.data
+        w13_weight_scale_inv = layer.w13_weight_scale_inv.data
+        w2_weight = layer.w2_weight.data
+        w2_weight_scale_inv = layer.w2_weight_scale_inv.data
+        w13_weight = self._maybe_pad_weight(w13_weight)
+        w2_weight = self._maybe_pad_weight(w2_weight)
+        layer.w13_weight = _create_param_from_subclass_attributes(
+            ModelWeightParameter(
+                data=w13_weight,
+                output_dim=0,
+                input_dim=1,
+                weight_loader=layer.w13_weight.weight_loader,
+            )
+        )
+        layer.w13_weight_scale_inv = _create_param_from_subclass_attributes(
+            BlockQuantScaleParameter(
+                data=w13_weight_scale_inv,
+                output_dim=0,
+                input_dim=1,
+                weight_loader=layer.w13_weight_scale_inv.weight_loader,
+            )
+        )
+        layer.w2_weight = _create_param_from_subclass_attributes(
+            ModelWeightParameter(
+                data=w2_weight,
+                output_dim=0,
+                input_dim=1,
+                weight_loader=layer.w2_weight.weight_loader,
+            )
+        )
+        layer.w2_weight_scale_inv = _create_param_from_subclass_attributes(
+            BlockQuantScaleParameter(
+                data=w2_weight_scale_inv,
+                output_dim=0,
+                input_dim=1,
+                weight_loader=layer.w2_weight_scale_inv.weight_loader,
+            )
+        )
+        return
 
     weight = layer.weight.data
     weight_scale_inv = layer.weight_scale_inv.data
