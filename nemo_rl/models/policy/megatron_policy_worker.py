@@ -601,6 +601,15 @@ class MegatronPolicyWorker:
                 model_cfg.fp8_param = fp8_cfg["fp8_param"]
             except KeyError as e:
                 raise KeyError(f"Missing key in fp8_cfg: {e}")
+            if (
+                model_cfg.tensor_model_parallel_size > 1
+                and model_cfg.fp8_recipe == "blockwise"
+                and model_cfg.fp8_param
+            ):
+                raise ValueError(
+                    "There is a known issue with FP8 blockwise recipe and tensor model parallel size > 1 when fp8_param is True. "
+                    "Please set fp8_param to False or use tensorwise recipe instead. (https://github.com/NVIDIA-NeMo/RL/issues/1164)"
+                )
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
