@@ -612,6 +612,16 @@ class MegatronPolicyWorker:
                     "Please set fp8_param to False or use tensorwise recipe instead. (https://github.com/NVIDIA-NeMo/RL/issues/1164)"
                 )
 
+        from megatron.core.quantization.utils import kitchen_quantization_recipe_config
+
+        recipe_num = int(os.getenv("KITCHEN_RECIPE", "5"))
+        model_cfg.use_kitchen = self.cfg["megatron_cfg"].get("use_kitchen", False)
+
+        kitchen_recipe = kitchen_quantization_recipe_config(recipe_num)
+        model_cfg.quant_recipe = kitchen_recipe
+        print(f"Kitchen recipe: {kitchen_recipe}")
+        print("use_kitchen: ", model_cfg.use_kitchen)
+
         checkpoint_config = CheckpointConfig(
             save_interval=100,
             save=weights_path,
