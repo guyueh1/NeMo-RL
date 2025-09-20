@@ -13,3 +13,9 @@
 	url = https://github.com/NVIDIA-NeMo/Automodel.git
 	branch = nemo-rl-submodule
 	shallow = true
+[submodule "3rdparty/kitchen-workspace/kitchen"]
+	path = 3rdparty/kitchen-workspace/kitchen
+	url = ssh://git@gitlab-master.nvidia.com:12051/compute/chef/kitchen.git
+[submodule "3rdparty/psx-formats-workspace/psx-formats"]
+	path = 3rdparty/psx-formats-workspace/psx-formats
+	url = ssh://git@gitlab-master.nvidia.com:12051/compute/psx/psx-formats/psx-formats.git
