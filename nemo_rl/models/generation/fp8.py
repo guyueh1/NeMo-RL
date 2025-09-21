@@ -14,7 +14,6 @@
 
 import os
 from dataclasses import dataclass, field
-from functools import partial
 from unittest.mock import patch
 
 import ray
@@ -284,7 +283,11 @@ def _is_fp8_weight(name, model):
             if (
                 isinstance(module, LinearBase)
                 and module.weight.dtype == torch.float8_e4m3fn
-                or isinstance(module, FusedMoE)
+                or (
+                    isinstance(module, FusedMoE)
+                    and module.w13_weight.dtype == torch.float8_e4m3fn
+                    and module.w2_weight.dtype == torch.float8_e4m3fn
+                )
             ):
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
@@ -411,7 +414,6 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w13_weight_scale_inv = _swap_w13_to_w31(w13_weight_scale_inv)
         layer.w13_weight.data = w13_weight
         layer.w13_weight_scale_inv.data = w13_weight_scale_inv
-
     
 def process_weights_after_loading(self, layer) -> None:
     from torch.nn import Parameter
