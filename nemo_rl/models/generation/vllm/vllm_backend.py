@@ -62,6 +62,18 @@ class VllmInternalWorkerExtension:
             self.socket.connect(self.zmq_address)
         
         while True:
+            payload = self.socket.recv_pyobj()
+            if payload is None:
+                # means the update is done
+                (
+                    self.model_runner.model, self.model_config, self.device
+                )
+                torch.cuda.synchronize()
+                self.socket.send(b"")
+                break
+            self.update_weights_from_local_ipc_handles(payload)
+            torch.cuda.synchronize()
+            self.socket.send(b"")
 
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid
