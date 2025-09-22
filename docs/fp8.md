@@ -87,6 +87,6 @@ This issue will be resolved once the Torch version is upgraded to **≥ 2.8.0**.
 
 ## Accuracy
 
-In the Llama 8B recipe, FP8 rollout and BF16 training results in approximately a **5% drop in accuracy**.  
-Convergence behavior remains an active area of research, and FP8 generation should be used with caution.  
-Efforts are ongoing to reduce the accuracy gap and further optimize performance.
+![Llama-3.1-8B-Instruct GRPO Curve BF16 vs FP8](assets/fp8_e2e_curve.png)
+In the experiment in this figure, enabling FP8 rollout and training gives 15%-25% decrease in step time, and the validation accuracy curves match up to 1000 step.
+Efforts are ongoing to performs longer runs and further optimize performance.
