@@ -78,7 +78,7 @@ assert fp8_block_available, reason_for_no_fp8_block
            ^^^^^^^^^^^^^^^^^^^
 AssertionError: FP8 block scaled GEMM requires Hopper and CUDA >= 12.9.
 ```
-This issue will be resolved once the Torch version is upgraded to **≥ 2.8.0**. In the meantime, you can enable Deepseek-style FP8 training using the following workaround:
+This issue will be resolved once the Torch version is upgraded to **≥ 2.8.0** (Please follow [#1122](https://github.com/NVIDIA-NeMo/RL/issues/1122) for more progress on the upgrade). In the meantime, you can enable Deepseek-style FP8 training using the following workaround:
 
 - **Build the NGC PyTorch container** from `docker/Dockerfile.ngc_pytorch`.  
   This setup uses the system Python environment, which includes **CUDA version 12.9 or higher**, meeting the requirements for TransformerEngine’s FP8 implementation.
