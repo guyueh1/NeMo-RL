@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
+import zmq
 
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
@@ -47,6 +48,20 @@ class VllmInternalWorkerExtension:
         self.model_update_group = PyNcclCommunicator(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             pg, device=self.device
         )
+
+    
+    @property
+    def zmq_address(self):
+        return f"ipc:///{self.report_device_id()}.sock"
+
+    def update_weights_from_ipc_zmq(self) -> bool:
+        """Update weights from IPC ZMQ."""
+        if not hasattr(self, "_zmq_ctx") or self._zmq_ctx is None:
+            self._zmq_ctx = zmq.Context()
+            self.socket = self._zmq_ctx.socket(zmq.REP)
+            self.socket.connect(self.zmq_address)
+        
+        while True:
 
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid

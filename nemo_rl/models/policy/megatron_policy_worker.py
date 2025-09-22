@@ -870,11 +870,25 @@ class MegatronPolicyWorker:
 
         self.zmq_context = zmq.Context()
         self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-        self.zmq_socket.bind(self.zmq_address)
+        self.zmq_socket.connect(self.zmq_address)
     
     @property
     def zmq_address(self):
         return f"ipc:///{self.report_device_id()}.sock"
+
+    def report_device_id(self) -> str:
+        """Report the UUID of the current CUDA device using NVML.
+
+        Returns:
+            str: UUID of the device in the format "GPU-xxxxx"
+        """
+        from nemo_rl.utils.nvml import get_device_uuid
+
+        # Get current device index from torch
+        device_idx = torch.cuda.current_device()
+        # Get device UUID using NVML
+        return get_device_uuid(device_idx)
+
 
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
         """Initialize the collective communication."""
