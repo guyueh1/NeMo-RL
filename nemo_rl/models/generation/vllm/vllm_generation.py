@@ -743,6 +743,27 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during update weights: {e}")
             return False
 
+    def update_weights_from_ipc_handles_zmq(self) -> list[ray.ObjectRef]:
+        """Update weights of the policy using ZMQ IPC handles."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "update_weights_from_ipc_handles_zmq_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "update_weights_from_ipc_handles_zmq"
+        )
+
+        # Use run_all_workers_single_data for methods that don't need data
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+
+        # this function should co-work with lm_policy, so we should wait for all futures to complete outside
+        return futures
+
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:

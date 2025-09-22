@@ -867,13 +867,8 @@ class MegatronPolicyWorker:
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
-
-        self.zmq_context = zmq.Context()
-        self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-        self.zmq_socket.connect(self.zmq_address)
     
-    @property
-    def zmq_address(self):
+    def get_zmq_address(self):
         return f"ipc:///{self.report_device_id()}.sock"
 
     def report_device_id(self) -> str:
@@ -901,6 +896,11 @@ class MegatronPolicyWorker:
             )
             device = torch.cuda.current_device()
             self.model_update_group = PyNcclCommunicator(pg, device=device)
+
+    def init_zmq(self):
+        self.zmq_context = zmq.Context()
+        self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+        self.zmq_socket.bind(self.get_zmq_address())
 
     def is_alive(self):
         return True
@@ -1605,6 +1605,8 @@ class MegatronPolicyWorker:
         return refit_param_info_hf
     
     def send_weights_ipc_handles(self) -> None:
+        if not hasattr(self, "zmq_socket"):
+            self.init_zmq()
         if self._held_gather_buffer is not None:
             del self._held_gather_buffer
             self._held_gather_buffer = None
@@ -1626,6 +1628,7 @@ class MegatronPolicyWorker:
             [self.model],
             show_progress=False,
         )
+        pack_tensor_for_ipc = True
         gathered_hf_params = {}
         type_to_total_size = defaultdict(lambda: 0)
         used_bytes = 0
@@ -1669,7 +1672,9 @@ class MegatronPolicyWorker:
                 )
 
                 self.zmq_socket.send_pyobj(serialized)
+                # print(f"[MegatronPolicyWorker] Sent serialized to {self.get_zmq_address()}: {serialized}", flush=True)
                 self.zmq_socket.recv()
+                # print(f"[MegatronPolicyWorker] Received response from {self.get_zmq_address()}", flush=True)
                 del self._held_gather_buffer
                 self._held_gather_buffer = None
                 gathered_hf_params = {}
@@ -1677,8 +1682,7 @@ class MegatronPolicyWorker:
                 used_bytes = 0
         self.zmq_socket.send_pyobj(None)
         self.zmq_socket.recv()
-        self.zmq_socket.close()
-        del self._held_gather_buffer
+        # self.zmq_socket.close()
         gc.collect()
         torch.cuda.empty_cache()
 

@@ -236,7 +236,9 @@ class GenerationInterface(ABC):
     def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update the model weights from the given IPC handles."""
         raise NotImplementedError
-
+    def update_weights_from_ipc_handles_zmq(self) -> bool:
+        """Update the model weights from the given IPC handles."""
+        raise NotImplementedError
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
         raise NotImplementedError

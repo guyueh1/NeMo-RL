@@ -625,3 +625,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Stop GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
+
+    
+    def send_weights_ipc_handles(self) -> list[ray.ObjectRef]:
+        """Send the weights for IPC handles."""
+        futures = self.worker_group.run_all_workers_single_data("send_weights_ipc_handles")
+        return futures
+    
+    def update_weights_from_ipc_handles_zmq(self) -> list[ray.ObjectRef]:
+        """Update the weights from IPC handles."""
+        futures = self.worker_group.run_all_workers_single_data("update_weights_from_ipc_handles_zmq")
+        return futures

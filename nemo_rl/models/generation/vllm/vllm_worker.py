@@ -681,6 +681,37 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+    
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles_zmq")
+    def update_weights_from_ipc_handles_zmq(self) -> bool:
+        """Update weights from IPC handles by delegating to the vLLM Worker implementation."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_from_ipc_handles_zmq can only be used with async_engine=False. Use update_weights_from_ipc_handles_zmq_async instead."
+                )
+
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_from_ipc_handles_zmq", args=tuple()
+            )
+            worker_result = result_or_coro[0]
+
+            if not worker_result:
+                print(
+                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                )
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_ipc_handles")
     def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
@@ -778,7 +809,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             traceback.print_exc()
             return False
-
+    
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
         assert self.llm is not None, (

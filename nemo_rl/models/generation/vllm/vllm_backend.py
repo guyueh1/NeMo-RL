@@ -54,8 +54,9 @@ class VllmInternalWorkerExtension:
     def zmq_address(self):
         return f"ipc:///{self.report_device_id()}.sock"
 
-    def update_weights_from_ipc_zmq(self) -> bool:
+    def update_weights_from_ipc_handles_zmq(self) -> bool:
         """Update weights from IPC ZMQ."""
+        print(f"[VllmInternalWorkerExtension] Updating weights from IPC ZMQ to {self.zmq_address}", flush=True)
         if not hasattr(self, "_zmq_ctx") or self._zmq_ctx is None:
             self._zmq_ctx = zmq.Context()
             self.socket = self._zmq_ctx.socket(zmq.REP)
@@ -63,17 +64,18 @@ class VllmInternalWorkerExtension:
         
         while True:
             payload = self.socket.recv_pyobj()
+            # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
             if payload is None:
                 # means the update is done
-                (
-                    self.model_runner.model, self.model_config, self.device
-                )
                 torch.cuda.synchronize()
                 self.socket.send(b"")
                 break
             self.update_weights_from_local_ipc_handles(payload)
             torch.cuda.synchronize()
             self.socket.send(b"")
+            # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
+        
+        return True
 
     def report_device_id(self) -> str:
         from nemo_rl.utils.nvml import get_device_uuid
