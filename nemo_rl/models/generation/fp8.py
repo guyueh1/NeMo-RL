@@ -155,6 +155,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+    if vllm_cfg.get("use_flashinfer_moe_fp8", False):
+        os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "1"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -410,10 +412,9 @@ def process_weights_after_loading_moe(self, layer) -> None:
 
     flashinfer_moe_enabled = envs.VLLM_USE_FLASHINFER_MOE_FP8 and has_flashinfer_moe()
     if flashinfer_moe_enabled:
-        w13_weight = _swap_w13_to_w31(w13_weight)
-        w13_weight_scale_inv = _swap_w13_to_w31(w13_weight_scale_inv)
-        layer.w13_weight.data = w13_weight
-        layer.w13_weight_scale_inv.data = w13_weight_scale_inv
+        layer.w13_weight.data = _swap_w13_to_w31(layer.w13_weight.data)
+        layer.w13_weight_scale_inv.data = _swap_w13_to_w31(layer.w13_weight_scale_inv.data)
+
     
 def process_weights_after_loading(self, layer) -> None:
     from torch.nn import Parameter
