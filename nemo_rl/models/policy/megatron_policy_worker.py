@@ -1537,6 +1537,7 @@ class MegatronPolicyWorker:
             refit_param_info_hf[name] = metadata
         return refit_param_info_hf
     
+    # @torch.no_grad()
     def _pack_and_send_tensor_group(self, gathered_hf_params: dict, type_to_total_size: dict) -> None:
         """Pack a group of tensors and send them via IPC.
         
@@ -1561,7 +1562,7 @@ class MegatronPolicyWorker:
             size = tensor.numel()
             packed_tensors[dtype][
                 dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
-            ].copy_(tensor.detach().view(-1))
+            ].copy_(tensor.detach().view(-1))  # try non_blocking=True ??
             dtype_to_offset[dtype] += size
 
         # Create IPC handles for consolidated tensors
@@ -1578,8 +1579,10 @@ class MegatronPolicyWorker:
             tuple(gathered_hf_params.keys()),
         )
 
+        # with torch.profiler.record_function("zmq_send_pyobj"):
         self.zmq_socket.send_pyobj(serialized)
-        print(f"[MegatronPolicyWorker] Sent {len(gathered_hf_params)} tensors to {self.get_zmq_address()}", flush=True)
+        # print(f"[MegatronPolicyWorker] Sent {len(gathered_hf_params)} tensors to {self.get_zmq_address()}", flush=True)
+        # with torch.profiler.record_function("zmq_recv"):
         self.zmq_socket.recv()
 
     @torch.no_grad()
@@ -1593,7 +1596,7 @@ class MegatronPolicyWorker:
                 profile_memory=True,
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq/memory_trace",
+                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq_dsv3_new/memory_trace",
                     use_gzip=True,
                 ),
             )
@@ -1655,8 +1658,6 @@ class MegatronPolicyWorker:
             self._held_gather_buffer = None
             count_of_group += 1
             
-        del self._held_gather_buffer
-        self._held_gather_buffer = None
         self.zmq_socket.send_pyobj(None)
         self.zmq_socket.recv()
         # self.zmq_socket.close()
@@ -1667,7 +1668,7 @@ class MegatronPolicyWorker:
             profiler.stop()
         self.count_of_function_calls += 1
         print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
-        print(f"self.count_of_function_calls: {self.count_of_function_calls}", flush=True)
+        # print(f"self.count_of_function_calls: {self.count_of_function_calls}", flush=True)
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
