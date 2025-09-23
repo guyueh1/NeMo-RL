@@ -799,6 +799,7 @@ class MegatronPolicyWorker:
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+        self.count_of_function_calls = 0
     
     def get_zmq_address(self):
         return f"ipc:///{self.report_device_id()}.sock"
@@ -1584,7 +1585,8 @@ class MegatronPolicyWorker:
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/send_weights_ipc_handles")
     def send_weights_ipc_handles(self) -> None:
-        if os.getenv("NRL_PROFILE", "False") == "True":
+        print(f"os.getenv('NRL_PROFILE'): {os.getenv('NRL_PROFILE')}", flush=True)
+        if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
             profiler = torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
                 record_shapes=True,
@@ -1596,6 +1598,7 @@ class MegatronPolicyWorker:
                 ),
             )
             profiler.start()
+            print(f"profiler start", flush=True)
         if not hasattr(self, "zmq_socket"):
             self.init_zmq()
         if self._held_gather_buffer is not None:
@@ -1619,6 +1622,7 @@ class MegatronPolicyWorker:
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,
         )
         gathered_hf_params = {}
         type_to_total_size = defaultdict(lambda: 0)
@@ -1658,9 +1662,12 @@ class MegatronPolicyWorker:
         # self.zmq_socket.close()
         # gc.collect()
         # torch.cuda.empty_cache()
-        print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
-        if os.getenv("NRL_PROFILE", "False") == "True":
+        if os.getenv("NRL_PROFILE", "False") == "True" and self.count_of_function_calls >= 1:
+            print(f"profiler stop", flush=True)
             profiler.stop()
+        self.count_of_function_calls += 1
+        print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
+        print(f"self.count_of_function_calls: {self.count_of_function_calls}", flush=True)
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -1677,7 +1684,7 @@ class MegatronPolicyWorker:
             List of (parameter_name, size_in_bytes) tuples.
         """
         self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
-            [self.model]
+            [self.model],
         )
         param_info = []
 
@@ -1834,6 +1841,7 @@ class MegatronPolicyWorker:
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,
         )
         # broadcast from train rank0 worker to inference workers
         for _, tensor in hf_params_generator:
