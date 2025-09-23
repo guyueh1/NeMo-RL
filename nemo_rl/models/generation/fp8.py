@@ -401,7 +401,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
     
     from vllm.utils.flashinfer import has_flashinfer_moe
     import vllm.envs as envs
-    from vllm.model_executor.layers.quantization.fp8 import _swap_w13_to_w31
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import swap_w13_to_w31
     from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import is_rocm_aiter_moe_enabled
 
     self.rocm_aiter_moe_enabled = is_rocm_aiter_moe_enabled()
@@ -412,8 +412,8 @@ def process_weights_after_loading_moe(self, layer) -> None:
 
     flashinfer_moe_enabled = envs.VLLM_USE_FLASHINFER_MOE_FP8 and has_flashinfer_moe()
     if flashinfer_moe_enabled:
-        layer.w13_weight.data = _swap_w13_to_w31(layer.w13_weight.data)
-        layer.w13_weight_scale_inv.data = _swap_w13_to_w31(layer.w13_weight_scale_inv.data)
+        layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
+        layer.w13_weight_scale_inv.data = swap_w13_to_w31(layer.w13_weight_scale_inv.data)
 
     
 def process_weights_after_loading(self, layer) -> None:
