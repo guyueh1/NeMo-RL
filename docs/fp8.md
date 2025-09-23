@@ -89,5 +89,9 @@ This issue will be resolved once the Torch version is upgraded to **≥ 2.8.0** 
 
 ![Llama-3.1-8B-Instruct GRPO Curve BF16 vs FP8](assets/fp8_e2e_curve.png)
 
+The above results are from Llama-3.1-8B-Instruct GRPO experiments. You can run them with the following example configs:
+* For BF16: `examples/configs/grpo_math_8B_megatron.yaml`
+* For FP8: `examples/configs/grpo_math_8B_megatron_fp8.yaml`
+
 In the experiment in this figure, enabling FP8 rollout and training gives 15%-25% decrease in step time, and the validation accuracy curves match up to 1000 step.
 Efforts are ongoing to performs longer runs and further optimize performance.
