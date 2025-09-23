@@ -20,8 +20,8 @@ import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel
-from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
@@ -397,12 +397,16 @@ def cast_tensor_to_fp8_blockwise(
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp
 
+
 def process_weights_after_loading_moe(self, layer) -> None:
-    
-    from vllm.utils.flashinfer import has_flashinfer_moe
     import vllm.envs as envs
-    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import swap_w13_to_w31
-    from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import is_rocm_aiter_moe_enabled
+    from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+        is_rocm_aiter_moe_enabled,
+    )
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        swap_w13_to_w31,
+    )
+    from vllm.utils.flashinfer import has_flashinfer_moe
 
     self.rocm_aiter_moe_enabled = is_rocm_aiter_moe_enabled()
 
@@ -413,9 +417,11 @@ def process_weights_after_loading_moe(self, layer) -> None:
     flashinfer_moe_enabled = envs.VLLM_USE_FLASHINFER_MOE_FP8 and has_flashinfer_moe()
     if flashinfer_moe_enabled:
         layer.w13_weight.data = swap_w13_to_w31(layer.w13_weight.data)
-        layer.w13_weight_scale_inv.data = swap_w13_to_w31(layer.w13_weight_scale_inv.data)
+        layer.w13_weight_scale_inv.data = swap_w13_to_w31(
+            layer.w13_weight_scale_inv.data
+        )
 
-    
+
 def process_weights_after_loading(self, layer) -> None:
     from torch.nn import Parameter
     from vllm.model_executor.parameter import (
