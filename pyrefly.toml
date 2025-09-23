@@ -34,6 +34,8 @@ project-includes = [
     "docs/helpers.py",
     "examples/converters/convert_dcp_to_hf.py",
     "examples/converters/convert_megatron_to_hf.py",
+    "nemo_rl/3rdparty/Megatron-LM-workspace/Megatron-LM/megatron/training/datasets/__init__.py",
+    "nemo_rl/3rdparty/Megatron-LM-workspace/Megatron-LM/megatron/training/datasets/sft_dataset.py",
     "nemo_rl/algorithms/__init__.py",
     "nemo_rl/algorithms/interfaces.py",
     "nemo_rl/algorithms/utils.py",
