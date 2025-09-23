@@ -131,74 +131,6 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
-# Get the repository root by going up four directories from this file
-REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
-DEBUG_PATH = os.path.join(REPO_DIR, "memory_leak", "mbridge")
-os.makedirs(DEBUG_PATH, exist_ok=True)
-def log_memory_detailed(f, stage, device_idx=0):
-    """Detailed memory logging to understand what's happening"""
-    allocated = torch.cuda.memory_allocated(device_idx) / (1024**3)
-    reserved = torch.cuda.memory_reserved(device_idx) / (1024**3)
-    max_allocated = torch.cuda.max_memory_allocated(device_idx) / (1024**3)
-    max_reserved = torch.cuda.max_memory_reserved(device_idx) / (1024**3)
-    total = torch.cuda.get_device_properties(device_idx).total_memory / (1024**3)
-    free = total - reserved
-    
-    # Count tensors more carefully
-    tensor_count_cuda = 0
-    tensor_count_cpu = 0
-    memory_cuda = 0.0
-    memory_cpu = 0.0
-    
-    try:
-        for obj in gc.get_objects():
-            if isinstance(obj, torch.Tensor):
-                if obj.is_cuda:
-                    tensor_count_cuda += 1
-                    try:
-                        memory_cuda += obj.numel() * obj.element_size()
-                    except (TypeError, ValueError, RuntimeError):
-                        print(f"Error calculating memory for tensor: {obj}")
-                else:
-                    tensor_count_cpu += 1
-                    try:
-                        memory_cpu += obj.numel() * obj.element_size()
-                    except (TypeError, ValueError, RuntimeError):
-                        print(f"Error calculating memory for tensor: {obj}")
-    except (TypeError, ValueError, RuntimeError, AttributeError):
-        print(f"Error calculating memory for tensor: {obj}")
-    
-    # Ensure values are valid floats
-    try:
-        memory_cuda = float(memory_cuda) / (1024**3)
-    except (TypeError, ValueError):
-        memory_cuda = 0.0
-        
-    try:
-        memory_cpu = float(memory_cpu) / (1024**3)
-    except (TypeError, ValueError):
-        memory_cpu = 0.0
-    
-    f.write(f"\n{'='*60}\n")
-    f.write(f"MEMORY REPORT - {stage}\n")
-    f.write(f"{'='*60}\n")
-    f.write(f"GPU Memory:\n")
-    f.write(f"  Allocated: {allocated:.2f} GB ({allocated/total*100:.1f}%)\n")
-    f.write(f"  Reserved:  {reserved:.2f} GB\n")
-    f.write(f"  Max Allocated: {max_allocated:.2f} GB\n")
-    f.write(f"  Max Reserved:  {max_reserved:.2f} GB\n")
-    f.write(f"  Total: {total:.2f} GB\n")
-    f.write(f"  Free: {free:.2f} GB\n")
-    f.write(f"\nTensor Counts:\n")
-    f.write(f"  tensors_on_cpu: {tensor_count_cpu}\n")
-    f.write(f"  tensors_on_cuda:0: {tensor_count_cuda}\n")
-    f.write(f"  memory_on_cpu: {memory_cpu:.2f} GB\n")
-    f.write(f"  memory_on_cuda:0: {memory_cuda:.2f} GB\n")
-    f.write(f"{'='*60}\n\n")
-    f.flush()
-
-    return log_memory_detailed
-
 
 def broadcast_object_across_pp_ranks(obj):
     """Broadcast an object across pipeline parallel ranks.
@@ -1604,7 +1536,66 @@ class MegatronPolicyWorker:
             refit_param_info_hf[name] = metadata
         return refit_param_info_hf
     
+    def _pack_and_send_tensor_group(self, gathered_hf_params: dict, type_to_total_size: dict) -> None:
+        """Pack a group of tensors and send them via IPC.
+        
+        Args:
+            gathered_hf_params: Dictionary of parameter names to tensors
+            type_to_total_size: Dictionary mapping dtype to total size
+        """
+        packed_tensors = {
+            dtype: torch.empty(
+                total_size,
+                device=next(iter(gathered_hf_params.values())).device,
+                dtype=dtype,
+                requires_grad=False,
+            )
+            for dtype, total_size in type_to_total_size.items()
+        }
+
+        dtype_to_offset = defaultdict(lambda: 0)
+        # Copy tensors into consolidated buffers
+        for key, tensor in gathered_hf_params.items():
+            dtype = tensor.dtype
+            size = tensor.numel()
+            packed_tensors[dtype][
+                dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
+            ].copy_(tensor.detach().view(-1))
+            dtype_to_offset[dtype] += size
+
+        # Create IPC handles for consolidated tensors
+        all_handles = [
+            (dtype, get_handle_from_tensor(tensor))
+            for dtype, tensor in packed_tensors.items()
+        ]
+
+        # Store reference to prevent garbage collection
+        self._held_gather_buffer = packed_tensors
+        serialized = (
+            True,  # pack_tensor_for_ipc
+            all_handles,
+            tuple(gathered_hf_params.keys()),
+        )
+
+        self.zmq_socket.send_pyobj(serialized)
+        print(f"[MegatronPolicyWorker] Sent {len(gathered_hf_params)} tensors to {self.get_zmq_address()}", flush=True)
+        self.zmq_socket.recv()
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/send_weights_ipc_handles")
     def send_weights_ipc_handles(self) -> None:
+        if os.getenv("NRL_PROFILE", "False") == "True":
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True,
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    "/lustre/fsw/portfolios/coreai/users/zhiyul/benchmark-rl/NeMo-RL/zmq/memory_trace",
+                    use_gzip=True,
+                ),
+            )
+            profiler.start()
         if not hasattr(self, "zmq_socket"):
             self.init_zmq()
         if self._held_gather_buffer is not None:
@@ -1623,68 +1614,53 @@ class MegatronPolicyWorker:
         ## default to 20% to get some more speedup than 10%, OOM if set to 30%
         memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.2")
         total_available_bytes *= float(memory_ratio)
+        print(f"[MegatronPolicyWorker] Total available bytes: {total_available_bytes}", flush=True)
         
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
         )
-        pack_tensor_for_ipc = True
         gathered_hf_params = {}
         type_to_total_size = defaultdict(lambda: 0)
         used_bytes = 0
+        count_of_group = 0
+        prec_to_bytes = {
+            torch.bfloat16: 2,
+            torch.float16: 2,
+            torch.float32: 4,
+        }
+        
         for name, tensor in hf_params_generator:
-            used_bytes += tensor.numel() * type_to_total_size[tensor.dtype] 
+            used_bytes += tensor.numel() * prec_to_bytes[tensor.dtype]
             gathered_hf_params[name] = tensor
             type_to_total_size[tensor.dtype] += tensor.numel()
-            if used_bytes > total_available_bytes:
-                packed_tensors = {
-                    dtype: torch.empty(
-                        total_size,
-                        device=next(iter(gathered_hf_params.values())).device,
-                        dtype=dtype,
-                        requires_grad=False,
-                    )
-                    for dtype, total_size in type_to_total_size.items()
-                }
-
-                dtype_to_offset = defaultdict(lambda: 0)
-                # Copy tensors into consolidated buffers
-                for key, tensor in gathered_hf_params.items():
-                    dtype = tensor.dtype
-                    size = tensor.numel()
-                    packed_tensors[dtype][
-                        dtype_to_offset[dtype] : dtype_to_offset[dtype] + size
-                    ].copy_(tensor.detach().view(-1))
-                    dtype_to_offset[dtype] += size
-
-                # Create IPC handles for consolidated tensors
-                all_handles = [
-                    (dtype, get_handle_from_tensor(tensor))
-                    for dtype, tensor in packed_tensors.items()
-                ]
-
-                # Store reference to prevent garbage collection
-                self._held_gather_buffer = packed_tensors
-                serialized = (
-                    pack_tensor_for_ipc,
-                    all_handles,
-                    tuple(gathered_hf_params.keys()),
-                )
-
-                self.zmq_socket.send_pyobj(serialized)
-                # print(f"[MegatronPolicyWorker] Sent serialized to {self.get_zmq_address()}: {serialized}", flush=True)
-                self.zmq_socket.recv()
-                # print(f"[MegatronPolicyWorker] Received response from {self.get_zmq_address()}", flush=True)
+            
+            if used_bytes >= total_available_bytes:
+                self._pack_and_send_tensor_group(gathered_hf_params, type_to_total_size)
                 del self._held_gather_buffer
                 self._held_gather_buffer = None
                 gathered_hf_params = {}
                 type_to_total_size = defaultdict(lambda: 0)
                 used_bytes = 0
+                count_of_group += 1
+
+        # Send any remaining tensors
+        if gathered_hf_params:
+            self._pack_and_send_tensor_group(gathered_hf_params, type_to_total_size)
+            del self._held_gather_buffer
+            self._held_gather_buffer = None
+            count_of_group += 1
+            
+        del self._held_gather_buffer
+        self._held_gather_buffer = None
         self.zmq_socket.send_pyobj(None)
         self.zmq_socket.recv()
         # self.zmq_socket.close()
-        gc.collect()
-        torch.cuda.empty_cache()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        print(f"[MegatronPolicyWorker] Packed {count_of_group} groups of tensors", flush=True)
+        if os.getenv("NRL_PROFILE", "False") == "True":
+            profiler.stop()
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
         """Calculate parameter information for refit.
@@ -1927,9 +1903,6 @@ class MegatronPolicyWorker:
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
-        with open(os.path.join(DEBUG_PATH, f"memory_state_{self.rank}.log"), "a") as f:
-            msg = log_memory_detailed(f, f"{prefix + '_' if prefix else '' }end_of_function_offload_before_refit")
-            print(msg, flush=True)
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
@@ -1944,9 +1917,6 @@ class MegatronPolicyWorker:
         gc.collect()
         torch.cuda.empty_cache()
 
-        with open(os.path.join(DEBUG_PATH, f"memory_state_{self.rank}.log"), "a") as f:
-            msg = log_memory_detailed(f, "begin_of_function_offload_after_refit")
-            print(msg, flush=True)
         # Offload as much as possible on the CPU
         self.model = self.move_model(self.model, "cpu")
         self.model.eval()
@@ -1959,9 +1929,6 @@ class MegatronPolicyWorker:
             f"GPU Memory after refit complete: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
-        with open(os.path.join(DEBUG_PATH, f"memory_state_{self.rank}.log"), "a") as f:
-            msg = log_memory_detailed(f, f"end_of_function_offload_after_refit")
-            print(msg, flush=True)
 
     @torch.no_grad()
     def move_model(

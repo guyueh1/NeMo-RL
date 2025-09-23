@@ -67,11 +67,11 @@ class VllmInternalWorkerExtension:
             # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
             if payload is None:
                 # means the update is done
-                torch.cuda.synchronize()
+                # torch.cuda.synchronize()
                 self.socket.send(b"")
                 break
             self.update_weights_from_local_ipc_handles(payload)
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
             self.socket.send(b"")
             # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
         
