@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import os
 import time
 import warnings
@@ -19,7 +20,6 @@ from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar
-import math
 
 import ray
 import torch
@@ -604,7 +604,7 @@ class MegatronPolicyWorker:
                 raise KeyError(f"Missing key in fp8_cfg: {e}")
             if model_cfg.fp8_param:
                 warnings.warn(
-                    "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. " 
+                    "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
                     "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
                 )
 
