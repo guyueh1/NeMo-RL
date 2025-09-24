@@ -26,9 +26,6 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
-from kitchen.quantization import QParams, ScalingType, MMParams
-from kitchen.quantization_subchannel_block_hybrid import HybridBlockAndVectorTiledQuantizeOp
-from kitchen import ops
 from kitchen.base import LinearBaseModule
 
 FP8_BLOCK_QUANT_KWARGS = {
@@ -42,7 +39,7 @@ FP8_BLOCK_QUANT_KWARGS = {
 @dataclass(frozen=True)
 class FP8Config:
     use_kitchen: bool = False
-    kitchen_recipe: Any = None
+    kitchen_qlinear_params: Any = None
     use_weight_pow2_scale: bool = False
     use_activation_pow2_scale: bool = False
     num_first_layers_in_bf16: int = 0
@@ -153,6 +150,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "FP8 generation for MoE models is currently not supported"
         )
 
+    if vllm_cfg.get("use_kitchen", False):
+        print(f"Using kitchen to emulate quantized linear in vllm, other fp8 related vllm kwargs are ignored!")
+        recipe_num = int(os.getenv("KITCHEN_RECIPE", "5"))
+        from nvidia_kitchen.config import get_qlinear_params_from_qat_params
+        qlinear_params = get_qlinear_params_from_qat_params(recipe_num)
+
     global global_fp8_config
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
@@ -163,14 +166,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
         model_parallel_size=model_parallel_size,
         use_kitchen=vllm_cfg.get("use_kitchen", False),
+        kitchen_qlinear_params=qlinear_params,
     )
-
-    if vllm_cfg.get("use_kitchen", False):
-        print(f"Using kitchen to emulate quantized linear in vllm, other fp8 related vllm kwargs are ignored!")
-        recipe_num = int(os.getenv("KITCHEN_RECIPE", "5"))
-        from nvidia_kitchen.config import get_qlinear_params_from_qat_params
-        qlinear_params = get_qlinear_params_from_qat_params(recipe_num)
-        global_fp8_config.kitchen_qlinear_params = qlinear_params
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
@@ -471,10 +468,10 @@ def kitchen_matmul(
 
     qlinear_params = global_fp8_config.kitchen_qlinear_params
     
-    ret = qlinear_params.quantize_op.quantize(x, qlinear_params.x_qparams)
+    ret = qlinear_params.quantize_op.quantize(x, qlinear_params.x_params)
     qx, sx = ret.data, ret.scale
     
-    ret = qlinear_params.quantize_op.quantize(layer.weight, qlinear_params.w_qparams)
+    ret = qlinear_params.quantize_op.quantize(layer.weight, qlinear_params.w_params)
     qw, sw = ret.data, ret.scale
     
     ret = qlinear_params.quantize_op.qgemm(
@@ -485,8 +482,8 @@ def kitchen_matmul(
         sx=sx, 
         sw=sw,
         bias=layer.bias,
-        qparams_x=qlinear_params.x_qparams,
-        qparams_w=qlinear_params.w_qparams,
+        qparams_x=qlinear_params.x_params,
+        qparams_w=qlinear_params.w_params,
     )
     ret = LinearBaseModule._rm_pad_for_fp8(ret, x_original_shape)
     return ret
