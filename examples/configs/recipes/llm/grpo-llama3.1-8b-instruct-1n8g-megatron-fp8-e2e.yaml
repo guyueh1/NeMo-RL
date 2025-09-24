@@ -3,7 +3,7 @@ grpo:
   num_generations_per_prompt: 32
   max_rollout_turns: 1
   max_num_epochs: 1
-  max_num_steps: 30
+  max_num_steps: 500
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
@@ -22,70 +22,79 @@ loss_fn:
   ratio_clip_max: 0.2
   ratio_clip_c: null
   use_on_policy_kl_approximation: false
-  use_importance_sampling_correction: false
+  use_importance_sampling_correction: True
   token_level_loss: true
 checkpointing:
-  enabled: false
-  checkpoint_dir: results/grpo-qwen2.5-7b-instruct-4n8g-megatron
+  enabled: true
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-e2e
   metric_name: val_reward
   higher_is_better: true
   keep_top_k: 3
-  save_period: 100
+  save_period: 10
   checkpoint_must_save_by: null
 policy:
-  model_name: Qwen/Qwen2.5-7B-Instruct
+  model_name: meta-llama/Llama-3.1-8B-Instruct
   tokenizer:
-    name: ${policy.model_name}
+    name: meta-llama/Llama-3.1-8B-Instruct
   train_global_batch_size: 512
   train_micro_batch_size: 1
   generation_batch_size: 32
   logprob_batch_size: 2
   max_total_sequence_length: 4096
   precision: bfloat16
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1
+
   dtensor_cfg:
-    enabled: false
+    enabled: False
+
+  dynamic_batching:
+    enabled: False
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
   megatron_cfg:
-    enabled: true
-    empty_unused_memory_level: 0
-    activation_checkpointing: false
-    converter_type: "Qwen2ForCausalLM"
-    tensor_model_parallel_size: 2
+    enabled: True
+    empty_unused_memory_level: 1
+    converter_type: "LlamaForCausalLM"
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
+    sequence_parallel: False
+    pipeline_dtype: ${policy.precision}
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
-    context_parallel_size: 1
-    pipeline_dtype: ${policy.precision}
-    sequence_parallel: false
-    freeze_moe_router: true
+    freeze_moe_router: True
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     moe_permute_fusion: false
-    #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
-    
+    activation_checkpointing: True
+    defer_fp32_logits: True
+
     optimizer:
       optimizer: "adam"
-      lr: 5.0e-6
-      min_lr: 5.0e-7
-      weight_decay: 0.01
-      bf16: true
-      fp16: false
+      lr: 5.0e-7
+      min_lr: 5.0e-8
+      weight_decay: 0.0
+      bf16: True
+      fp16: False
       params_dtype: "float32"
 
-      #adam
       adam_beta1: 0.9
       adam_beta2: 0.999
       adam_eps: 1e-8
 
-      #sgd
-      sgd_momentum: 0.9
-
-      #distributed optimizer
-      use_distributed_optimizer: true
-      use_precision_aware_optimizer: true
+      use_distributed_optimizer: True
+      use_precision_aware_optimizer: False
 
       clip_grad: ${policy.max_grad_norm}
 
@@ -95,49 +104,26 @@ policy:
       weight_decay_incr_style: "constant"
       lr_decay_style: "constant"
       lr_decay_iters: 1000
-      lr_warmup_iters: 50
-      lr_warmup_init: 5.0e-7
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-8
 
     distributed_data_parallel_config:
-      grad_reduce_in_fp32: false
-      overlap_grad_reduce: true
-      overlap_param_gather: true
-      average_in_collective: true
-      use_custom_fsdp: false
+      grad_reduce_in_fp32: False
+      overlap_grad_reduce: True
+      overlap_param_gather: True
+      average_in_collective: True
+      use_custom_fsdp: False
       data_parallel_sharding_strategy: "optim_grads_params"
-  dynamic_batching:
-    enabled: false
-  sequence_packing:
-    enabled: true
-    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
-    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
-    algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
-  make_sequence_length_divisible_by: 4
-  max_grad_norm: 1
-  optimizer:
-    name: torch.optim.AdamW
-    kwargs:
-      lr: 3e-07
-      weight_decay: 0.01
-      betas:
-        - 0.9
-        - 0.999
-      eps: 1e-08
-      foreach: false
-      fused: false
-  scheduler:
-    - name: torch.optim.lr_scheduler.LinearLR
-      kwargs:
-        start_factor: 0.1
-        end_factor: 1
-        total_iters: 13
-    - name: torch.optim.lr_scheduler.ConstantLR
-      kwargs:
-        factor: 1
-        total_iters: 10000000000
-    - milestones:
-        - 13
+
+    fp8_cfg:
+      enabled: true
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+    
+    env_vars:
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
+
   generation:
     backend: vllm
     max_new_tokens: 4096
@@ -145,17 +131,21 @@ policy:
     top_p: 1
     top_k: null
     stop_token_ids:
-      - 151645
+      - 128009
     stop_strings: null
     vllm_cfg:
       async_engine: false
-      precision: ${policy.precision}
-      tensor_parallel_size: 4
+      precision: 'fp8'
+      tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1
-      gpu_memory_utilization: 0.6
+      enable_expert_parallel: false
+      gpu_memory_utilization: 0.5
       max_model_len: 4096
       enforce_eager: False
+      use_deep_gemm: true
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
     colocated:
       enabled: true
       resources:
@@ -171,19 +161,19 @@ env:
   math:
     num_workers: 8
 logger:
-  log_dir: logs/grpo-qwen2.5-7b-instruct-4n8g-megatron
+  log_dir: logs/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-e2e
   num_val_samples_to_print: 0
   wandb_enabled: true
   tensorboard_enabled: true
-  mlflow_enabled: False
+  mlflow_enabled: false
   monitor_gpus: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen2.5-7b-instruct-4n8g-megatron
+    name: grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-e2e
   tensorboard: {}
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
 cluster:
   gpus_per_node: 8
-  num_nodes: 4
+  num_nodes: 1
