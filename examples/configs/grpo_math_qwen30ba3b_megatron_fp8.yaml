@@ -26,4 +26,4 @@ policy:
       expert_parallel_size: 8 # need to make moe_intermediate_size / expert_tensor_parallel_size % 128 == 0
       precision: "fp8"
       use_deep_gemm: true
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.5
