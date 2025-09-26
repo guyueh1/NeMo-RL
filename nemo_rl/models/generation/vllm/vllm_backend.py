@@ -62,18 +62,59 @@ class VllmInternalWorkerExtension:
             self.socket = self._zmq_ctx.socket(zmq.REP)
             self.socket.connect(self.zmq_address)
         
+        prec_to_bytes = {
+            torch.bfloat16: 2,
+            torch.float16: 2,
+            torch.float32: 4,
+        }
+        
         while True:
             payload = self.socket.recv_pyobj()
             # print(f"[VllmInternalWorkerExtension] Received payload from {self.zmq_address}: {payload}", flush=True)
-            if payload is None:
+            if isinstance(payload, dict):
+                ipc_handle = payload['ipc_handle']
+                # get ipc buffer
+                args = ipc_handle[0]
+                list_args = list(args)
+                list_args[6] = self.device.index
+                ipc_buffer = rebuild_cuda_tensor(*list_args)
+                self.socket.send(b"")
+            elif payload is None:
                 # means the update is done
                 # torch.cuda.synchronize()
                 self.socket.send(b"")
+                try:
+                    del ipc_buffer
+                except:
+                    pass
                 break
-            self.update_weights_from_local_ipc_handles(payload)
-            # torch.cuda.synchronize()
-            self.socket.send(b"")
-            # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
+            else:
+                assert isinstance(payload, tuple), "payload should be a tuple"
+                if len(payload) > 1:
+                    self.update_weights_from_local_ipc_handles(payload)
+                else:
+                    keys = payload[0]
+                    offset = 0
+                    weights = []
+                    for key in keys:
+                        shape, dtype, size = self.state_dict_info[key]
+                        size_bytes = size * prec_to_bytes[dtype]
+                        weight = ipc_buffer[offset:offset+size_bytes].view(dtype).view(*shape)
+                        weights.append((key, weight))
+                        offset += size_bytes
+
+                    # Load weights into the model
+                    from nemo_rl.models.generation import fp8
+
+                    if fp8.is_fp8_model(self.model_runner.vllm_config):
+                        # the fp8 load_weights additionally casts bf16 weights into fp8
+                        fp8.load_weights(weights, self.model_runner)
+                    else:
+                        self.model_runner.model.load_weights(weights=weights)
+
+                # torch.cuda.synchronize()
+                self.socket.send(b"")
+                # print(f"[VllmInternalWorkerExtension] Sent response to {self.zmq_address}", flush=True)
         
         return True
 
