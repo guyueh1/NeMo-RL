@@ -39,7 +39,7 @@ FP8_BLOCK_QUANT_KWARGS = {
 @dataclass(frozen=True)
 class FP8Config:
     use_kitchen: bool = False
-    kitchen_qlinear_params: Any = None
+    kitchen_recipe_num: Any = None
     use_weight_pow2_scale: bool = False
     use_activation_pow2_scale: bool = False
     num_first_layers_in_bf16: int = 0
@@ -54,6 +54,7 @@ class FP8State:
     seen_params: set = field(default_factory=lambda: set())
     fp8_param_names: set = field(default_factory=lambda: set())
     vllm_patches: list = field(default_factory=lambda: [])
+    kitchen_qlinear_params: Any = None
 
 
 # Global FP8 config that can be accessed by patched vLLM functions
@@ -153,8 +154,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     if vllm_cfg.get("use_kitchen", False):
         print(f"Using kitchen to emulate quantized linear in vllm, other fp8 related vllm kwargs are ignored!")
         recipe_num = int(os.getenv("KITCHEN_RECIPE", "5"))
-        from nvidia_kitchen.config import get_qlinear_params_from_qat_params
-        qlinear_params = get_qlinear_params_from_qat_params(recipe_num)
 
     global global_fp8_config
     global_fp8_config = FP8Config(
@@ -166,7 +165,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
         model_parallel_size=model_parallel_size,
         use_kitchen=vllm_cfg.get("use_kitchen", False),
-        kitchen_qlinear_params=qlinear_params,
+        kitchen_recipe_num=recipe_num,
     )
 
     if vllm_cfg.get("use_deep_gemm", False):
@@ -466,7 +465,16 @@ def kitchen_matmul(
     x_original_shape = x.shape
     x = LinearBaseModule._pad_tensor_for_fp8(x, divisor=128)
 
-    qlinear_params = global_fp8_config.kitchen_qlinear_params
+    global fp8_state
+    if fp8_state.kitchen_qlinear_params is None:
+        assert global_fp8_config.kitchen_recipe_num is not None, "kitchen_recipe_num is not set"
+        from nvidia_kitchen.config import get_qlinear_params_from_qat_params
+        qlinear_params = get_qlinear_params_from_qat_params(
+            global_fp8_config.kitchen_recipe_num
+        )
+        fp8_state.kitchen_qlinear_params = qlinear_params
+    else:
+        qlinear_params = fp8_state.kitchen_qlinear_params
     
     ret = qlinear_params.quantize_op.quantize(x, qlinear_params.x_params)
     qx, sx = ret.data, ret.scale
