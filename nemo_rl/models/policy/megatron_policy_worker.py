@@ -1574,6 +1574,7 @@ class MegatronPolicyWorker:
         return refit_param_info_hf
     
     # @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/_pack_and_send_tensor_group")
     def _pack_and_send_tensor_group(self, gathered_hf_params: dict, type_to_total_size: dict, ipc_handle: tuple[Any] = None, ipc_buffer: torch.Tensor = None) -> None:
         """Pack a group of tensors and send them via IPC.
         
@@ -1673,7 +1674,6 @@ class MegatronPolicyWorker:
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,
         )
         gathered_hf_params = {}
         type_to_total_size = defaultdict(lambda: 0)
