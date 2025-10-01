@@ -608,15 +608,15 @@ class MegatronPolicyWorker:
                     "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
                 )
 
-        # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
-        # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
-        optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"].get(
-            "optimizer_cpu_offload", False
-        )
-        optimizer_offload_fraction = self.cfg["megatron_cfg"]["optimizer"].get(
-            "optimizer_offload_fraction", 0.0
-        )
+        optimizer_cpu_offload = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_cpu_offload"
+        ]
+        optimizer_offload_fraction = self.cfg["megatron_cfg"]["optimizer"][
+            "optimizer_offload_fraction"
+        ]
         if optimizer_cpu_offload:
+            # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
+            # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
             assert optimizer_offload_fraction == 1.0, (
                 "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
             )
