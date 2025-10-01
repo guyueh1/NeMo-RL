@@ -1757,9 +1757,7 @@ class MegatronPolicyWorker:
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and (
-                not self.cfg["megatron_cfg"]["optimizer"].get(
-                    "optimizer_cpu_offload", False
-                )
+                not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
             )
         ):
             if isinstance(self.optimizer, ChainedOptimizer):
@@ -1792,9 +1790,7 @@ class MegatronPolicyWorker:
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and (
-                not self.cfg["megatron_cfg"]["optimizer"].get(
-                    "optimizer_cpu_offload", False
-                )
+                not self.cfg["megatron_cfg"]["optimizer"]["optimizer_cpu_offload"]
             )
         ):
             # Iterate through the state dictionaries for each parameter group
