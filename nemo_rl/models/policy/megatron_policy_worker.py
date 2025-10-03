@@ -814,9 +814,6 @@ class MegatronPolicyWorker:
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
-        os.environ["NCCL_DEBUG"] = "INFO"
-        os.environ["NCCL_DEBUG_SUBSYS"] = "TUNING"
-
     def init_collective(self, ip: str, port: int, world_size: int) -> None:
         """Initialize the collective communication."""
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
