@@ -18,7 +18,6 @@ from typing import Callable, Optional
 import torch
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
-from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepSeekV3Config
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -77,7 +76,7 @@ def convert_config_to_flops_config(
             attention_heads=config.num_attention_heads,
             vocab_size=config.vocab_size,
         ), llama
-    elif isinstance(config, DeepSeekV3Config):
+    elif config.__class__.model_type == "deepseek_v3":
         return FLOPSConfig(
             gbs=0,
             hs=config.hidden_size,
