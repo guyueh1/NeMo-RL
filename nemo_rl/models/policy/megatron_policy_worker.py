@@ -616,13 +616,13 @@ class MegatronPolicyWorker:
 
         from megatron.core.quantization.utils import kitchen_quantization_recipe_config
 
-        recipe_num = int(os.getenv("KITCHEN_RECIPE", "5"))
+        recipe_num = int(os.getenv("MEGATRON_KITCHEN_RECIPE", "5"))
         model_cfg.use_kitchen = self.cfg["megatron_cfg"].get("use_kitchen", False)
 
         kitchen_recipe = kitchen_quantization_recipe_config(recipe_num)
         model_cfg.quant_recipe = kitchen_recipe
-        print(f"Kitchen recipe: {kitchen_recipe}")
-        print("use_kitchen: ", model_cfg.use_kitchen)
+        print(f"[MegatronPolicyWorker] Kitchen recipe: {kitchen_recipe}")
+        print("[MegatronPolicyWorker] use_kitchen: ", model_cfg.use_kitchen)
 
         checkpoint_config = CheckpointConfig(
             save_interval=100,
