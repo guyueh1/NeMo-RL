@@ -860,6 +860,19 @@ class MegatronPolicyWorker:
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+
+        # Only TP0PP0 gets the data, other MP ranks get None; now TP0PP0 needs
+        # to broadcast the data to other MP ranks. This is currently via cpu which
+        # is slow, we should change it to gpu broadcast for tensors. 
+        if data is not None:
+            data = data.to('cpu')
+        obj_list = [data]
+        group = parallel_state.get_model_parallel_group()
+        ranks = torch.distributed.get_process_group_ranks(group)
+        torch.distributed.broadcast_object_list(obj_list, src=ranks[0], group=group)
+        data = obj_list[0]
+        data = data.to(torch.cuda.current_device())
+        
         self.model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None

@@ -489,8 +489,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             in_sharded_axes=["data_parallel"],
             replicate_on_axes=[
                 "context_parallel",
-                "tensor_parallel",
-                "pipeline_parallel",
             ],
             output_is_replicated=[
                 "context_parallel",
@@ -503,6 +501,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "gbs": batch_size,
                 "mbs": micro_batch_size,
             },
+            make_dummy_calls_to_free_axes=True,
         )
         results = self.worker_group.get_all_worker_results(futures)
 
