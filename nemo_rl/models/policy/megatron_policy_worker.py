@@ -614,7 +614,7 @@ class MegatronPolicyWorker:
 
         from megatron.core.quantization.utils import kitchen_quantization_recipe_config
 
-        recipe_num = int(os.getenv("KITCHEN_RECIPE", "5"))
+        recipe_num = int(os.getenv("MEGATRON_KITCHEN_RECIPE", "1"))
         model_cfg.use_kitchen = self.cfg["megatron_cfg"].get("use_kitchen", False)
 
         kitchen_recipe = kitchen_quantization_recipe_config(recipe_num)
