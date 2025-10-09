@@ -1640,6 +1640,18 @@ class MegatronPolicyWorker:
         self.refit_conversion_tasks_current_index = 0
         return self.refit_param_info_mcore, total_available_bytes
 
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/refit_dry_run")
+    def refit_dry_run(self):
+        """Dry run the refit process to get the size of the weights."""
+        
+        hf_params_generator = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+        )
+        for _ in hf_params_generator:
+            pass
+
     # Temporary fix, 'keys' is a kwarg due to some sort of ray bug
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/get_weights_ipc_handles")
@@ -1989,3 +2001,26 @@ class MegatronPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    def nvtx_range_push(self, message: str) -> None:
+        """Push an NVTX range."""
+        torch.cuda.nvtx.range_push(message)
+    
+    def nvtx_range_pop(self) -> None:
+        """Pop an NVTX range."""
+        torch.cuda.nvtx.range_pop()
+
+    def report_pp_ep_ranks(self) -> tuple[int, int]:
+        """Report the pipeline and expert parallel ranks."""
+        return (
+            parallel_state.get_pipeline_model_parallel_rank(),
+            parallel_state.get_expert_model_parallel_rank(),
+        )
+    
+    def report_device_uuid(self) -> str:
+        """Report the UUID of the current CUDA device using NVML.
+
+        Returns:
+            str: UUID of the device in the format "GPU-xxxxx"
+        """
+        return self.report_device_id()

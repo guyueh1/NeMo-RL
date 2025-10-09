@@ -706,6 +706,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def refit_dry_run(self) -> None:
+        """Dry run the refit process to get the size of the weights."""
+        futures = self.worker_group.run_all_workers_single_data("refit_dry_run")
+        ray.get(futures)
+
     def prepare_weights_for_ipc(
         self, _refit_buffer_size_gb: Optional[int] = None
     ) -> list[list[str]]:
@@ -850,3 +855,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """Stop GPU profiling."""
         futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
         ray.get(futures)
+
+    def nvtx_range_push(self, message: str) -> None:
+        """Push an NVTX range."""
+        futures = self.worker_group.run_all_workers_single_data("nvtx_range_push", message=message)
+        ray.get(futures)
+    
+    def nvtx_range_pop(self) -> None:
+        """Pop an NVTX range."""
+        futures = self.worker_group.run_all_workers_single_data("nvtx_range_pop")
+        ray.get(futures)
+
+    def report_pp_ep_ranks(self) -> tuple[int, int]:
+        futures = self.worker_group.run_all_workers_single_data("report_pp_ep_ranks")
+        results = ray.get(futures)
+        return results
+    
+    def report_device_uuid(self) -> str:
+        """Report the UUID of the current CUDA device using NVML.
+
+        Returns:
+            str: UUID of the device in the format "GPU-xxxxx"
+        """
+        futures = self.worker_group.run_all_workers_single_data("report_device_uuid")
+        results = ray.get(futures)
+        return results
