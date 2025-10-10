@@ -409,7 +409,7 @@ class RayVirtualCluster:
         Returns:
             Tuple of (address, port)
         """
-        if hasattr(self, "_sorted_bundle_indices"):
+        if self._sorted_bundle_indices is not None:
             return self.get_available_address_and_port(pg_idx=0, bundle_idx=self._sorted_bundle_indices[0])
         return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
     
@@ -419,7 +419,7 @@ class RayVirtualCluster:
             raise ValueError("Placement groups must be initialized before calling _get_sorted_bundle_indices")
         
         if len(self._node_placement_groups) != 1:
-            raise ValueError("Only unified placement group supports getting sorted bundle indices")
+            return None
         
         pg = self._node_placement_groups[0]
         pg_data = placement_group_table(pg)
