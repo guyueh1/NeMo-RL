@@ -170,38 +170,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pg = cluster.get_placement_groups()
 
         if len(pg) == 1:
-            unified_pg = pg[0]
-
-            def get_node_bundles(pg) -> dict[str, list[int]]:
-                # Retrieve mapping from node ID to bundle indices from a placement group.
-                try:
-                    pg_table = ray.util.placement_group_table(pg)
-                    bundle_to_node = pg_table["bundles_to_node_id"]
-                except Exception as e:
-                    raise RuntimeError(
-                        "Failed to retrieve bundle/node mapping from placement group"
-                    ) from e
-
-                node_bundles: dict[str, list[int]] = defaultdict(list)
-                for bundle_idx, node_id in bundle_to_node.items():
-                    node_bundles[node_id].append(bundle_idx)
-                for bundles in node_bundles.values():
-                    bundles.sort()
-
-                # Create reproducible node indices
-                sorted_nodes = sorted(node_bundles)
-
-                # Flatten bundles in node order
-                flat: list[int] = []
-                for nid in sorted_nodes:
-                    flat.extend(node_bundles[nid])
-
-                group = []
-                for bundle_idx in flat:
-                    group.append((0, [bundle_idx]))
-                return group
-
-            tied_groups = get_node_bundles(unified_pg)
+            tied_groups = [(i // 8, [x]) for i,x in enumerate(cluster._sorted_bundle_indices)]
 
             self.worker_group = RayWorkerGroup(
                 cluster,
