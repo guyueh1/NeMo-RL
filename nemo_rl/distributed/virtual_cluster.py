@@ -171,7 +171,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     )
 
 @ray.remote(num_gpus=1)
-class GetGPUIDActor:
+class GetGPUIDActor:  # pragma: no cover
     """ Util actor class to return GPU id of the current worker."""
     def get_gpu_id(self):
         return ray.get_gpu_ids()[0]

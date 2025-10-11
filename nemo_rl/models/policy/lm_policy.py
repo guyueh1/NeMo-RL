@@ -170,7 +170,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         pg = cluster.get_placement_groups()
 
         if len(pg) == 1:
-            tied_groups = [(i // 8, [x]) for i,x in enumerate(cluster._sorted_bundle_indices)]
+            group_size = cluster.num_gpus_per_node
+            tied_groups = [
+                (i // group_size, [bundle_idx])
+                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
+            ]
 
             self.worker_group = RayWorkerGroup(
                 cluster,
