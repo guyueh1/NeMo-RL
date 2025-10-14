@@ -167,9 +167,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pre_init_communication_queue=pre_init_queue,
         )
 
-        pg = cluster.get_placement_groups()
-
-        if len(pg) == 1:
+        if cluster._sorted_bundle_indices is not None:
+            # The cluster has initialized a unified placemenet group across nodes
+            # In this case, we need to create workers based on sorted bundle indices
             group_size = cluster.num_gpus_per_node
             tied_groups = [
                 (i // group_size, [bundle_idx])
