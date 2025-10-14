@@ -5,6 +5,7 @@ requires = [
     "setuptools",
     "pybind11",
     "torch",
+    "nvidia-mathdx==25.1.1",
 ]
 build-backend = "setuptools.build_meta"
 
