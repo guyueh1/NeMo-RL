@@ -5,6 +5,7 @@ import shutil
 import pathlib
 import subprocess
 import setuptools
+import site
 from typing import Tuple
 import torch.utils.cpp_extension
 
@@ -142,7 +143,9 @@ def get_nvcc_flags(debug_mode: bool, for_cutlass_gemm: bool) -> list[str]:
 def get_nvcc_gencode_flags(cuda_version: Tuple[int, ...]) -> list[str]:
     assert_cuda_version(cuda_version)
     # add nvcc flags for specific architectures
-    if cuda_version >= (12, 8):
+    if cuda_version >= (13, 0):
+        cuda_archs = os.getenv("KITCHEN_CUDA_ARCHS", "90a;100a;103a")
+    elif cuda_version >= (12, 8):
         cuda_archs = os.getenv("KITCHEN_CUDA_ARCHS", "90a;100a")
     else:
         cuda_archs = os.getenv("KITCHEN_CUDA_ARCHS", "90a")
@@ -153,6 +156,13 @@ def get_nvcc_gencode_flags(cuda_version: Tuple[int, ...]) -> list[str]:
         gencode_flags.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
     return gencode_flags
 
+def find_mathdx_location() -> str:
+    site_packages = site.getsitepackages()
+    for site_package in site_packages:
+        mathdx_path = site_package + "/nvidia/mathdx/include"
+        if os.path.exists(mathdx_path):
+            return mathdx_path
+    raise RuntimeError("Could not find nvidia mathdx site packages")
 
 def setup_extensions() -> setuptools.Extension:
     debug_mode = os.getenv("DEBUG", "0") == "1"
@@ -219,11 +229,8 @@ def setup_extensions() -> setuptools.Extension:
     # Exclude cutlass_gemm files
     ext_sources = ext_sources - cutlass_gemm_sources
 
-    ext_include_dirs = [
-        '/usr/local/cuda/include',
-        str(extensions_dir)
-    ]
-
+    MATHDX_LOCATION = find_mathdx_location()
+    ext_include_dirs = [str(extensions_dir)] + [str(MATHDX_LOCATION)]
     cutlass_gemm_include_dirs = ext_include_dirs + [
         str(root_dir / "third_party" / "cutlass" / "include"),
         str(root_dir / "third_party" / "cutlass" / "tools" / "util" / "include"),
@@ -276,3 +283,4 @@ setuptools.setup(
     install_requires=["torch", "scipy==1.15.2"],
     url="https://gitlab-master.nvidia.com/compute/chef/kitchen",
 )
+
