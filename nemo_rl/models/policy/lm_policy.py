@@ -194,7 +194,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 sharding_annotations=self.sharding_annotations,
                 env_vars=env_vars or {},
             )
-        self.print_node_ip_and_gpu_id()
 
         if config["dynamic_batching"]["enabled"]:
             assert pp_size == 1, (
