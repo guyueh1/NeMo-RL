@@ -702,6 +702,22 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
         return cast(list[str], list_of_worker_results)
 
+    def report_node_ip_and_gpu_id(self) -> str:
+        """Report the node IP and GPU ID of the current worker."""
+        assert self.llm is not None, (
+            "Attempting to report node IP and GPU ID with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "report_node_ip_and_gpu_id cannot be used with async_engine=True. Use report_node_ip_and_gpu_id_async instead."
+            )
+
+        list_of_worker_results = self.llm.collective_rpc(
+            "report_node_ip_and_gpu_id", args=tuple()
+        )
+        return list_of_worker_results
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))

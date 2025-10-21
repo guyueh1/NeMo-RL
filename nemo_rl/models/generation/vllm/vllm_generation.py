@@ -219,6 +219,9 @@ class VllmGeneration(GenerationInterface):
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
 
+        # Print the node IP and GPU ID of the current worker
+        self.print_node_ip_and_gpu_id()
+
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
     ) -> list[tuple[int, list[int]]]:
@@ -363,6 +366,46 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
+
+    def print_node_ip_and_gpu_id(self) -> None:
+        """Report the node IP and GPU ID of the current worker."""
+        method_name = (
+            "report_node_ip_and_gpu_id_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "report_node_ip_and_gpu_id"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
+        )
+        # Wait for all futures to complete
+        results = ray.get(futures)
+        flattened_results = [tup for result in results for tup in result]
+
+        all_node_ips = sorted(set([result[0] for result in flattened_results]))
+        all_gpu_ids = sorted(set([result[1] for result in flattened_results]))
+
+        worker_id_list = [
+            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
+        ]
+        for worker_id, (ip, gpu_id) in enumerate(flattened_results):
+            node_idx = all_node_ips.index(ip)
+            gpu_idx = all_gpu_ids.index(gpu_id)
+            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
+
+        from prettytable import PrettyTable
+
+        table = PrettyTable()
+        table.title = "Policy worker mapping to Nodes and GPUs"
+        table.field_names = ["Node_IP"] + [
+            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
+        ]
+        for i, node_idx in enumerate(all_node_ips):
+            row = [node_idx]
+            for j in range(len(all_gpu_ids)):
+                row.append(tuple(worker_id_list[i][j]))
+            table.add_row(row)
+
+        print(table)
 
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting

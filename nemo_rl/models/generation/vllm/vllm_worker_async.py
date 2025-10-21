@@ -148,6 +148,28 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
+    async def report_node_ip_and_gpu_id_async(self) -> list[str]:
+        """Async version of report_node_ip_and_gpu_id."""
+        assert self.llm is not None, (
+            "Attempting to report node IP and GPU ID with either an uninitialized vLLM or non-model-owner"
+        )
+
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "report_node_ip_and_gpu_id_async can only be used with async_engine=True. Use report_node_ip_and_gpu_id instead."
+            )
+
+        result_or_coro = await self.llm.collective_rpc(
+            "report_node_ip_and_gpu_id", args=tuple()
+        )
+
+        if asyncio.iscoroutine(result_or_coro):
+            list_of_worker_results = await result_or_coro
+        else:
+            list_of_worker_results = result_or_coro
+
+        return list_of_worker_results
+
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
