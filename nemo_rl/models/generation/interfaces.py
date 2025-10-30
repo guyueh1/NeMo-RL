@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, NotRequired, TypedDict, Union, Dict
 
 import ray
 import torch
@@ -121,6 +121,8 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int]
     stop_strings: NotRequired[list[str]]
     pad_token_id: NotRequired[int]
+    ignore_eos: bool
+    output_len_or_output_len_generator: NotRequired[Dict[str, Any] | int]
     colocated: NotRequired[ColocationConfig]
 
 

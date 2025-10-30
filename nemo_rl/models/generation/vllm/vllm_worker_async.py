@@ -562,6 +562,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
 
+            output_len_or_output_len_generator = self.cfg["output_len_or_output_len_generator"]
+            if output_len_or_output_len_generator is not None:
+                if isinstance(output_len_or_output_len_generator, Callable):
+                    output_len = output_len_or_output_len_generator(sample_idx)
+                else:
+                    output_len = output_len_or_output_len_generator
+                allowed_new_tokens = min(allowed_new_tokens, output_len)
+
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:
                 # Access the input data directly from the function parameters
@@ -774,6 +782,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 top_k=top_k if not greedy else 1,
                 max_tokens=self.cfg["max_new_tokens"],
                 stop_token_ids=self.cfg["stop_token_ids"],
+                ignore_eos=self.cfg.get("ignore_eos", False),
                 stop=final_stop_strings,
                 include_stop_str_in_output=True,  # returning stop strings like hf
             )
