@@ -14,15 +14,14 @@
 
 """Local math dataset."""
 
-import os
-from typing import Any, Literal, Optional, Callable
-
-from datasets import load_dataset
+from typing import Callable
 
 from nemo_rl.data import processors
+from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import (
+    prepare_openinstructmath2_dataset,
+)
 from nemo_rl.data.interfaces import TaskDataSpec
 
-from nemo_rl.data.datasets.response_datasets.openmathinstruct2 import prepare_openinstructmath2_dataset
 
 class RandomDataset:
     def __init__(
@@ -37,3 +36,4 @@ class RandomDataset:
             task_name="random",
             input_len_or_input_len_generator=self.input_len_or_input_len_generator,
         )
+        self.processor = processors.random_input_len_processor

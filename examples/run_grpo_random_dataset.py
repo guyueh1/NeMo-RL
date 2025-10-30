@@ -34,8 +34,8 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.dummy_environment import DummyEnvironment
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
@@ -76,7 +76,10 @@ def setup_data(
     print("\n▶ Setting up data...")
     if data_config.get("input_len_generator_cfg", None) is not None:
         input_len_generator_cfg = data_config["input_len_generator_cfg"]
-        from nemo_rl.utils.sequence_length_generator import get_sequence_length_generator
+        from nemo_rl.utils.sequence_length_generator import (
+            get_sequence_length_generator,
+        )
+
         input_generator = get_sequence_length_generator(input_len_generator_cfg)
         data_config["input_len_or_input_len_generator"] = input_generator
     else:
@@ -84,7 +87,9 @@ def setup_data(
 
     random_task_spec = TaskDataSpec(
         task_name="random",
-        input_len_or_input_len_generator=data_config["input_len_or_input_len_generator"],
+        input_len_or_input_len_generator=data_config[
+            "input_len_or_input_len_generator"
+        ],
     )
 
     # load dataset
@@ -96,15 +101,15 @@ def setup_data(
     )
     task_data_processors["random"] = (random_task_spec, random_input_len_processor)
 
-    # setup math environment
-    math_env = MathEnvironment.options(  # type: ignore # it's wrapped with ray.remote
+    # setup dummy environment
+    dummy_env = DummyEnvironment.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
+                "nemo_rl.environments.dummy_environment.DummyEnvironment"
             ),
             "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
-    ).remote(env_configs["math"])
+    ).remote()
 
     dataset = AllTaskProcessedDataset(
         data.formatted_ds["train"],
@@ -116,8 +121,8 @@ def setup_data(
 
     val_dataset = None
 
-    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: math_env)
-    task_to_env["random"] = math_env
+    task_to_env: dict[str, EnvironmentInterface] = defaultdict(lambda: dummy_env)
+    task_to_env["random"] = dummy_env
     return dataset, val_dataset, task_to_env, task_to_env
 
 
