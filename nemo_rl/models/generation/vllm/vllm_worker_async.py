@@ -16,7 +16,7 @@ import asyncio
 import gc
 import threading
 import uuid
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import Any, AsyncGenerator, Callable, Optional, cast
 
 import ray
 import torch
@@ -525,7 +525,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if len(data["input_ids"]) == 0:
             return
 
-        verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         input_ids_batch = data["input_ids"]
         input_lengths_batch = data["input_lengths"]
@@ -562,7 +562,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
 
-            output_len_or_output_len_generator = self.cfg["output_len_or_output_len_generator"]
+            output_len_or_output_len_generator = self.cfg[
+                "output_len_or_output_len_generator"
+            ]
             if output_len_or_output_len_generator is not None:
                 if isinstance(output_len_or_output_len_generator, Callable):
                     output_len = output_len_or_output_len_generator(sample_idx)
@@ -641,7 +643,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             # Create output_ids tensor for this single item
             output_ids_single_item = torch.full(
                 (final_output_tensor_len,),
-                self.cfg["pad_token_id"],
+                self.cfg["_pad_token_id"],
                 dtype=original_input_ids_single_row.dtype,
                 device=original_input_ids_single_row.device,
             )

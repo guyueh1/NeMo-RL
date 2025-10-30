@@ -141,16 +141,27 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
-        from nemo_rl.utils.sequence_length_generator import get_sequence_length_generator
-        output_len_or_output_len_generator = self.cfg.get("output_len_or_output_len_generator", None)
+        from nemo_rl.utils.sequence_length_generator import (
+            get_sequence_length_generator,
+        )
+
+        output_len_or_output_len_generator = self.cfg.get(
+            "output_len_or_output_len_generator", None
+        )
         if output_len_or_output_len_generator is not None:
             if isinstance(output_len_or_output_len_generator, dict):
-                output_len_or_output_len_generator = get_sequence_length_generator(output_len_or_output_len_generator)
+                output_len_or_output_len_generator = get_sequence_length_generator(
+                    output_len_or_output_len_generator
+                )
             elif isinstance(output_len_or_output_len_generator, int):
                 pass
             else:
-                raise ValueError(f"Invalid output_len_or_output_len_generator: {output_len_or_output_len_generator}")
-            self.cfg["output_len_or_output_len_generator"] = output_len_or_output_len_generator
+                raise ValueError(
+                    f"Invalid output_len_or_output_len_generator: {output_len_or_output_len_generator}"
+                )
+            self.cfg["output_len_or_output_len_generator"] = (
+                output_len_or_output_len_generator
+            )
         else:
             self.cfg["output_len_or_output_len_generator"] = None
 
@@ -475,7 +486,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
 
         # verify inputs have correct padding
-        verify_right_padding(data, pad_value=self.cfg["pad_token_id"])
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
@@ -509,7 +520,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             # Create a new tensor with the right size and fill with padding token
             full_output = torch.full(
-                (total_length,), self.cfg["pad_token_id"], dtype=input_ids.dtype
+                (total_length,), self.cfg["_pad_token_id"], dtype=input_ids.dtype
             )
 
             # Copy original input (with padding) into the beginning
