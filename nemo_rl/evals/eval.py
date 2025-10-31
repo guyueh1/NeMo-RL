@@ -318,6 +318,9 @@ async def _run_env_eval_impl(
     # Run evaluation loop
     score = 0.0
     for batch in dataloader:
+        import time
+
+        start_time = time.time()
         # measure multiple samples
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
@@ -382,7 +385,8 @@ async def _run_env_eval_impl(
             )
         else:
             raise ValueError(f"Invalid metric: {metric}")
-
+        step_time = time.time() - start_time
+        print(f"Step time: {step_time:.2f}s")
     # Cleanup before printing results
     ray.get(env.shutdown.remote())
     vllm_generation.shutdown()
