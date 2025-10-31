@@ -11,10 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import numpy as np
 from typing import Callable
+
+import numpy as np
+
 
 def get_sequence_length_generator(sequence_length_generator_cfg: dict) -> Callable:
     mean = sequence_length_generator_cfg["mean"]
     std = sequence_length_generator_cfg["std"]
-    return lambda: int(np.round(np.random.normal(mean, std)))
+    length = int(np.round(np.random.normal(mean, std)))
+    length = max(1, length)
+    return length
