@@ -33,7 +33,7 @@ class RandomDataset:
         # use openmathinstruct2 dataset as iterator, the real token_ids are synthetic
         self.formatted_ds = prepare_openinstructmath2_dataset()
         self.task_spec = TaskDataSpec(
-            task_name="random",
+            task_name="math",
             input_len_or_input_len_generator=self.input_len_or_input_len_generator,
         )
         self.processor = processors.random_input_len_processor

@@ -74,14 +74,23 @@ def setup_data(
     dict[str, EnvironmentInterface],
 ]:
     print("\n▶ Setting up data...")
-    if data_config.get("input_len_generator_cfg", None) is not None:
-        input_len_generator_cfg = data_config["input_len_generator_cfg"]
-        from nemo_rl.utils.sequence_length_generator import (
-            get_sequence_length_generator,
-        )
+    if data_config.get("input_len_or_input_len_generator", None) is not None:
+        input_len_or_input_len_generator = data_config[
+            "input_len_or_input_len_generator"
+        ]
+        if isinstance(input_len_or_input_len_generator, dict):
+            from nemo_rl.utils.sequence_length_generator import (
+                get_sequence_length_generator,
+            )
 
-        input_generator = get_sequence_length_generator(input_len_generator_cfg)
-        data_config["input_len_or_input_len_generator"] = input_generator
+            input_generator = get_sequence_length_generator(
+                input_len_or_input_len_generator
+            )
+            data_config["input_len_or_input_len_generator"] = input_generator
+        else:
+            data_config["input_len_or_input_len_generator"] = (
+                input_len_or_input_len_generator
+            )
     else:
         assert False, "input_len_generator_cfg must be provided"
 
@@ -100,12 +109,16 @@ def setup_data(
         defaultdict(lambda: (random_task_spec, random_input_len_processor))
     )
     task_data_processors["random"] = (random_task_spec, random_input_len_processor)
+    task_data_processors["math"] = (
+        random_task_spec,
+        random_input_len_processor,
+    )  # todo: fix original task name in dataset
 
     # setup dummy environment
     dummy_env = DummyEnvironment.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
             "py_executable": get_actor_python_env(
-                "nemo_rl.environments.dummy_environment.DummyEnvironment"
+                "nemo_rl.environments.math_environment.MathEnvironment"
             ),
             "env_vars": dict(os.environ),  # Pass thru all user environment variables
         }
@@ -192,6 +205,28 @@ def main() -> None:
 
     # Check if async mode is enabled
     if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
+        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+        unsupported_features = [
+            "use_dynamic_sampling",
+            "reward_scaling",
+            "reward_shaping",
+        ]
+
+        for feature in unsupported_features:
+            if feature not in config["grpo"]:
+                continue
+
+            if feature == "use_dynamic_sampling":
+                if config["grpo"][feature]:
+                    raise NotImplementedError(
+                        f"{feature} is not supported with async GRPO"
+                    )
+            else:
+                if config["grpo"][feature]["enabled"]:
+                    raise NotImplementedError(
+                        f"{feature} is not supported with async GRPO"
+                    )
+
         from nemo_rl.algorithms.grpo import async_grpo_train
 
         print("🚀 Running async GRPO training")

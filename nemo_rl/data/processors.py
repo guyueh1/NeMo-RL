@@ -261,5 +261,6 @@ def random_input_len_processor(
         "loss_multiplier": 1.0,
         "idx": idx,
         "extra_env_info": {},
+        "task_name": "random",
     }
     return output

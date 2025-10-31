@@ -16,7 +16,7 @@ import asyncio
 import gc
 import threading
 import uuid
-from typing import Any, AsyncGenerator, Callable, Optional, cast
+from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -566,7 +566,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 "output_len_or_output_len_generator"
             ]
             if output_len_or_output_len_generator is not None:
-                if isinstance(output_len_or_output_len_generator, Callable):
+                if callable(output_len_or_output_len_generator):
                     output_len = output_len_or_output_len_generator(sample_idx)
                 else:
                     output_len = output_len_or_output_len_generator
@@ -783,7 +783,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 top_p=self.cfg["top_p"],
                 top_k=top_k if not greedy else 1,
                 max_tokens=self.cfg["max_new_tokens"],
-                stop_token_ids=self.cfg["stop_token_ids"],
+                stop_token_ids=self.cfg["stop_token_ids"]
+                if not self.cfg["ignore_eos"]
+                else [],
                 ignore_eos=self.cfg["ignore_eos"],
                 stop=final_stop_strings,
                 include_stop_str_in_output=True,  # returning stop strings like hf

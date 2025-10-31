@@ -397,7 +397,9 @@ class BaseVllmGenerationWorker:
             top_k=top_k_val,
             max_tokens=max_tokens,
             logprobs=0,
-            stop_token_ids=self.cfg["stop_token_ids"],
+            stop_token_ids=self.cfg["stop_token_ids"]
+            if not self.cfg["ignore_eos"]
+            else [],
             ignore_eos=self.cfg["ignore_eos"],
             stop=stop_strings,
             include_stop_str_in_output=True,
