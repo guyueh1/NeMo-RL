@@ -397,7 +397,6 @@ def process_weights_after_loading(self, layer) -> None:
     )
     from vllm.model_executor.parameter import (
         BlockQuantScaleParameter,
-        ModelWeightParameter,
     )
 
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
@@ -426,23 +425,19 @@ def process_weights_after_loading(self, layer) -> None:
         else layer.weight_scale
     )
     weight, weight_scale = process_fp8_weight_block_strategy(layer.weight, weight_scale)
-
-    layer.weight = _create_param_from_subclass_attributes(
-        ModelWeightParameter(
-            data=weight.data,
-            output_dim=0,
-            input_dim=1,
-            weight_loader=layer.weight.weight_loader,
+    layer.weight.data = weight.data
+    if hasattr(layer, "weight_scale"):
+        layer.weight_scale.data = weight_scale.data
+    else:
+        layer.weight_scale = _create_param_from_subclass_attributes(
+            BlockQuantScaleParameter(
+                data=weight_scale.data,
+                output_dim=0,
+                input_dim=1,
+                weight_loader=layer.weight_scale_inv.weight_loader,
+            )
         )
-    )
-    layer.weight_scale = _create_param_from_subclass_attributes(
-        BlockQuantScaleParameter(
-            data=weight_scale.data,
-            output_dim=0,
-            input_dim=1,
-            weight_loader=layer.weight_scale_inv.weight_loader,
-        )
-    )
+        layer.update_param_tp_status()
 
     del layer.weight_scale_inv
 
