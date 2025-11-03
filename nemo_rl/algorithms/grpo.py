@@ -190,9 +190,13 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(master_config["checkpointing"])
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    grpo_save_state: Optional[GRPOSaveState] = cast(
-        Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
-    )
+    only_load_weight_from_last_checkpoint = master_config["checkpointing"].get("only_load_weight_from_last_checkpoint", False)
+    if not only_load_weight_from_last_checkpoint:
+        grpo_save_state: Optional[GRPOSaveState] = cast(
+            Optional[GRPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
+        )
+    else:
+        grpo_save_state = None
     if grpo_save_state is None:
         grpo_save_state = _default_grpo_save_state()
 
@@ -206,7 +210,7 @@ def setup(
         collate_fn=rl_collate_fn,
         drop_last=True,
     )
-    if last_checkpoint_path is not None:
+    if (not only_load_weight_from_last_checkpoint) and last_checkpoint_path is not None:
         dataloader_state_dict = torch.load(
             os.path.join(last_checkpoint_path, "train_dataloader.pt")
         )
