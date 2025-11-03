@@ -190,6 +190,22 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             bf16_params.append(_get_params_in_layers(param_names, layers))
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
+    ignored_layer_kws = vllm_cfg.get("ignored_layer_kws", [])
+    if len(ignored_layer_kws):
+        with init_empty_weights():
+            model = AutoModel.from_config(config)
+        param_names = [
+            f"model.{name}".removesuffix(".weight")
+            for name, _ in model.named_parameters()
+        ]
+        ignored_layers = [
+            n for n in param_names if any(p in n for p in ignored_layer_kws)
+        ]
+        if "ignored_layers" not in fp8_block_quant_kwargs:
+            fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
+        else:
+            fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
+        print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
 
     vllm_kwargs = {
         "quantization": "fp8",
