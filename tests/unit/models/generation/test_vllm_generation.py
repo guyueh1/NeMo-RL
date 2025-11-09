@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 import ray
+import requests
 import torch
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -25,7 +28,13 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    _replace_prefix_tokens,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -54,7 +63,7 @@ basic_vllm_test_config: VllmConfig = {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
         "pipeline_parallel_size": 1,
-        "enable_expert_parallel": False,
+        "expert_parallel_size": 1,
         "gpu_memory_utilization": 0.7,
         "max_model_len": 1024,
         "async_engine": False,  # Default to False for synchronous tests
@@ -85,6 +94,7 @@ basic_dtensor_test_config: PolicyConfig = {
     "max_new_tokens": 16,
     "do_sample": False,
     "precision": "float32",
+    "offload_optimizer_for_logprob": False,
     "optimizer": {
         "name": "torch.optim.AdamW",
         "kwargs": {
@@ -124,6 +134,7 @@ def get_basic_megatron_test_config(
     precision: str = "float32",
     activation_checkpointing: bool = False,
     sequence_parallel: bool = False,
+    empty_unused_memory_level: int = 0,
 ) -> PolicyConfig:
     """Create a test config for Megatron policy worker."""
     # Use the exact same model as vLLM tests for perfect compatibility
@@ -138,6 +149,7 @@ def get_basic_megatron_test_config(
         "learning_rate": 5e-6,
         "logprob_batch_size": 2,
         "precision": precision,
+        "offload_optimizer_for_logprob": False,
         "dtensor_cfg": {
             "enabled": False,  # Disabled for Megatron tests
         },
@@ -149,7 +161,7 @@ def get_basic_megatron_test_config(
         },
         "megatron_cfg": {
             "enabled": True,
-            "empty_unused_memory_level": 0,
+            "empty_unused_memory_level": empty_unused_memory_level,
             "activation_checkpointing": activation_checkpointing,
             "converter_type": "Qwen2ForCausalLM",  # Use Qwen2 converter for Qwen3 models (compatible)
             "tensor_model_parallel_size": tp,
@@ -167,6 +179,7 @@ def get_basic_megatron_test_config(
             "moe_router_bias_update_rate": 0.0,
             "moe_permute_fusion": False,
             "apply_rope_fusion": True,
+            "bias_activation_fusion": True,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -182,6 +195,8 @@ def get_basic_megatron_test_config(
                 "use_distributed_optimizer": True,
                 "use_precision_aware_optimizer": True,
                 "clip_grad": 1.0,
+                "optimizer_cpu_offload": False,
+                "optimizer_offload_fraction": 0.0,
             },
             "scheduler": {
                 "start_weight_decay": 0.01,
@@ -196,7 +211,6 @@ def get_basic_megatron_test_config(
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": True,
                 "overlap_param_gather": False,
-                "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
@@ -425,7 +439,7 @@ async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False)
 
     # Extract in correct order
     outputs = [item for _, item in collected_indexed_outputs]
-    pad_token_id = vllm_policy.cfg.get("pad_token_id", tokenizer.pad_token_id)
+    pad_token_id = vllm_policy.cfg.get("_pad_token_id", tokenizer.pad_token_id)
     outputs = BatchedDataDict.from_batches(
         outputs,
         pad_value_dict={"output_ids": pad_token_id, "logprobs": 0.0},
@@ -934,8 +948,15 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     # Refit
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    futures_train = lm_policy.init_collective(ip, port, world_size=2)
-    futures_inference = vllm_policy.init_collective(ip, port, world_size=2)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1040,6 +1061,467 @@ def test_vllm_generate_text(cluster, tokenizer):
     vllm_generation.shutdown()
 
 
+def configure_http_server_config(tokenizer) -> VllmConfig:
+    # Create separate configs for each policy
+    generation_config = deepcopy(basic_vllm_test_config)
+    generation_config = configure_generation_config(
+        generation_config, tokenizer, is_eval=True
+    )
+
+    # Enable the http server. Requires both async engine and the expose_http_server flag
+    generation_config["vllm_cfg"]["async_engine"] = True
+    generation_config["vllm_cfg"]["expose_http_server"] = True
+
+    return generation_config
+
+
+def _wait_for_vllm_http_server_spinup(base_url: str):
+    while True:
+        try:
+            requests.get(base_url, timeout=5)
+            # We don't check the status code since there may not be a route at /
+            break
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            Exception,
+        ):
+            pass
+
+
+def test_vllm_http_server(cluster, tokenizer):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    body = dict(
+        model=generation_config["model_name"],
+        messages=[
+            {"role": "user", "content": "count to 5"},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    _wait_for_vllm_http_server_spinup(base_urls[0])
+
+    # Generate and check result
+    response = requests.post(url=f"{base_urls[0]}/chat/completions", json=body)
+    actual_result = response.json()
+
+    # This result assumes this exact model. The expected result here is what the full result looks like before we standardize.
+    expected_result = {
+        "id": "chatcmpl-7b8c0cdeeab34fd58ad260cf44b1a408",
+        "object": "chat.completion",
+        "created": 1756421711,
+        "model": "Qwen/Qwen3-0.6B",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>",
+                    "refusal": None,
+                    "annotations": None,
+                    "audio": None,
+                    "function_call": None,
+                    "tool_calls": [],
+                    "reasoning_content": None,
+                },
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "token_id:151667",
+                            "logprob": -0.00023779425828251988,
+                            "bytes": [60, 116, 104, 105, 110, 107, 62],
+                            "top_logprobs": [],
+                        }
+                    ]
+                },
+                "finish_reason": "length",
+                "stop_reason": None,
+                "token_ids": None,
+            }
+        ],
+        "service_tier": None,
+        "system_fingerprint": None,
+        "usage": {
+            "prompt_tokens": 12,
+            "total_tokens": 13,
+            "completion_tokens": 1,
+            "prompt_tokens_details": None,
+        },
+        "prompt_logprobs": None,
+        "prompt_token_ids": None,
+        "kv_transfer_params": None,
+    }
+
+    def _standardize(d: dict) -> dict:
+        d = deepcopy(d)
+        d.pop("id")
+        d.pop("created")
+        # We don't want to implicate log prob accuracy in this test.
+        d["choices"][0]["logprobs"]["content"][0].pop("logprob")
+
+        return d
+
+    assert _standardize(expected_result) == _standardize(actual_result)
+
+    # Check that tokenization route works
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_result = {
+        "count": 12,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            1830,
+            311,
+            220,
+            20,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ],
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # Clean up
+    vllm_generation.shutdown()
+
+    # We should not be able to connect after shutdown
+    with pytest.raises(requests.ConnectionError):
+        requests.post(
+            url=f"{base_urls[0]}/chat/completions",
+            json=dict(
+                messages=[
+                    {"role": "user", "content": "count to 5"},
+                ],
+                temperature=0.0,
+                logprobs=True,
+                return_tokens_as_token_ids=True,
+                max_tokens=1,
+            ),
+        )
+
+
+def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
+    # This test assumes the tokenizer model is for the Qwen 3 family
+    eos_token_id = tokenizer.eos_token_id
+    assert eos_token_id == 151645
+
+    data_fpath = Path(__file__).with_name(
+        "test_vllmasyncgenerationworker_replace_prefix_worker.json"
+    )
+    with data_fpath.open() as f:
+        data = json.load(f)
+
+    og_model_token_ids = data["og_model_token_ids"]
+    model_token_ids = data["model_token_ids"]
+    template_token_ids = data["template_token_ids"]
+
+    og_model_str = tokenizer.decode(og_model_token_ids)
+    model_str = tokenizer.decode(model_token_ids)
+    template_str = tokenizer.decode(template_token_ids)
+    assert og_model_str == template_str
+    assert model_str != template_str
+
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    model_prefix_token_ids = og_model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = og_model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    # newline after EOS
+    template_prefix_token_ids = template_token_ids[:-15]
+    assert template_prefix_token_ids[-2] == eos_token_id
+    assert template_prefix_token_ids[-1] != eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == og_model_token_ids
+
+    model_prefix_token_ids = model_token_ids[:-16]
+    assert model_prefix_token_ids[-1] == eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+    # no EOS
+    model_prefix_token_ids = model_token_ids[:-17]
+    assert model_prefix_token_ids[-1] != eos_token_id
+    template_prefix_token_ids = template_token_ids[:-16]
+    assert template_prefix_token_ids[-1] == eos_token_id
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == model_token_ids
+
+
+def test_replace_prefix_tokens_empty_model_prefix_returns_template():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = []
+    template_prefix_token_ids = [9, 2]
+    template_token_ids = [9, 2, 33, 44]
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == template_token_ids
+
+
+def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [7, 2]
+    template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
+    template_token_ids = [9, 9, 9, 2, 10]
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_prefix_token_ids=template_prefix_token_ids,
+            template_token_ids=template_token_ids,
+        )
+
+
+def test_replace_prefix_tokens_tokenizer_without_eos_raises():
+    class _T:
+        eos_token_id = None
+
+    tokenizer = _T()
+    with pytest.raises(AssertionError):
+        _replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=[1],
+            template_prefix_token_ids=[1, 2],
+            template_token_ids=[1, 2],
+        )
+
+
+def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    model_prefix_token_ids = [100, 2]
+    template_prefix_token_ids = [9, 2, 9, 2]  # two EOS; last at idx=3
+    template_token_ids = [9, 2, 9, 2, 77, 88]
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=model_prefix_token_ids,
+        template_prefix_token_ids=template_prefix_token_ids,
+        template_token_ids=template_token_ids,
+    )
+    assert result == [100, 2, 77, 88]
+
+
+@pytest.mark.asyncio
+async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
+    cluster, tokenizer
+):
+    """Test that vLLM http server works."""
+
+    generation_config = configure_http_server_config(tokenizer)
+
+    # Ensure we can get same output
+    assert generation_config["model_name"] == "Qwen/Qwen3-0.6B", (
+        "Model name should be Qwen/Qwen3-0.6B to get expected output"
+    )
+    assert generation_config["vllm_cfg"]["tensor_parallel_size"] == 1, (
+        "Tensor parallel size should be 1 to get expected output"
+    )
+
+    # Set to greedy for test reproducibility.
+    generation_config["temperature"] = 0.0
+
+    # Create vLLM generation
+    vllm_generation = VllmGeneration(cluster, generation_config)
+
+    # We expect one server per vLLM DP rank.
+    base_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(base_urls) == cluster.num_gpus_per_node
+
+    detokenized_str = " Skinny"
+    initial_tokenized_ids = [26951, 3834]
+    re_tokenized_ids = [94224]
+
+    body = dict(
+        messages=[
+            {"role": "user", "content": detokenized_str},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        # We want to test the actual train flow and how this is used. So we need to get logprobs here.
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+
+    _wait_for_vllm_http_server_spinup(base_urls[0])
+
+    # Check that the re-tokenized ids are the same with the reference and different without the reference.
+    # WITHOUT reference token IDs
+    response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
+    actual_result = response.json()
+    expected_result = {
+        "count": 9,
+        "max_model_len": 1024,
+        "tokens": [
+            151644,
+            872,
+            198,
+            *re_tokenized_ids,
+            151645,
+            198,
+            151644,
+            77091,
+            198,
+        ],
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # WITH reference token IDs
+    initial_tokenized_query_ids_prefix = [151644, 872, 198, *initial_tokenized_ids]
+    initial_tokenized_query_ids = [
+        *initial_tokenized_query_ids_prefix,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+    ]
+    body_with_reference_token_ids = body | {
+        "required_prefix_token_ids": initial_tokenized_query_ids_prefix
+    }
+    response = requests.post(
+        url=f"{base_urls[0]}/../tokenize", json=body_with_reference_token_ids
+    )
+    actual_result = response.json()
+    expected_result = {
+        "count": 10,
+        "max_model_len": 1024,
+        "tokens": initial_tokenized_query_ids,
+        "token_strs": None,
+    }
+    assert expected_result == actual_result
+
+    # Generate and check result
+    response = requests.post(
+        url=f"{base_urls[0]}/chat/completions", json=body_with_reference_token_ids
+    )
+    vllm_http_server_result = response.json()
+    vllm_http_server_generated_token = vllm_http_server_result["choices"][0][
+        "logprobs"
+    ]["content"][0]
+    vllm_http_server_generated_token_id = int(
+        vllm_http_server_generated_token["token"].removeprefix("token_id:")
+    )
+
+    async for _, generate_result in vllm_generation.generate_async(
+        BatchedDataDict[GenerationDatumSpec](
+            {
+                "input_ids": torch.tensor([initial_tokenized_query_ids]),
+                "input_lengths": torch.tensor([len(initial_tokenized_query_ids)]),
+            }
+        )
+    ):
+        pass
+
+    generate_generated_token_id = generate_result["output_ids"][0][
+        len(initial_tokenized_query_ids)
+    ].item()
+
+    # We just check the first token here to check the alignment
+    assert vllm_http_server_generated_token_id == generate_generated_token_id
+
+    # Clean up
+    vllm_generation.shutdown()
+
+
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
@@ -1116,11 +1598,11 @@ def test_vllm_weight_update_and_prefix_cache_reset(
         )
 
         print("Updating vLLM weights from HF policy...")
-        grouped_param_keys = lm_policy.prepare_weights_for_ipc()
-        for keys in grouped_param_keys:
-            ipc_handles = lm_policy.get_weights_ipc_handles(keys)
-            update_success = vllm_policy.update_weights_from_ipc_handles(ipc_handles)
-            assert update_success, "Weight update should succeed"
+
+        buffer_size_bytes = int(lm_policy.get_free_memory_bytes() * 0.3)
+        lm_policy.stream_weights_via_ipc_zmq(buffer_size_bytes=buffer_size_bytes)
+        update_success = vllm_policy.update_weights_via_ipc_zmq()
+        assert update_success, "Weight update should succeed"
         print("vLLM weights successfully updated.")
 
         print("Running Generation 2 (Weights Updated, Cache Still Active)...")
@@ -1197,7 +1679,7 @@ def test_vllm_weight_update_memory(cluster, tokenizer):
         lm_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])
 
@@ -1383,9 +1865,15 @@ async def test_vllm_refit_non_colocated_update_weights(
 
     # initialize collective communication for update weights
     ip, port = policy_cluster_separate.get_master_address_and_port()
-    world_size = tensor_parallel_size + 1
-    futures_train = lm_policy.init_collective(ip, port, world_size=world_size)
-    futures_inference = vllm_generation.init_collective(ip, port, world_size=world_size)
+    train_world_size = policy_cluster_separate.world_size()
+    inference_world_size = generation_cluster_separate.world_size()
+    world_size = train_world_size + inference_world_size
+    futures_train = lm_policy.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
+    futures_inference = vllm_generation.init_collective(
+        ip, port, world_size=world_size, train_world_size=train_world_size
+    )
     ray.get(futures_train + futures_inference)
 
     # prepare refit info
@@ -1620,7 +2108,9 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
     )
 
     # Megatron config with same model
-    megatron_config = get_basic_megatron_test_config(tp=1, pp=1, precision="float32")
+    megatron_config = get_basic_megatron_test_config(
+        tp=1, pp=1, precision="float32", empty_unused_memory_level=1
+    )
     megatron_config["model_name"] = model_name
     megatron_config["tokenizer"]["name"] = model_name
 
@@ -1647,7 +2137,7 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
         megatron_policy,
         vllm_policy,
         vllm_config["colocated"]["enabled"],
-        _refit_buffer_size_gb=1,
+        _refit_buffer_size_gb=1.5,
     )
 
     gpu_infos = ray.get([w.get_gpu_info.remote() for w in workers])

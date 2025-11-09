@@ -28,10 +28,8 @@ from nemo_rl.algorithms.loss_functions import (
 )
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import (
-    AllTaskProcessedDataset,
-    preference_collate_fn,
-)
+from nemo_rl.data.collate_fn import preference_collate_fn
+from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
@@ -48,6 +46,7 @@ class RMSaveState(TypedDict):
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
     consumed_samples: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
 def _default_rm_save_state() -> RMSaveState:
@@ -56,6 +55,7 @@ def _default_rm_save_state() -> RMSaveState:
         "step": 0,
         "total_steps": 0,
         "consumed_samples": 0,
+        "total_valid_tokens": 0,
     }
 
 
@@ -151,6 +151,7 @@ def setup(
             add_loss_mask=False,
         ),
         drop_last=True,
+        num_workers=data_config["num_workers"],
     )
 
     if last_checkpoint_path is not None:
@@ -173,6 +174,7 @@ def setup(
                 add_loss_mask=False,
             ),
             drop_last=False,
+            num_workers=data_config["num_workers"],
         )
         for k, v in val_dataset.items()
     }
@@ -207,6 +209,7 @@ def setup(
             for k in policy_config["megatron_cfg"]["scheduler"]:
                 if "iters" in k:
                     policy_config["megatron_cfg"]["scheduler"][k] *= 2
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
@@ -220,6 +223,9 @@ def setup(
         init_optimizer=True,
         init_reference_model=False,
     )
+    # print the node IP and GPU ID of the policy workers for debugging
+    policy.print_node_ip_and_gpu_id()
+
     loss_fn = PreferenceLoss()
     print("  ✓ Model initialized")
 
@@ -439,10 +445,14 @@ def rm_train(
         current_epoch = 0
         current_step = 0
         total_steps = 0
+        total_valid_tokens = 0
     else:
         current_epoch = rm_save_state["epoch"]
         current_step = rm_save_state["step"]
         total_steps = rm_save_state["total_steps"]
+        total_valid_tokens = rm_save_state.get(
+            "total_valid_tokens", 0
+        )  # Default to 0 for backward compatibility with older checkpoints
 
     rm_config = master_config["rm"]
     # Validation configuration
@@ -517,6 +527,17 @@ def rm_train(
                         val_mbs=rm_config["val_micro_batch_size"],
                         logger=logger,
                     )
+                metrics = {
+                    "loss": train_results["loss"].numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                }
+                metrics.update(train_results["all_mb_metrics"])
+                for k, v in metrics.items():
+                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
+                        metrics[k] = np.mean(v).item()
+                    else:
+                        metrics[k] = np.sum(v).item()
+                total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
                 timeout.mark_iteration()
@@ -539,6 +560,7 @@ def rm_train(
                     rm_save_state["step"] = (current_step + 1) % len(train_dataloader)
                     rm_save_state["total_steps"] = total_steps + 1
                     rm_save_state["epoch"] = current_epoch
+                    rm_save_state["total_valid_tokens"] = total_valid_tokens
                     # Remove outdated validation metrics
                     for key in list(rm_save_state):
                         if (
@@ -556,16 +578,34 @@ def rm_train(
                     if val_metrics is not None:
                         rm_save_state.update(val_metrics)
 
-                    if master_config["checkpointing"]["metric_name"] is not None:
-                        if (
-                            master_config["checkpointing"]["metric_name"]
-                            not in rm_save_state
-                        ):
+                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    if full_metric_name is not None:
+                        assert full_metric_name.startswith(
+                            "train:"
+                        ) or full_metric_name.startswith("val:"), (
+                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
+                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
+                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
+                            f" e.g. 'val_loss --> 'val:validation-default_loss'"
+                        )
+                        prefix, metric_name = full_metric_name.split(":", 1)
+                        metrics_source = metrics if prefix == "train" else val_metrics
+                        if not metrics_source:
                             warnings.warn(
-                                f"You asked to save checkpoints based on {master_config['checkpointing']['metric_name']} but the metric is not found in the save state. "
-                                "Saving most recent k checkpoints instead."
+                                f"You asked to save checkpoints based on {metric_name} but no {prefix} metrics were collected. "
+                                "This checkpoint will not be saved as top-k.",
+                                stacklevel=2,
                             )
-                            master_config["checkpointing"]["metric_name"] = None
+                            if full_metric_name in rm_save_state:
+                                del rm_save_state[full_metric_name]
+                        elif metric_name not in metrics_source:
+                            raise ValueError(
+                                f"Metric {metric_name} not found in {prefix} metrics"
+                            )
+                        else:
+                            rm_save_state[full_metric_name] = metrics_source[
+                                metric_name
+                            ]
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
@@ -583,6 +623,7 @@ def rm_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config["checkpointing"],
                         )
                         torch.save(
                             train_dataloader.state_dict(),
@@ -590,17 +631,6 @@ def rm_train(
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
-            losses = train_results["loss"]
-            metrics = {
-                "loss": train_results["loss"].numpy(),
-                "grad_norm": train_results["grad_norm"].numpy(),
-            }
-            metrics.update(train_results["all_mb_metrics"])
-            for k, v in metrics.items():
-                if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
-                    metrics[k] = np.mean(v).item()
-                else:
-                    metrics[k] = np.sum(v).item()
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
@@ -623,6 +653,13 @@ def rm_train(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
+            total_num_gpus = (
+                master_config["cluster"]["num_nodes"]
+                * master_config["cluster"]["gpus_per_node"]
+            )
+            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                metrics["global_valid_toks"] / total_time / total_num_gpus
+            )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
 
@@ -631,11 +668,16 @@ def rm_train(
             total_steps += 1
 
             if should_save_by_timeout:
+                print("Timeout has been reached, stopping training early", flush=True)
                 return
             if (
                 master_config["rm"]["max_num_steps"] != -1
                 and total_steps >= master_config["rm"]["max_num_steps"]
             ):
+                print(
+                    "Max number of steps has been reached, stopping training early",
+                    flush=True,
+                )
                 return
 
         current_epoch += 1
