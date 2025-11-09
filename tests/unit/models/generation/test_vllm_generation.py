@@ -209,7 +209,6 @@ def get_basic_megatron_test_config(
                 "grad_reduce_in_fp32": False,
                 "overlap_grad_reduce": True,
                 "overlap_param_gather": False,
-                "average_in_collective": True,
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
         },
@@ -1112,6 +1111,7 @@ def test_vllm_http_server(cluster, tokenizer):
     assert len(base_urls) == cluster.num_gpus_per_node
 
     body = dict(
+        model=generation_config["model_name"],
         messages=[
             {"role": "user", "content": "count to 5"},
         ],

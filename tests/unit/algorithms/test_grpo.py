@@ -826,6 +826,7 @@ def mock_grpo_components():
             "token_mult_prob_error": [
                 1.0
             ],  # Must be <= 1.05 to avoid logging extra plots
+            "gen_kl_error": [0.0001],
         },
     }
     policy.generate.return_value = {
@@ -884,6 +885,9 @@ def mock_grpo_components():
     loss_fn = ClippedPGLossFn(
         {
             "reference_policy_kl_penalty": 0.01,
+            "reference_policy_kl_type": "k3",
+            "kl_input_clamp_value": 20.0,
+            "kl_output_clamp_value": 10.0,
             "ratio_clip_min": 0.8,
             "ratio_clip_max": 1.2,
             "ratio_clip_c": 1.0,
@@ -933,6 +937,10 @@ def mock_grpo_components():
             "reward_scaling": {"enabled": False},
             "reward_shaping": {"enabled": False},
             "use_dynamic_sampling": False,
+            "async_grpo": {
+                "enabled": False,
+                "max_trajectory_age_steps": 1,
+            },
         },
         "policy": {
             "train_global_batch_size": 1,
