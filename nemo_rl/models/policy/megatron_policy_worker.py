@@ -551,6 +551,9 @@ class MegatronPolicyWorker:
         model_cfg.virtual_pipeline_model_parallel_size = self.cfg["megatron_cfg"].get(
             "virtual_pipeline_model_parallel_size", None
         )
+        model_cfg.pipeline_model_parallel_layout = self.cfg["megatron_cfg"].get(
+            "pipeline_model_parallel_layout", None
+        )
         model_cfg.num_layers_in_first_pipeline_stage = self.cfg["megatron_cfg"][
             "num_layers_in_first_pipeline_stage"
         ]
