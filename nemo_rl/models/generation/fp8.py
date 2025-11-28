@@ -316,6 +316,8 @@ def _is_fp8_weight(name, model):
 def load_weights(weights, model_runner):
     weights_quantized = []
     model = model_runner.model
+    model.load_weights(weights)
+    return
 
     for k, v in weights:
         if not _is_fp8_weight(k, model):
