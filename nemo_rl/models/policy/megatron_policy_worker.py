@@ -1999,8 +1999,13 @@ class MegatronPolicyWorker:
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
-        if not hasattr(self, "has_called_refit_before"):
-            self.has_called_refit_before = False
+        if not hasattr(self, "refit_count"):
+            self.refit_count = 0
+        # need to create conversion tasks again if it's the first time to load in fp8
+        if self.refit_count == 1:
+            self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+                [self.model]
+            )
 
         self.maybe_init_zmq()
 
@@ -2011,7 +2016,7 @@ class MegatronPolicyWorker:
             [self.model],
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-            load_in_fp8=self.has_called_refit_before,
+            load_in_fp8=self.refit_count > 0,
         )
 
         # Use the shared implementation
@@ -2023,7 +2028,7 @@ class MegatronPolicyWorker:
             worker_name=str(self),
         )
 
-        self.has_called_refit_before = True
+        self.refit_count += 1
 
     @torch.no_grad()
     def broadcast_weights_for_collective(self) -> None:
