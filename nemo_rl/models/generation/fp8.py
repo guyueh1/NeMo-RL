@@ -313,11 +313,13 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
-def load_weights(weights, model_runner):
+def load_weights(weights, model_runner, load_in_fp8: bool = False):
     weights_quantized = []
     model = model_runner.model
-    model.load_weights(weights)
-    return
+
+    if load_in_fp8:
+        model.load_weights(weights)
+        return
 
     for k, v in weights:
         if not _is_fp8_weight(k, model):

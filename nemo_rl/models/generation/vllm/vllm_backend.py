@@ -103,6 +103,9 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
+        if not hasattr(self, "has_called_refit_before"):
+            self.has_called_refit_before = False
+
         buffer = None
         weights = None
 
@@ -128,33 +131,36 @@ class VllmInternalWorkerExtension:
                 buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
 
                 weights = []
-                offset = 0
-                for key in list_keys:
-                    shape, dtype = self.state_dict_info[key]  # pyrefly
-                    if isinstance(shape, list):
-                        shape = torch.Size(shape)
-                    size_in_bytes = dtype.itemsize * shape.numel()
-                    weights.append(
-                        (
-                            key,
-                            buffer[offset : offset + size_in_bytes]
-                            .view(dtype=dtype)
-                            .view(shape),
-                        )
-                    )
-                    aligned_size = calculate_aligned_size(size_in_bytes)
-                    offset += aligned_size
-                assert offset == used_bytes, (
-                    "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
-                )
-                # Load weights into the model
-                from nemo_rl.models.generation import fp8
 
-                if fp8.is_fp8_model(self.model_runner.vllm_config):
-                    # the fp8 load_weights additionally casts bf16 weights into fp8
-                    fp8.load_weights(weights, self.model_runner)
-                else:
-                    self.model_runner.model.load_weights(weights=weights)
+                if not self.has_called_refit_before:
+
+                    offset = 0
+                    for key in list_keys:
+                        shape, dtype = self.state_dict_info[key]  # pyrefly
+                        if isinstance(shape, list):
+                            shape = torch.Size(shape)
+                        size_in_bytes = dtype.itemsize * shape.numel()
+                        weights.append(
+                            (
+                                key,
+                                buffer[offset : offset + size_in_bytes]
+                                .view(dtype=dtype)
+                                .view(shape),
+                            )
+                        )
+                        aligned_size = calculate_aligned_size(size_in_bytes)
+                        offset += aligned_size
+                    assert offset == used_bytes, (
+                        "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
+                    )
+                    # Load weights into the model
+                    from nemo_rl.models.generation import fp8
+
+                    if fp8.is_fp8_model(self.model_runner.vllm_config):
+                        # the fp8 load_weights additionally casts bf16 weights into fp8
+                        fp8.load_weights(weights, self.model_runner)
+                    else:
+                        self.model_runner.model.load_weights(weights=weights)
 
                 torch.cuda.current_stream().synchronize()
 
@@ -170,6 +176,8 @@ class VllmInternalWorkerExtension:
 
             gc.collect()
             torch.cuda.empty_cache()
+
+            self.has_called_refit_before = True
             return True
         except Exception as e:
             print(
