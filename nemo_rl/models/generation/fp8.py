@@ -270,7 +270,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+        # os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -543,7 +543,7 @@ def cast_tensor_to_fp8_blockwise(
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
 # Patches this method to not create new torch.nn.Parameter for layer weights
 # to maintain weight loaders.
-def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
+def maybe_post_process_fp8_weight_block(weight, weight_scale, layer):
     assert layer.weight_block_size is not None
 
     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -562,16 +562,15 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     )
     if should_use_deepgemm:
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
-            wq=layer.weight.data,
-            ws=layer.weight_scale.data,
+            wq=weight,
+            ws=weight_scale,
             quant_block_shape=tuple(layer.weight_block_size),
             use_e8m0=is_deep_gemm_e8m0_used(),
         )
         # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
         # Instead of creating new torch.nn.Parameter, we update the data in place.
-        layer.weight.data.copy_(dg_weight)
-        layer.weight_scale.data.copy_(dg_weight_scale)
-
+        return dg_weight, dg_weight_scale
+    return layer.weight.data, layer.weight_scale.data
 
 def process_weights_after_loading(self, layer) -> None:
     """This function is used to process the weights after loading for a Linear layer.
@@ -588,7 +587,8 @@ def process_weights_after_loading(self, layer) -> None:
 
     weight_scale = layer.weight_scale_inv
     weight, weight_scale = process_fp8_weight_block_strategy(layer.weight, weight_scale)
-    layer.weight.data = weight.data
+    weight, weight_scale = maybe_post_process_fp8_weight_block(weight, weight_scale, layer)
+    layer.weight.data.copy_(weight)
     if hasattr(layer, "weight_scale"):
         # Not the first time to call this function, just need to update the data
         layer.weight_scale.copy_(weight_scale.data)
@@ -597,7 +597,6 @@ def process_weights_after_loading(self, layer) -> None:
         layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
         layer.update_param_tp_status()
 
-    maybe_post_process_fp8_weight_block(layer)
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
