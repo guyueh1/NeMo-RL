@@ -282,28 +282,28 @@ def get_ray_cluster_topology() -> dict[str, tuple[str, int]]:
 def select_segment_nodes(
     topology: dict[str, tuple[str, int]],
     segment_size: int,
-    num_nodes: int,
+    num_training_nodes: int,
 ) -> tuple[list[str], list[str]]:
-    """Partition Ray node IDs into segment-aligned selected nodes and remainder.
+    """Partition Ray node IDs into training-eligible and remainder based on segment constraints.
 
     Greedily selects complete segments (segment_size nodes) from each NVLink domain,
-    sorted by topological order, until num_nodes is reached.
+    sorted by topological order, until num_training_nodes is reached.
 
     Args:
         topology: Dict mapping node_id -> (nvlink_domain, topo_rank) from get_ray_cluster_topology().
         segment_size: Number of nodes per NVLink domain segment.
-        num_nodes: Total number of nodes to select.
+        num_training_nodes: Total number of nodes needed for training.
 
     Returns:
-        (selected_node_ids, remaining_node_ids): Selected nodes are in topological order.
+        (training_node_ids, remaining_node_ids): Training nodes are in topological order.
 
     Raises:
-        ValueError: If segment_size does not evenly divide num_nodes.
+        ValueError: If segment_size does not evenly divide num_training_nodes.
         ResourceInsufficientError: If not enough complete segments can be formed.
     """
-    if num_nodes % segment_size != 0:
+    if num_training_nodes % segment_size != 0:
         raise ValueError(
-            f"num_nodes ({num_nodes}) must be divisible by "
+            f"num_training_nodes ({num_training_nodes}) must be divisible by "
             f"segment_size ({segment_size})."
         )
 
@@ -322,8 +322,8 @@ def select_segment_nodes(
         key=lambda item: item[1][0][1],
     )
 
-    num_segments_needed = num_nodes // segment_size
-    selected_node_ids: list[str] = []
+    num_segments_needed = num_training_nodes // segment_size
+    training_node_ids: list[str] = []
     segments_taken = 0
 
     # Greedily take complete segments from each domain in topological order.
@@ -334,7 +334,7 @@ def select_segment_nodes(
         segments_to_take = min(segments_available, num_segments_needed - segments_taken)
         nodes_to_take = segments_to_take * segment_size
         for nid, _ in nodes[:nodes_to_take]:
-            selected_node_ids.append(nid)
+            training_node_ids.append(nid)
         segments_taken += segments_to_take
 
     if segments_taken < num_segments_needed:
@@ -342,21 +342,21 @@ def select_segment_nodes(
         raise ResourceInsufficientError(
             f"Cannot form {num_segments_needed} complete segments of {segment_size} nodes. "
             f"Nodes per domain: {domain_summary}. "
-            f"Need {num_nodes} nodes total."
+            f"Need {num_training_nodes} training nodes total."
         )
 
-    remaining_node_ids = [nid for nid in topology if nid not in set(selected_node_ids)]
+    remaining_node_ids = [nid for nid in topology if nid not in set(training_node_ids)]
 
     domains_used = set()
-    for nid in selected_node_ids:
+    for nid in training_node_ids:
         domains_used.add(topology[nid][0])
     logger.info(
         f"[TOPOLOGY] Segment selection: {segments_taken} segments of {segment_size} nodes "
-        f"from {len(domains_used)} NVLink domains -> {len(selected_node_ids)} selected nodes, "
+        f"from {len(domains_used)} NVLink domains -> {len(training_node_ids)} training nodes, "
         f"{len(remaining_node_ids)} remaining nodes"
     )
 
-    return selected_node_ids, remaining_node_ids
+    return training_node_ids, remaining_node_ids
 
 
 def _sort_bundle_indices_by_topology(
@@ -473,7 +473,7 @@ def _sort_bundle_indices_by_topology(
 class RayVirtualCluster:
     """Creates a virtual distributed cluster using Ray placement groups.
 
-    This class simplifies distributed cluster setup by:
+    This class simplifies distributed training setup by:
     - Creating placement groups that represent logical compute nodes
     - Allocating GPU and CPU resources for distributed workers
     - Managing communication between distributed processes
@@ -526,7 +526,6 @@ class RayVirtualCluster:
         self._world_size = sum(self._bundle_ct_per_node_list)
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
         self._sorted_bundle_indices: Optional[list[int]] = None
-        self._nvlink_domain_per_bundle_index: Optional[tuple[str, ...]] = None
 
         self.num_gpus_per_node = num_gpus_per_node
         self.use_gpus = use_gpus
@@ -724,7 +723,7 @@ class RayVirtualCluster:
         )
 
     def get_master_address_and_port(self) -> tuple[str, int]:
-        """Gets the master address and port for the distributed setup.
+        """Gets the master address and port for the distributed training setup.
 
         Returns:
             Tuple of (address, port)
@@ -754,11 +753,9 @@ class RayVirtualCluster:
             )
 
         if not self.use_gpus:
-            self._nvlink_domain_per_bundle_index = None
             return None
 
         if len(self._node_placement_groups) != 1:
-            self._nvlink_domain_per_bundle_index = None
             return None
 
         pg = self._node_placement_groups[0]
@@ -797,7 +794,6 @@ class RayVirtualCluster:
             (gpu_ids[i], nvlink_domains[i], topo_ranks[i], bundle_to_node_ids[i])
             for i in range(num_bundles)
         ]
-        self._nvlink_domain_per_bundle_index = tuple(nvlink_domains)
         pg_reordered_bundle_indices = _sort_bundle_indices_by_topology(
             bundle_data,
             segment_size=self.segment_size,
@@ -824,7 +820,6 @@ class RayVirtualCluster:
             # Reset internal state
             self._node_placement_groups = None
             self._sorted_bundle_indices = None
-            self._nvlink_domain_per_bundle_index = None
 
         return True
 
