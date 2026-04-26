@@ -200,21 +200,6 @@ for node in $nodes; do
     ip_addresses_array+=("$ip_address")
 done
 
-# Sort nodes alphabetically for deterministic startup order.
-_sorted_pairs=()
-for (( _si = 0; _si < ${#nodes_array[@]}; _si++ )); do
-  _sorted_pairs+=("${nodes_array[$_si]}|${ip_addresses_array[$_si]}")
-done
-IFS=$'\n' _sorted_pairs=($(printf '%s\n' "${_sorted_pairs[@]}" | sort)); unset IFS
-nodes_array=()
-ip_addresses_array=()
-for _pair in "${_sorted_pairs[@]}"; do
-  nodes_array+=("${_pair%%|*}")
-  ip_addresses_array+=("${_pair##*|}")
-done
-unset _sorted_pairs _pair _si
-echo "[INFO] Nodes after hostname sort: ${nodes_array[*]}"
-
 head_node=${nodes_array[0]}
 head_node_ip=${ip_addresses_array[0]}
 
@@ -242,29 +227,6 @@ ip_head=$head_node_ip:$PORT
 #   (e.g., "rack-A1" vs "rack-B1" both yield "1").
 TOPO_PROBE_SCRIPT="$LOG_DIR/topology_probe.sh"
 cat > "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
-CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
-if [[ -z "\$CLUSTER_UUID" ]]; then
-  CLUSTER_UUID=""
-fi
-
-TOPO_RANK=""
-if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "block.node" ]]; then
-  _block_part="\${SLURM_TOPOLOGY_ADDR%%.*}"
-  _node_part="\${SLURM_TOPOLOGY_ADDR##*.}"
-  _block_digits=\$(echo "\$_block_part" | tr -dc '0-9')
-  _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
-  if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
-    TOPO_RANK=\$(( _block_digits * 10000000000 + _node_digits ))
-  fi
-elif [[ -n "\${SLURM_PROCID:-}" ]]; then
-  TOPO_RANK="\$SLURM_PROCID"
-else
-  _hostname_digits=\$(hostname | tr -dc '0-9')
-  if [[ -n "\$_hostname_digits" ]]; then
-    TOPO_RANK="\$_hostname_digits"
-  fi
-fi
-
 # Write GPU→cpulist mapping for NUMA binding.
 # IMPORTANT: The env var name NRL_GPU_CPU_AFFINITY_FILE and default path must stay
 # in sync with GPU_CPU_AFFINITY_PATH in nemo_rl/distributed/numa_utils.py.
@@ -276,19 +238,6 @@ if [[ -s "\$NRL_GPU_CPU_AFFINITY_FILE" ]]; then
 else
   echo "WARNING: Could not generate NUMA affinity map (nvidia-smi topo unavailable)"
 fi
-
-# Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
-# IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
-# with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in
-# nemo_rl/distributed/virtual_cluster.py.
-RAY_RESOURCES='{\"worker_units\": '"$GPUS_PER_NODE"', \"slurm_managed_ray_cluster\": 1'
-if [[ -n "\$CLUSTER_UUID" ]]; then
-  RAY_RESOURCES+=', \"nvlink_domain_'\${CLUSTER_UUID}'\": 1'
-fi
-if [[ -n "\$TOPO_RANK" ]]; then
-  RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
-fi
-RAY_RESOURCES+='}'
 TOPO_PROBE_EOF
 
 # First we start the head of the ray cluster on one of the physical nodes
@@ -356,12 +305,10 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-source $LOG_DIR/topology_probe.sh
-
 cat <<EOFINNER | tee /launch-head.sh
 ray start --head \
     --disable-usage-stats \
-    --resources="\$RAY_RESOURCES" \
+    --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
@@ -462,12 +409,10 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-source $LOG_DIR/topology_probe.sh
-
 cat <<EOFINNER | tee /launch-worker.sh
 ray start --address "$ip_head" \
           --disable-usage-stats \
-          --resources="\$RAY_RESOURCES" \
+          --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
           --min-worker-port=${MIN_WORKER_PORT} \
           --max-worker-port=${MAX_WORKER_PORT} \
           \
@@ -560,9 +505,7 @@ else
     echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
     exit 1
   fi
-  nodes_array=(${nodes_array[*]})
-  node="\${nodes_array[\$WORKER_NUM]}"
-  WORKER_PID=\$(get_container_pid "\$node")
+  nodes_array=($nodes)
   if [[ -n "\${COMMAND:-}" ]]; then
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
   else
