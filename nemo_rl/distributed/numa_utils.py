@@ -48,10 +48,12 @@ def bind_to_gpu_numa() -> bool:
     Memory binding is attempted independently and logged separately.
     """
     if os.environ.get("NRL_DISABLE_NUMA_BINDING") == "1":
+        print("NUMA binding skipped: NRL_DISABLE_NUMA_BINDING is set")
         return False
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if not cvd:
+        print("NUMA binding skipped: CUDA_VISIBLE_DEVICES is not set")
         return False
 
     gpu = cvd.split(",")[0]
@@ -65,14 +67,14 @@ def bind_to_gpu_numa() -> bool:
                 if idx == gpu:
                     cpus = _parse_cpulist(cpulist)
                     os.sched_setaffinity(0, cpus)
-                    logger.info("NUMA CPU binding: GPU %s → CPUs %s", gpu, cpulist)
+                    print(f"NUMA CPU binding: GPU {gpu} → CPUs {cpulist}")
                     _set_numa_membind(cpus)
                     return True
-        logger.debug("NUMA binding: GPU %s not found in %s", gpu, GPU_CPU_AFFINITY_PATH)
+        print(f"NUMA binding: GPU {gpu} not found in {GPU_CPU_AFFINITY_PATH}")
     except FileNotFoundError:
-        logger.debug("NUMA binding skipped: %s not found", GPU_CPU_AFFINITY_PATH)
+        print(f"NUMA binding skipped: {GPU_CPU_AFFINITY_PATH} not found")
     except Exception as exc:
-        logger.debug("NUMA binding skipped: %s", exc)
+        print(f"NUMA binding skipped: {exc}")
     return False
 
 
@@ -127,9 +129,7 @@ def _set_numa_membind(cpus: set[int]) -> bool:
         finally:
             libnuma.numa_bitmask_free(nodemask)
 
-        logger.info(
-            "NUMA membind: hard-bound to node %d (from CPU %d)", numa_node, min(cpus)
-        )
+        print(f"NUMA membind: hard-bound to node {numa_node} (from CPU {min(cpus)})")
         return True
     except Exception as exc:
         logger.debug("NUMA membind skipped: %s", exc)
