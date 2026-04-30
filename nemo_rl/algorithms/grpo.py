@@ -594,7 +594,7 @@ def setup(
             cluster_node_offset=inference_node_offset,
             cluster_gpu_offset_each_node=inference_gpu_offset,
         )
-        pg.finish_generation()
+        pg.finish_generation(discard_weights=colocated_inference)
         return pg, time.perf_counter() - t0
 
     def init_sglang():
