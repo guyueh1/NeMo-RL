@@ -36,7 +36,7 @@ GPU_CPU_AFFINITY_PATH = os.environ.get(
 )
 
 
-def bind_to_gpu_numa() -> bool:
+def bind_to_gpu_numa(device_id: int | None = None) -> bool:
     """Pin the current process to the NUMA-local CPUs and memory of its assigned GPU.
 
     Reads the GPU→cpulist mapping written by topology_probe.sh at node
@@ -56,7 +56,10 @@ def bind_to_gpu_numa() -> bool:
         print("NUMA binding skipped: CUDA_VISIBLE_DEVICES is not set")
         return False
 
-    gpu = cvd.split(",")[0]
+    if device_id is None:
+        gpu = cvd.split(",")[0]
+    else:
+        gpu = str(device_id)
     try:
         with open(GPU_CPU_AFFINITY_PATH) as f:
             for line in f:

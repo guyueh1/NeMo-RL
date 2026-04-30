@@ -56,8 +56,10 @@ class VllmInternalWorkerExtension:
     def bind_numa(self) -> bool:
         """Pin this TP worker to the NUMA-local CPUs of its GPU."""
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+        from nemo_rl.utils.nvml import device_id_to_physical_device_id
 
-        return bind_to_gpu_numa()
+        device_id = device_id_to_physical_device_id(self.device.index)
+        return bind_to_gpu_numa(device_id)
 
     def init_collective(
         self,
