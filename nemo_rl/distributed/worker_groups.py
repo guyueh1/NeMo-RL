@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import math
 import os
 import time
 from copy import deepcopy
@@ -750,6 +751,9 @@ class RayWorkerGroup:
             "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
         )
 
+        args = [ray.put(arg) for arg in args]
+        kwargs = {key: ray.put(value) for key, value in kwargs.items()}
+
         futures = []
 
         if run_rank_0_only_axes is None:
@@ -833,6 +837,23 @@ class RayWorkerGroup:
             replicate_on_axes = []
         if output_is_replicated is None:
             output_is_replicated = []
+
+        replicate_degrees = math.prod(
+            [self.sharding_annotations.get_axis_size(ax) for ax in replicate_on_axes]
+        )
+        if replicate_degrees > 1:
+            # Use ray.put to serialize all the arguments. This can reduce the cost
+            # of repeated serialization when we send same arguments to multiple workers.
+            _args = []
+            for arg in args:
+                _args = [ray.put(a) for a in arg]
+                _args.append(_args)
+            args = tuple(_args)
+            _kwargs = dict()
+            for key, value in kwargs.items():
+                _values = [ray.put(v) for v in value]
+                _kwargs[key] = _values
+            kwargs = _kwargs
 
         futures = []
 
