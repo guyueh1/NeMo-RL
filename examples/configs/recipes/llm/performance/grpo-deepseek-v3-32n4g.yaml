@@ -1,18 +1,32 @@
 defaults: ./grpo-deepseek-v3-32n8g.yaml
 checkpointing:
+  enabled: false
   checkpoint_dir: results/grpo-deepseek-v3-32n4g
+loss_fn:
+  force_on_policy_ratio: true
 policy:
+  sequence_packing:
+    fuse_loss: true
   megatron_cfg:
-    pipeline_model_parallel_size: 8
-    num_layers_in_first_pipeline_stage: 7
-    num_layers_in_last_pipeline_stage: 6
+    expert_model_parallel_size: 64
+    pipeline_model_parallel_size: 2
+    # pipeline_model_parallel_layout: "E(tttt|)*15tL"
+    num_layers_in_first_pipeline_stage: 31
+    num_layers_in_last_pipeline_stage: 30
+    recompute_modules: ["moe"]
+    recompute_granularity: "selective"
     # HybridEP settings
     moe_token_dispatcher_type: flex
     moe_flex_dispatcher_backend: hybridep
     moe_hybridep_num_sms: 32
   generation:
     vllm_cfg:
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.5
+      tensor_parallel_size: 16
+    vllm_kwargs:
+      compilation_config:
+        pass_config:
+          fuse_allreduce_rms: false
 logger:
   log_dir: logs/grpo-deepseek-v3-32n4g
   wandb:

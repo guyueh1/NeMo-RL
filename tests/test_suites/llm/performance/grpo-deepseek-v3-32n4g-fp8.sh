@@ -6,6 +6,12 @@ export NCCL_NVLS_ENABLE=0
 # for hybridEP
 export CUDA_HOME=/usr/local/cuda
 
+# FP8 performance optimizations
+export VLLM_USE_FLASHINFER_MOE_FP8=1
+export VLLM_FLASHINFER_MOE_BACKEND=latency
+export VLLM_FLASHINFER_ALLREDUCE_BACKEND=mnnvl
+export VLLM_ALLREDUCE_USE_FLASHINFER=1
+
 # Use the DeepSeek-V3 checkpoint converted to BF16.
 if [[ -z "$NRL_DEEPSEEK_V3_BF16_CKPT" ]]; then
     echo "Need to set NRL_DEEPSEEK_V3_BF16_CKPT to the path of DeepSeek-V3 checkpoint converted to BF16. See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md for more details."

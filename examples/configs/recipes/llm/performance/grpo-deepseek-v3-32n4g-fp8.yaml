@@ -1,0 +1,21 @@
+defaults: ./grpo-deepseek-v3-32n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-deepseek-v3-32n4g-fp8
+loss_fn:
+  use_importance_sampling_correction: true
+policy:
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      use_deep_gemm: true
+      use_deep_gemm_e8m0: "1"
+      quantization_ignored_layer_kws: [
+        a_proj,
+        b_proj
+      ]
+      tensor_parallel_size: 8
+
+logger:
+  log_dir: logs/grpo-deepseek-v3-32n4g-fp8
+  wandb:
+    name: grpo-deepseek-v3-32n4g-fp8
