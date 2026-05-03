@@ -1309,7 +1309,10 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         for _, state in optimizer_state.items():
             for k, v in state.items():
                 if torch.is_tensor(v) and v.is_cuda:
-                    state[k] = v.to("cpu")
+                    cpu_v = torch.empty_like(v, device="cpu", pin_memory=True)
+                    cpu_v.copy_(v, non_blocking=True)
+                    state[k] = cpu_v
+                    del v
 
     def _optimizer_to_cuda(self, optimizer_state):
         """Reload optimizer state tensors to CUDA."""
