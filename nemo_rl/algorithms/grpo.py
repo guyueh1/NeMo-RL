@@ -1112,9 +1112,22 @@ def refit_policy_generation(
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
     if colocated_inference:
-        policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
+        import psutil
 
+        print(
+            f"Before policy offloading, free memory: {policy.get_free_memory_bytes() / (1024**3):.2f}GB"
+        )
+        print(f"Before policy offloading psutil: {psutil.virtual_memory()}")
+        policy.offload_before_refit()
+        print(
+            f"After policy offloading, free memory: {policy.get_free_memory_bytes() / (1024**3):.2f}GB"
+        )
+        print(f"After policy offloading psutil: {psutil.virtual_memory()}")
+        policy_generation.prepare_for_generation(tags=["weights"])
+        print(
+            f"After policy generation preparation, free memory: {policy.get_free_memory_bytes() / (1024**3):.2f}GB"
+        )
+        print(f"After policy generation preparation psutil: {psutil.virtual_memory()}")
     # Create a context manager that does nothing when timer is None
     timer_context = (
         timer.time("prepare_for_generation/transfer_and_update_weights")

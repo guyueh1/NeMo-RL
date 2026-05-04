@@ -883,8 +883,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""
         futures = self.worker_group.run_all_workers_single_data("get_free_memory_bytes")
+        res = ray.get(futures)
+        print(f"Free memory bytes on all workers: {res}")
         # minimum free memory from all workers for safety
-        free_memory_bytes = min(ray.get(future) for future in futures)
+        free_memory_bytes = min(res)
         return free_memory_bytes
 
     def stream_weights_via_ipc_zmq(
