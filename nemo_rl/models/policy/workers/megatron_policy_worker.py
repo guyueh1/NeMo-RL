@@ -1294,29 +1294,26 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         use_pinned = self.cfg["use_pinned_optimizer_offload"]
 
         if device == "cpu":
-            if use_pinned:
-                self._coalesced_optimizer_to_cpu(optimizer_state)
-            else:
-                self._optimizer_to_cpu(optimizer_state)
+            self._optimizer_to_cpu(optimizer_state, pin_memory=use_pinned)
         elif device == "cuda":
-            if use_pinned:
-                self._coalesced_optimizer_to_cuda(optimizer_state)
-            else:
-                self._optimizer_to_cuda(optimizer_state)
+            self._optimizer_to_cuda(optimizer_state)
         else:
             raise ValueError(
                 f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
             )
 
-    def _optimizer_to_cpu(self, optimizer_state):
+    def _optimizer_to_cpu(self, optimizer_state, pin_memory=False):
         """Offload optimizer state tensors to CPU using default pageable memory."""
         for _, state in optimizer_state.items():
             for k, v in state.items():
                 if torch.is_tensor(v) and v.is_cuda:
-                    cpu_v = torch.empty_like(v, device="cpu", pin_memory=True)
-                    cpu_v.copy_(v, non_blocking=True)
-                    state[k] = cpu_v
-                    del v
+                    if pin_memory:
+                        cpu_v = torch.empty_like(v, device="cpu", pin_memory=True)
+                        cpu_v.copy_(v, non_blocking=True)
+                        state[k] = cpu_v
+                        del v
+                    else:
+                        state[k] = v.cpu()
 
     def _optimizer_to_cuda(self, optimizer_state):
         """Reload optimizer state tensors to CUDA."""
