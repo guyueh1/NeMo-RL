@@ -607,9 +607,31 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         raise ValueError(
             f"MXFP8 linear layer weight must be 2D, but got {layer.weight.ndim}D"
         )
-    assert self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
     weight = layer.weight.data  # [N, K]
     N, K = weight.shape
+    if self.backend == Mxfp8LinearBackend.EMULATION:
+        if not hasattr(layer, "weight_scale_from_checkpoint"):
+            layer.weight_scale_from_checkpoint = ModelWeightParameter(
+                data=layer.weight_scale.data,
+                input_dim=1,
+                output_dim=0,
+                weight_loader=layer.weight_scale.weight_loader,
+            )
+            layer.register_parameter(
+                "weight_scale_from_checkpoint", layer.weight_scale_from_checkpoint
+            )
+            layer.weight_scale_from_checkpoint.copy_(layer.weight_scale.data)
+            scale_k = K // 32
+            weight_scale = layer.weight_scale_from_checkpoint.data[:N, :scale_k].contiguous()
+            layer.weight_scale = torch.nn.Parameter(
+                weight_scale.contiguous(), requires_grad=False
+            )
+        else:
+            scale_k = K // 32
+            weight_scale = layer.weight_scale_from_checkpoint.data[:N, :scale_k].contiguous()
+            layer.weight_scale.copy_(weight_scale.contiguous())
+        return
+    assert self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
 
     if not hasattr(layer, "weight_scale_from_checkpoint"):
         layer.weight_scale_from_checkpoint = ModelWeightParameter(

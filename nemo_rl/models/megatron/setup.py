@@ -489,6 +489,8 @@ def setup_model_config(
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
 
+    model_cfg.batch_invariant_mode = config["megatron_cfg"].get("batch_invariant_mode", False)
+
     # Validate optimizer configuration
     _validate_optimizer_config(config)
 
@@ -965,6 +967,13 @@ def setup_model_and_optimizer(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
     )
+
+    # Enable batch invariant mode for megatron model
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        enable_batch_invariant_mode,
+    )
+    if megatron_cfg.model.batch_invariant_mode:
+        enable_batch_invariant_mode()
 
     if megatron_cfg.ft and megatron_cfg.ft.enable_ft_package:
         fault_tolerance.setup(megatron_cfg, state)
