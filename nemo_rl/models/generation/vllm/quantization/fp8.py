@@ -597,8 +597,13 @@ def process_weights_after_loading(self, layer) -> None:
 
 
 def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
+    from vllm.model_executor.kernels.linear.mxfp8.emulation import (
+        EmulationMxfp8LinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+        FlashInferCutlassMxfp8LinearKernel,
+    )
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-        Mxfp8LinearBackend,
         swizzle_mxfp8_scale,
     )
     from vllm.model_executor.parameter import ModelWeightParameter
@@ -609,7 +614,7 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         )
     weight = layer.weight.data  # [N, K]
     N, K = weight.shape
-    if self.backend == Mxfp8LinearBackend.EMULATION:
+    if isinstance(self.kernel, EmulationMxfp8LinearKernel):
         if not hasattr(layer, "weight_scale_from_checkpoint"):
             layer.weight_scale_from_checkpoint = ModelWeightParameter(
                 data=layer.weight_scale.data,
@@ -631,7 +636,7 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
             weight_scale = layer.weight_scale_from_checkpoint.data[:N, :scale_k].contiguous()
             layer.weight_scale.copy_(weight_scale.contiguous())
         return
-    assert self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
+    assert isinstance(self.kernel, FlashInferCutlassMxfp8LinearKernel)
 
     if not hasattr(layer, "weight_scale_from_checkpoint"):
         layer.weight_scale_from_checkpoint = ModelWeightParameter(
