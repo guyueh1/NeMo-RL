@@ -1,0 +1,28 @@
+diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
+index d9184bb77..eb8d7eac1 100644
+--- a/vllm/model_executor/layers/layernorm.py
++++ b/vllm/model_executor/layers/layernorm.py
+@@ -268,6 +268,23 @@ class RMSNorm(CustomOp):
+         if self.variance_size_override is not None:
+             return self.forward_native(x, residual)
+ 
++        # Under batch-invariant mode, route the fused add+norm through the BI
++        # Triton kernel so the variance reduction + normalize matches what
++        # `rms_norm_batch_invariant` produces in the residual=None case.
++        # The default `fused_add_rms_norm` C++ kernel uses `cub::BlockReduce`
++        # (a pairwise tree) and `rsqrtf`, which diverges from the BI Triton
++        # kernel (`tl.sum BLOCK_SIZE=1024` sequential outer + `1.0/sqrt`) at
++        # large input magnitudes — observed as ~1 bf16 ULP drift starting at
++        # layer 6 vs an equivalent Megatron BI RMSNorm path.
++        if envs.VLLM_BATCH_INVARIANT and residual is not None:
++            residual.add_(x)
++            return (
++                rms_norm_batch_invariant(
++                    residual, self.weight.data, self.variance_epsilon
++                ),
++                residual,
++            )
++
+         # Optional Oink SM100 fast path (fused residual-add + RMSNorm, in-place).
+         # This mirrors vLLM's fused_add_rms_norm semantics by mutating both
+         # `x` (normalized output) and `residual` (residual-out buffer).
