@@ -1,6 +1,5 @@
-"""Run a single prompt through a Megatron Llama-3.1-8B model with forward-only,
-capture inputs to every module on the requested decoder layers, and save the
-final logits.
+"""Run a batch of real prompts through a Megatron Llama-3.1-8B model
+(forward-only) and save the last-token logits for each prompt.
 
 BF16 (default):
     uv run --extra mcore torchrun --nproc_per_node=1 my_script/megatron_forward.py
@@ -32,8 +31,41 @@ from megatron.core.transformer.module import Float16Module
 from transformers import AutoTokenizer
 
 
-DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog."
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DATASET = "openai/gsm8k"
+DEFAULT_DATASET_SUBSET = "main"
+DEFAULT_DATASET_SPLIT = "train"
+DEFAULT_DATASET_FIELD = "question"
+DEFAULT_NUM_PROMPTS = 32
+
+
+def load_prompts(dataset, subset, split, field, n, seed):
+    """Load `n` non-empty prompts from a HuggingFace dataset, deterministically."""
+    from datasets import load_dataset
+
+    kwargs = {"split": split}
+    if subset:
+        ds = load_dataset(dataset, subset, **kwargs)
+    else:
+        ds = load_dataset(dataset, **kwargs)
+    ds = ds.shuffle(seed=seed)
+    prompts = []
+    for row in ds:
+        text = row.get(field)
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        prompts.append(text)
+        if len(prompts) >= n:
+            break
+    if len(prompts) < n:
+        raise RuntimeError(
+            f"only found {len(prompts)} non-empty '{field}' rows in "
+            f"{dataset}:{subset}:{split}, needed {n}"
+        )
+    return prompts
 
 
 def default_output(
@@ -110,6 +142,50 @@ def install_mxfp8_compact_scales():
         pass
 
     MXFP8Quantizer.optimize_for_gemm = property(_get, _set)
+
+
+def install_mxfp8_passthrough_for_bi_gemm():
+    """Route MXFP8 GEMMs around the BI matmul; BF16 GEMMs still hit BI Triton.
+
+    Interim fix that lets ``--batch-invariant`` coexist with ``--mxfp8``
+    without attempting any vLLM bit-identity. Megatron's BI ``general_gemm``
+    patch (``_te_general_gemm_patched``) immediately reads ``A.is_cuda`` /
+    ``B.is_cuda`` on every call, but TE's quantised storage types
+    (``MXFP8TensorStorage`` / ``Float8TensorStorage``) do not expose
+    ``is_cuda``, so MXFP8 linears under BI mode raise
+    ``AttributeError: 'MXFP8TensorStorage' object has no attribute 'is_cuda'``.
+    This wrapper detects non-``torch.Tensor`` GEMM operands (TE quantised
+    storages) and forwards the call to TE's original ``general_gemm``;
+    regular CUDA tensors still go through the BI Triton matmul.
+    """
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik_mod
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+    import transformer_engine.pytorch.module.linear as te_linear_mod
+    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
+    import megatron.core.extensions.transformer_engine as meg_te
+
+    if bik_mod._TE_GENERAL_GEMM_ORIG is None:
+        raise RuntimeError("enable_batch_invariant_mode() must run before "
+                           "install_mxfp8_passthrough_for_bi_gemm()")
+
+    orig_gemm = bik_mod._TE_GENERAL_GEMM_ORIG
+    bi_gemm = bik_mod._te_general_gemm_patched
+    extract = bik_mod._extract_te_gemm_args
+
+    def _wrapper(*args, **kwargs):
+        a, b, _, _, _, _, _ = extract(args, kwargs)
+        if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+            return orig_gemm(*args, **kwargs)
+        return bi_gemm(*args, **kwargs)
+
+    for mod, attr in (
+        (te_cpp, "general_gemm"),
+        (te_linear_mod, "general_gemm"),
+        (te_layernorm_linear_mod, "general_gemm"),
+        (meg_te, "general_gemm"),
+    ):
+        if hasattr(mod, attr):
+            setattr(mod, attr, _wrapper)
 
 
 def install_mxfp8_dequant_for_bi_gemm():
@@ -567,7 +643,13 @@ def unwrap(m):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--prompt", default=DEFAULT_PROMPT)
+    p.add_argument("--num-prompts", type=int, default=DEFAULT_NUM_PROMPTS,
+                   help="Number of prompts to draw from --dataset (default: 32).")
+    p.add_argument("--dataset", default=DEFAULT_DATASET)
+    p.add_argument("--dataset-subset", default=DEFAULT_DATASET_SUBSET)
+    p.add_argument("--dataset-split", default=DEFAULT_DATASET_SPLIT)
+    p.add_argument("--dataset-field", default=DEFAULT_DATASET_FIELD)
+    p.add_argument("--dataset-seed", type=int, default=0)
     p.add_argument("--output", default=None)
     p.add_argument("--batch-invariant", action="store_true")
     p.add_argument("--split-fused", action="store_true",
@@ -606,11 +688,13 @@ def parse_args():
                    help="FP8 element format used by the MXFP8 recipe (default: "
                         "e4m3). 'hybrid' uses e4m3 for fwd and e5m2 for bwd. "
                         "Only meaningful with --mxfp8.")
-    p.add_argument("--capture-layers", default="0",
-                   help="Comma-separated 0-indexed decoder layer numbers to capture "
-                        "per-module input tensors for (default: 0).")
+    p.add_argument("--mxfp8-bi-dequant", action="store_true",
+                   help="Under --mxfp8 --batch-invariant, dequant MXFP8 operands "
+                        "to bf16 and route through the BF16 BI matmul "
+                        "(install_mxfp8_dequant_for_bi_gemm). Default is the "
+                        "passthrough patch which just lets MXFP8 GEMMs use TE's "
+                        "original cuBLASLt kernel.")
     args = p.parse_args()
-    args.capture_layers = [int(x) for x in args.capture_layers.split(",") if x.strip()]
     if args.split_all_fused:
         args.split_fused = True   # imply layer-0 split when all-layers split
     if args.output is None:
@@ -638,11 +722,17 @@ def main():
         enable_batch_invariant_mode()
         print_rank_0("[megatron] batch_invariant_mode ENABLED")
         if args.mxfp8:
-            install_mxfp8_compact_scales()
-            install_mxfp8_dequant_for_bi_gemm()
-            print_rank_0("[megatron] MXFP8 quantizers forced to compact scales")
-            print_rank_0("[megatron] BI GEMM patch wrapped: MXFP8 tensors "
-                         "dequant -> bf16 -> BF16 BI matmul (matmul_persistent)")
+            if args.mxfp8_bi_dequant:
+                install_mxfp8_compact_scales()
+                install_mxfp8_dequant_for_bi_gemm()
+                print_rank_0("[megatron] MXFP8 quantizers forced to compact scales")
+                print_rank_0("[megatron] BI GEMM patch wrapped: MXFP8 tensors "
+                             "dequant -> bf16 -> BF16 BI matmul (matmul_persistent)")
+            else:
+                install_mxfp8_passthrough_for_bi_gemm()
+                print_rank_0("[megatron] BI GEMM patch wrapped: MXFP8 tensors "
+                             "passthrough to TE's original general_gemm; "
+                             "BF16 ops still hit BI Triton")
 
     if args.vllm_rmsnorm:
         if not args.batch_invariant:
@@ -705,30 +795,42 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    token_ids_list = tokenizer.encode(args.prompt, add_special_tokens=True)
-    print_rank_0(f"[megatron] prompt: {args.prompt!r}")
-    print_rank_0(f"[megatron] token ids ({len(token_ids_list)}): {token_ids_list}")
+    prompts = load_prompts(
+        args.dataset,
+        args.dataset_subset,
+        args.dataset_split,
+        args.dataset_field,
+        args.num_prompts,
+        args.dataset_seed,
+    )
+    token_ids_list = [
+        tokenizer.encode(p, add_special_tokens=True) for p in prompts
+    ]
+    seq_lens = [len(ids) for ids in token_ids_list]
+    print_rank_0(f"[megatron] dataset: {args.dataset}:{args.dataset_subset}:"
+                 f"{args.dataset_split} field={args.dataset_field!r} "
+                 f"n={len(prompts)}")
+    print_rank_0(f"[megatron] seq_len min/mean/max = {min(seq_lens)}/"
+                 f"{sum(seq_lens) / len(seq_lens):.1f}/{max(seq_lens)}")
 
-    # TE's MXFP8 quantizer requires the product of leading dims (= seq_len *
-    # batch for our (s, b, h) layout) to be divisible by 32 (the MXFP8 block
-    # size). Pad seq_len up to the next multiple of 32 with the EOS token;
-    # the padded positions don't affect the captured tensors at the original
-    # positions thanks to causal attention, and compare.py's min-length
-    # truncation discards them anyway.
-    real_seq_len = len(token_ids_list)
-    if args.mxfp8 and real_seq_len % 32 != 0:
-        padded_len = ((real_seq_len + 31) // 32) * 32
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        token_ids_list = token_ids_list + [pad_id] * (padded_len - real_seq_len)
-        print_rank_0(f"[megatron] padded seq_len {real_seq_len} -> {padded_len} for MXFP8 "
-                     f"(TE MXFP8 block size requires divisibility by 32)")
+    # Pad all prompts to a common length so they fit in one (B, S) tensor. Under
+    # MXFP8 the per-block scaling kernel requires every dim to be a multiple of
+    # 32 — round seq_len up accordingly. Causal attention makes the pad
+    # positions invisible to the real token positions, so per-prompt last-token
+    # logits are unaffected.
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    padded_seq_len = max(seq_lens)
+    if args.mxfp8 and padded_seq_len % 32 != 0:
+        padded_seq_len = ((padded_seq_len + 31) // 32) * 32
+        print_rank_0(f"[megatron] padded seq_len {max(seq_lens)} -> {padded_seq_len} "
+                     "for MXFP8 (TE MXFP8 block size requires divisibility by 32)")
 
-    input_ids = torch.tensor([token_ids_list], dtype=torch.long, device="cuda")
+    padded_ids = [ids + [pad_id] * (padded_seq_len - len(ids)) for ids in token_ids_list]
+    input_ids = torch.tensor(padded_ids, dtype=torch.long, device="cuda")
     position_ids = torch.arange(
         input_ids.size(1), dtype=torch.long, device=input_ids.device
     ).unsqueeze(0).expand_as(input_ids)
 
-    # Register hooks on the (single, last-stage) model chunk.
     assert len(model_list) == 1, "expected one model chunk with pp=1"
     inner = unwrap(model_list[0])
 
@@ -742,43 +844,6 @@ def main():
                      "(linear_qkv -> SplitNormLinear(norm, linear), "
                      "linear_fc1 -> SplitNormLinear(norm, linear))")
 
-    captured_module_inputs = {idx: {} for idx in args.capture_layers}
-    captured_layer_outputs = {}
-    handles = []
-
-    def make_hook(layer_idx, name):
-        bucket = captured_module_inputs[layer_idx]
-        def hook(module, args_, output_):
-            saved = []
-            for a in args_:
-                if isinstance(a, torch.Tensor):
-                    saved.append(a.detach().to(torch.float32).cpu().clone())
-                else:
-                    saved.append(a)
-            if name not in bucket:
-                bucket[name] = saved
-        return hook
-
-    def make_layer_output_hook(idx):
-        def hook(module, args_, output_):
-            # TransformerLayer may return a tensor or (hidden_states, context) tuple.
-            t = output_
-            if isinstance(t, tuple):
-                t = t[0]
-            if isinstance(t, torch.Tensor):
-                captured_layer_outputs[idx] = t.detach().to(torch.float32).cpu().clone()
-        return hook
-
-    for layer_idx in args.capture_layers:
-        layer = inner.decoder.layers[layer_idx]
-        for name, sub in layer.named_modules():
-            qual = name if name else "<layer>"
-            handles.append(sub.register_forward_hook(make_hook(layer_idx, qual)))
-
-    for i, layer in enumerate(inner.decoder.layers):
-        handles.append(layer.register_forward_hook(make_layer_output_hook(i)))
-
-    # Forward pass (forward-only).
     with torch.no_grad():
         fwd_bwd = get_forward_backward_func()
         iterator = SingleBatchIterator(input_ids, position_ids)
@@ -789,31 +854,32 @@ def main():
             num_microbatches=1,
             forward_only=True,
             seq_length=input_ids.size(1),
-            micro_batch_size=1,
+            micro_batch_size=input_ids.size(0),
             collect_non_loss_data=True,
         )
-
-    for h in handles:
-        h.remove()
 
     if isinstance(output, list) and len(output) > 0:
         output = output[0]
 
-    logits_cpu = None
+    last_token_logits_cpu = None
     if parallel_state.is_pipeline_last_stage() and isinstance(output, torch.Tensor):
-        # With tp=1 there's nothing to all-gather; just move to CPU.
         logits_cpu = output.detach().to(torch.float32).cpu()
         print_rank_0(f"[megatron] logits shape: {tuple(logits_cpu.shape)}")
+        # Megatron returns logits as (B, S, V). Gather row[i] at position
+        # seq_lens[i] - 1 (the last real token of prompt i).
+        assert logits_cpu.dim() == 3 and logits_cpu.size(0) == len(prompts), (
+            f"unexpected logits shape {tuple(logits_cpu.shape)}; "
+            f"expected (B={len(prompts)}, S, V)"
+        )
+        idx = torch.tensor([sl - 1 for sl in seq_lens], dtype=torch.long)
+        last_token_logits_cpu = logits_cpu[torch.arange(len(prompts)), idx]
 
     if dist.is_initialized() and dist.get_rank() == 0:
         payload = {
-            "prompt": args.prompt,
-            "token_ids": token_ids_list,
-            # Legacy alias for backward compat with older compare.py.
-            "first_layer_inputs": captured_module_inputs.get(0, {}),
-            "module_inputs_by_layer": captured_module_inputs,
-            "layer_outputs": captured_layer_outputs,
-            "logits": logits_cpu,
+            "prompts": prompts,
+            "token_ids_list": token_ids_list,
+            "seq_lens": seq_lens,
+            "last_token_logits": last_token_logits_cpu,
         }
         torch.save(payload, args.output)
         print(f"[megatron] saved capture to {args.output}")
