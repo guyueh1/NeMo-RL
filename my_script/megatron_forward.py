@@ -72,21 +72,66 @@ def default_output(
     )
 
 
-def install_mxfp8_passthrough_for_bi_gemm():
-    """When ``--batch-invariant`` and ``--mxfp8`` are both on, Megatron's BI
-    matmul patch (``_te_general_gemm_patched``) can't handle MXFP8 tensors —
-    it calls ``B.is_cuda`` which fails on ``MXFP8TensorStorage``.
+def install_mxfp8_compact_scales():
+    """Force all MXFP8 tensors to use compact (non-swizzled) scales.
 
-    Wrap the patch so any GEMM call whose inputs aren't regular fp32/fp16/bf16
-    CUDA tensors (i.e. the MXFP8 quantized linears) routes to TE's original
-    ``general_gemm`` instead. BF16 GEMMs keep going through the BI path.
+    TE's MXFP8 quantizer normally stores per-block scales in a swizzled
+    cuBLASLt-friendly layout when ``optimize_for_gemm=True``. cuBLASLt's
+    block-scaled fp8 GEMM consumes that layout directly. But the C++ kernel
+    behind ``tex.dequantize`` asserts on swizzled tensors:
 
-    This mirrors what vLLM already does for MXFP8: its BI matmul patches only
-    intercept ``aten::{mm, addmm, matmul, linear}`` for plain bf16 tensors;
-    the MXFP8 GEMM call path goes through ModelOpt's kernel which doesn't hit
-    ``aten::mm``, so vLLM's BI patches don't apply to it either.
+        Assertion failed: !input.with_gemm_swizzled_scales.
+        Input must have scales in compact format.
+
+    Since the BI MXFP8 path dequants both inputs back to bf16 before calling
+    the BF16 BI matmul, we don't need the swizzled layout at all.
+
+    TE's basic_linear / forward_grouped_mlp / backward_grouped_mlp paths set
+    ``input_quantizer.optimize_for_gemm = True`` right before quantization,
+    so patching ``make_empty`` (which doesn't fire on the tex.quantize path)
+    isn't enough. We replace ``optimize_for_gemm`` on the ``MXFP8Quantizer``
+    class with a property that always reads ``False`` and silently swallows
+    ``True`` writes. The C++ side reads this attribute via
+    ``quantizer.attr("optimize_for_gemm").cast<bool>()`` per call
+    (``quantizer.cpp:116``), so every newly-allocated MXFP8 tensor
+    inherits ``with_gemm_swizzled_scales=False``.
+
+    Must be called BEFORE ``model_provider.finalize()`` /
+    ``provide_distributed_model`` so the first MXFP8 quantizers picked up
+    inside ``fp8_autocast`` see the patched property.
+    """
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    def _get(self):
+        return False
+
+    def _set(self, value):
+        # Silently swallow `True` writes; we always want compact scales.
+        pass
+
+    MXFP8Quantizer.optimize_for_gemm = property(_get, _set)
+
+
+def install_mxfp8_dequant_for_bi_gemm():
+    """When ``--batch-invariant`` and ``--mxfp8`` are both on, route MXFP8
+    GEMMs through the BF16 batch-invariant matmul kernel by **dequantising
+    both inputs to bf16** first.
+
+    Mirrors vLLM's ``BatchInvariantMxfp8LinearKernel`` (which dequants weight
+    via ``dequant_mxfp8_to_bf16`` and calls ``matmul_persistent``):
+    elementwise dequant is naturally batch-invariant, and the BF16 BI matmul
+    has a fixed K-reduction order, so the result is deterministic and
+    matches across engines if both sides dequant identically.
+
+    On TE side, the FP8 input is an ``MXFP8TensorStorage`` (or similar TE
+    quantised-tensor type); ``.dequantize(dtype=torch.bfloat16)`` returns a
+    regular bf16 tensor via TE's C++ dequant kernel. The result is then fed
+    into ``BatchInvariantTEGemmFn.apply`` — the same path BF16 layers take.
 
     Must be called AFTER ``enable_batch_invariant_mode()``.
+
+    Replaces the earlier ``install_mxfp8_passthrough_for_bi_gemm`` which
+    simply fell through to TE's non-BI ``general_gemm`` for MXFP8 calls.
     """
     from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik_mod
     import transformer_engine.pytorch.cpp_extensions as te_cpp
@@ -94,26 +139,52 @@ def install_mxfp8_passthrough_for_bi_gemm():
     import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
     import megatron.core.extensions.transformer_engine as meg_te
 
-    orig_patched = bik_mod._te_general_gemm_patched
-    orig_te = bik_mod._TE_GENERAL_GEMM_ORIG
-    if orig_te is None:
+    if bik_mod._TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError("enable_batch_invariant_mode() must run before "
-                           "install_mxfp8_passthrough_for_bi_gemm()")
-    extract = bik_mod._extract_te_gemm_args
-    regular_dtypes = (torch.bfloat16, torch.float16, torch.float32)
+                           "install_mxfp8_dequant_for_bi_gemm()")
 
-    def _is_regular(t):
-        if t is None:
-            return True
-        if isinstance(t, torch.Tensor):
-            return t.dtype in regular_dtypes
-        return False
+    extract = bik_mod._extract_te_gemm_args
+    bi_gemm_fn = bik_mod.BatchInvariantTEGemmFn
+
+    def _maybe_dequant_to_bf16(t):
+        # Regular tensor (or None): leave alone. MXFP8/Float8 TE tensor: call
+        # .dequantize(dtype=bf16). Detection uses the .dequantize attribute,
+        # which TE's quantised-tensor storages expose but regular tensors do
+        # not.
+        if t is None or isinstance(t, torch.Tensor):
+            return t
+        if hasattr(t, "dequantize"):
+            return t.dequantize(dtype=torch.bfloat16)
+        return t
 
     def _wrapper(*args, **kwargs):
-        a, b, *_rest = extract(args, kwargs)
-        if not _is_regular(a) or not _is_regular(b):
-            return orig_te(*args, **kwargs)
-        return orig_patched(*args, **kwargs)
+        a, b, out_dtype, layout, out_tensor, bias, grad = extract(args, kwargs)
+        extra_output = kwargs.get("extra_output", None)
+        ub = kwargs.get("ub", None)
+        ub_type = kwargs.get("ub_type", None)
+        bulk_overlap = kwargs.get("bulk_overlap", False)
+        if extra_output is not None or ub is not None or ub_type is not None or bulk_overlap:
+            raise RuntimeError(
+                "Batch-invariant GEMM does not support Userbuffers/overlap "
+                "(extra_output/ub/ub_type/bulk_overlap)."
+            )
+
+        a_bf16 = _maybe_dequant_to_bf16(a)
+        b_bf16 = _maybe_dequant_to_bf16(b)
+
+        result = bi_gemm_fn.apply(
+            a_bf16, b_bf16, bias if not grad else None, out_dtype, layout
+        )
+
+        bias_grad = None
+        if grad and bias is not None:
+            b_flat = b_bf16.reshape(-1, b_bf16.shape[-1]) if b_bf16.dim() > 2 else b_bf16
+            bias_grad = b_flat.sum(dim=0)
+
+        if out_tensor is not None:
+            out_tensor.copy_(result)
+            return (out_tensor, bias_grad, None, extra_output)
+        return (result, bias_grad, None, extra_output)
 
     for mod, attr in (
         (te_cpp, "general_gemm"),
@@ -567,9 +638,11 @@ def main():
         enable_batch_invariant_mode()
         print_rank_0("[megatron] batch_invariant_mode ENABLED")
         if args.mxfp8:
-            install_mxfp8_passthrough_for_bi_gemm()
-            print_rank_0("[megatron] BI GEMM patch wrapped: MXFP8 tensors fall "
-                         "through to TE's original general_gemm")
+            install_mxfp8_compact_scales()
+            install_mxfp8_dequant_for_bi_gemm()
+            print_rank_0("[megatron] MXFP8 quantizers forced to compact scales")
+            print_rank_0("[megatron] BI GEMM patch wrapped: MXFP8 tensors "
+                         "dequant -> bf16 -> BF16 BI matmul (matmul_persistent)")
 
     if args.vllm_rmsnorm:
         if not args.batch_invariant:

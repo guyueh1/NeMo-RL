@@ -278,3 +278,459 @@ shared by both engines — would close all of them at once.
 | vLLM MXFP8 capture | `my_script/vllm_capture_mxfp8_bi.pt` | Baseline |
 | Megatron MXFP8 capture | `my_script/megatron_capture_mxfp8_split_vllmrope_vllmswiglu_vllmsdpa_vllmrmsnorm_bi.pt` | Baseline |
 | Compare output | `my_script/compare_mxfp8_bi_L0.log` | Per-module + per-layer diffs |
+
+---
+
+## Update 2026-06-01: dequant-to-bf16 + BF16 BI matmul approach
+
+After the initial baseline, switched both engines to a different MXFP8 BI
+strategy: **dequant both GEMM inputs to bf16 and reuse the existing BF16
+batch-invariant matmul kernel**. The motivation is simplicity — instead of
+writing a new MXFP8 BI matmul kernel (per
+[`mxfp8_bi_matmul_design.md`](mxfp8_bi_matmul_design.md)), reuse the kernel
+that's already bit-identical between vLLM and Megatron in the BF16 work.
+
+### Implementation
+
+**vLLM** — new `BatchInvariantMxfp8LinearKernel` at
+`3rdparty/vllm/vllm/model_executor/kernels/linear/mxfp8/batch_invariant.py`:
+
+```python
+def apply_weights(self, layer, x, bias=None):
+    weight_bf16 = dequant_mxfp8_to_bf16(layer.weight, weight_scale)  # [N, K] bf16
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_2d = matmul_persistent(x_2d, weight_bf16.t())               # BF16 BI matmul
+    if bias is not None: out_2d = out_2d + bias
+    return out_2d.reshape(*x.shape[:-1], -1).to(x.dtype)
+```
+
+The activation `x` is BF16; we don't quantize it. Registered first in
+`_POSSIBLE_MXFP8_KERNELS[CUDA]` so it wins automatically under
+`VLLM_BATCH_INVARIANT=1`.
+
+**Megatron** — three new patches in `my_script/megatron_forward.py`, all
+auto-applied when `--mxfp8 --batch-invariant` are both set:
+
+1. `install_mxfp8_compact_scales()` — replaces
+   `MXFP8Quantizer.optimize_for_gemm` with a `property` that always reads
+   `False` and silently swallows writes. Required because TE's
+   `basic_linear.py:353`, `forward_grouped_mlp.py:287`, and
+   `backward_grouped_mlp.py:352` explicitly set
+   `quantizer.optimize_for_gemm = True` just before each `tex.quantize`
+   call; otherwise the resulting MXFP8 tensors carry swizzled scales and
+   `tex.dequantize` refuses them with
+   `Assertion failed: !input.with_gemm_swizzled_scales`.
+2. `install_mxfp8_dequant_for_bi_gemm()` — wraps the BI `general_gemm`
+   hook (TE has four binding points: `te_cpp.general_gemm`,
+   `te_linear_mod.general_gemm`,
+   `te_layernorm_linear_mod.general_gemm`, and Megatron's
+   `meg_te.general_gemm`). For each TE quantised input, calls
+   `.dequantize(dtype=torch.bfloat16)` to get back a bf16 tensor, then
+   feeds the bf16 result into `BatchInvariantTEGemmFn` (the BF16 BI
+   matmul path). Replaces the earlier no-op
+   `install_mxfp8_passthrough_for_bi_gemm`.
+3. Same `--mxfp8` seq-pad-to-32 logic stays in place.
+
+### Result with this approach (L0 module-level)
+
+Configuration:
+`uv run --extra vllm  python    my_script/vllm_forward.py     --mxfp8 --batch-invariant --capture-layers 0`
+followed by
+`uv run --extra mcore torchrun --nproc_per_node=1 my_script/megatron_forward.py --mxfp8 --batch-invariant --split-fused --vllm-rope --vllm-swiglu --vllm-sdpa --vllm-rmsnorm --capture-layers 0`
+followed by
+`compare.py`.
+
+| L0 tensor | max_abs | Bit-identical? |
+|---|---|---|
+| `input_layernorm` input (embedding) | 0 | ✓ |
+| `linear_qkv.linear` input (post first RMSNorm) | 0 | ✓ |
+| `linear_proj` input (post-SDPA) | **0.00586** | ✗ first MXFP8 divergence |
+| `linear_fc1.linear` input (post second RMSNorm) | 0.0313 | ✗ |
+| `linear_fc2` input (post-SwiGLU) | 0.125 | ✗ |
+
+Per-layer residual drift (positions 0–10): L0=0.047, L5=0.250, L10=0.109,
+L20=0.250, **L31=12.0** (compared to L31=2.0 in the prior FlashInfer-vs-TE
+baseline). The deeper-layer drift grew under this approach.
+
+Why is the new approach *worse* at depth? At the time we didn't know; we
+hypothesised differing weight quantizers between vLLM (converter / disk
+ckpt) and Megatron (TE on-the-fly quantization at GEMM time). The
+diagnostic below disproves that.
+
+### Diagnostic: are vLLM's and Megatron's MXFP8 quantizers byte-identical?
+
+`my_script/compare_mxfp8_quant.py` (new) loads
+`model.layers.0.self_attn.q_proj.weight` (4096×4096 bf16) from the HF
+ckpt and runs three quantizers on it in the same Python process (mcore
+venv has both TE and vLLM importable):
+
+1. **vLLM converter** (already on disk in the MXFP8 ckpt produced by
+   `convert_hf_bf16_ckpt_to_mxfp8.py`). Formula:
+   `exponent = ceil(log2(amax / 448)); biased = clamp(exponent, -127, 127) + 127`.
+2. **TE `MXFP8Quantizer.quantize_impl(w)`**. Formula on Blackwell:
+   single PTX `cvt.rp.satfinite.ue8m0x2.f32` (round-up to E8M0)
+   applied to `amax / 448` — equivalent to `ceil(log2(amax/448)) + 127`.
+3. **vLLM `mxfp8_e4m3_quantize(w)`** — runtime quantizer, dispatches to
+   FlashInfer's `mxfp8_quantize` CUDA kernel on Blackwell.
+
+Result (byte-wise comparison of the `(uint8 scale, fp8 data)` tuples):
+
+```
+(converter) vs (TE):           scale-byte-identical: True  data-byte-identical: True
+(converter) vs (vLLM runtime): scale-byte-identical: True  data-byte-identical: True
+(TE)        vs (vLLM runtime): scale-byte-identical: True  data-byte-identical: True
+```
+
+**All three quantizers produce byte-identical output for the same bf16
+input.** First-8-of-row-0 of every scale tensor is
+`[114, 114, 114, 114, 114, 114, 114, 114]` — identical across all three.
+
+So:
+
+- The weight quantizer **is not the source of the L0 drift.** The
+  formula reads `ceil(log2(amax/448)) + 127` everywhere; on Blackwell the
+  hardware PTX op implements it directly.
+- Per Section "Implementation" in
+  [`mxfp8_bi_matmul_design.md`](mxfp8_bi_matmul_design.md), the
+  *converter* uses the explicit `ceil(log2(amax/desc_max))` while the
+  Python *runtime fallback* in `mxfp8_utils.py:_mxfp8_e4m3_quantize_torch`
+  uses `floor(log2(amax))` — but the runtime fallback is only used on
+  non-Blackwell hardware. On Blackwell (our target), FlashInfer's CUDA
+  kernel is selected and matches TE byte-for-byte.
+
+⚠️ Caveat: my first diagnostic run *appeared* to show a 1.24 max_abs diff
+between TE-quantized and converter-quantized dequanted tensors. That was
+a script bug: TE returns `_rowwise_data` as `torch.uint8` (not
+`torch.float8_e4m3fn`), and my dequant did
+`.to(torch.float32)` directly on the uint8, interpreting bytes as
+integers 0–255 rather than as fp8 floats. Once
+`.view(torch.float8_e4m3fn)` is applied first, the dequanted bf16 is
+byte-identical too. The underlying conclusion is unchanged: the bytes
+match.
+
+### Updated diagnosis: activation quantization is the asymmetry
+
+The L0 drift at `linear_proj` input therefore cannot come from weight
+quantization. Re-reading the two paths:
+
+| | vLLM `BatchInvariantMxfp8LinearKernel.apply_weights` | Megatron `install_mxfp8_dequant_for_bi_gemm` |
+|---|---|---|
+| Weight | MXFP8 → dequant → bf16 | bf16 (HF ckpt) → TE on-the-fly quant → MXFP8 → our wrapper dequant → bf16 |
+| Activation | bf16 (untouched) | bf16 → TE on-the-fly quant → MXFP8 → our wrapper dequant → bf16 |
+
+The two engines' weight handling is now numerically equivalent
+(quantizers byte-identical, both dequant via the same formula).
+
+But **Megatron quantizes the activation on the fly via `fp8_autocast`**;
+vLLM does not. Megatron's activation goes through a *lossy* MXFP8
+round-trip (bf16 → fp8 → bf16) before reaching the BF16 BI matmul, while
+vLLM's activation stays in bf16. This lossy round-trip is the source of
+the L0 `linear_proj` input drift, which compounds layer-by-layer.
+
+### Recommended next step
+
+Skip activation quantization on the Megatron side. Two implementation
+candidates:
+
+1. **Replace `MXFP8Quantizer.quantize_impl` to short-circuit for the
+   activation path.** Detect "input activation" calls (e.g. by a flag on
+   the quantizer, or by tensor identity) and return a wrapper holding the
+   original bf16 directly; the wrapper's `.dequantize()` returns the
+   bf16 unchanged. Megatron's weight quantization continues to round-trip
+   through MXFP8 (so weights stay equivalent to vLLM's).
+2. **Disable `fp8_autocast` entirely + lossy-round-trip the weights
+   once at model-load time.** Pre-bake each linear weight via
+   `dequant(quant(w_bf16))` using TE's quantizer (which, per the
+   diagnostic, matches vLLM's converter byte-for-byte). Skip
+   `provider.fp8` and `provider.fp8_recipe`. Megatron then runs as a
+   plain BF16 model with lossy weights; activations are untouched.
+
+Option 2 is cleaner experimentally (no need to instrument TE's
+quantizer with conditional logic) and matches vLLM's behavior exactly
+(both engines: lossy bf16 weight × bf16 activation → BF16 BI matmul).
+Option 1 keeps the `fp8_autocast` plumbing alive (potentially useful for
+training-mode debugging later).
+
+### File and patch inventory (updated)
+
+| Artefact | Path | Purpose |
+|---|---|---|
+| BI MXFP8 kernel | `3rdparty/vllm/vllm/model_executor/kernels/linear/mxfp8/batch_invariant.py` | vLLM dequant + BF16 BI matmul |
+| BI MXFP8 registration | `3rdparty/vllm/vllm/model_executor/kernels/linear/__init__.py` | First in `_POSSIBLE_MXFP8_KERNELS[CUDA]` |
+| Compact-scales patch | `my_script/megatron_forward.py::install_mxfp8_compact_scales` | Property-based override of `MXFP8Quantizer.optimize_for_gemm` |
+| Dequant-for-BI hook | `my_script/megatron_forward.py::install_mxfp8_dequant_for_bi_gemm` | Dequant TE MXFP8 → bf16 at GEMM hook, route to BF16 BI matmul |
+| Quantizer diagnostic | `my_script/compare_mxfp8_quant.py` | Standalone vLLM ↔ TE quantizer comparison |
+| Diagnostic log | `my_script/compare_mxfp8_quant.log` | Confirms quantizers are byte-identical |
+| MXFP8 BI L0 capture (Megatron) | `my_script/megatron_capture_mxfp8_split_vllmrope_vllmswiglu_vllmsdpa_vllmrmsnorm_bi.pt` | With dequant + BF16 BI matmul |
+| MXFP8 BI L0 capture (vLLM) | `my_script/vllm_capture_mxfp8_bi.pt` | With BatchInvariantMxfp8LinearKernel |
+| L0 compare log | `my_script/compare_mxfp8_bi_dequant_L0.log` | Drift starts at `linear_proj` input (post-SDPA) |
+
+---
+
+## Update 2026-06-01 (continued): W8A8 activation round-trip in vLLM → L0–L19 bit-identical
+
+Following the diagnostic that ruled out the weight quantizer as the source
+of drift, modified vLLM's `BatchInvariantMxfp8LinearKernel.apply_weights`
+to also lossy-round-trip the **activation** through MXFP8 — mirroring what
+Megatron's `fp8_autocast` already does per linear call. Both engines now
+do W8A8: bf16 weight quant→dequant + bf16 activation quant→dequant +
+BF16 BI matmul.
+
+### Patch (vLLM)
+
+`3rdparty/vllm/vllm/model_executor/kernels/linear/mxfp8/batch_invariant.py`:
+
+```python
+def _quant_dequant_bf16_via_mxfp8(x: torch.Tensor) -> torch.Tensor:
+    """Lossy bf16 -> MXFP8 -> bf16 round-trip on activations.
+    Mirrors TE's per-call activation quantisation under fp8_autocast."""
+    x_2d = x.reshape(-1, x.shape[-1])
+    x_fp8, x_scale = mxfp8_e4m3_quantize(x_2d, is_sf_swizzled_layout=False)
+    x_bf16 = dequant_mxfp8_to_bf16(x_fp8, x_scale)
+    return x_bf16.reshape(x.shape)
+
+# In apply_weights, after weight dequant and before matmul_persistent:
+x_bf16 = _quant_dequant_bf16_via_mxfp8(x)
+out_2d = matmul_persistent(x_bf16.reshape(-1, x_bf16.shape[-1]), weight_bf16.t())
+```
+
+The quantizer used (`mxfp8_e4m3_quantize` → FlashInfer on Blackwell) was
+confirmed byte-identical to TE's `tex.quantize` in
+`my_script/compare_mxfp8_quant.py`, so the lossy round-trip on the
+activation produces the same bf16 value on both engines for the same
+input.
+
+### Result
+
+Configuration unchanged on the Megatron side:
+`uv run --extra mcore torchrun --nproc_per_node=1 my_script/megatron_forward.py --mxfp8 --batch-invariant --split-fused --vllm-rope --vllm-swiglu --vllm-sdpa --vllm-rmsnorm --capture-layers 0`.
+
+| Pair | max_abs | mean_abs |
+|---|---|---|
+| Final logits (last position, padded — see caveat) | 23.2 | 3.42 (cos -0.29) |
+| Per-layer residual stream L0 | **0** | 0 |
+| Per-layer residual stream L1–L19 | **0** | 0 |
+| Per-layer residual stream L20 | 0.0313 | 1.16e-3 |
+| Per-layer residual stream L25 | 0.250 | 9.79e-3 |
+| Per-layer residual stream L30 | 0.625 | 2.47e-2 |
+| Per-layer residual stream L31 | **0.898** | 3.77e-2 |
+
+L0 module-level (positions 0–10):
+
+| Tensor | max_abs |
+|---|---|
+| `input_layernorm` input (embedding) | **0** |
+| `linear_qkv.linear` input (post first RMSNorm) | **0** |
+| `linear_proj` input (post-SDPA) | **0** |
+| `linear_fc1.linear` input (post second RMSNorm) | **0** |
+| `linear_fc2` input (post-SwiGLU) | **0** |
+
+Every comparable L0 module input is bit-identical. The known module-
+boundary semantic mismatch (`post_attention_layernorm ↔
+pre_mlp_layernorm`) still shows max_abs ≈ 0.25 because vLLM captures
+pre-add `attn_out` while Megatron captures the post-add residual — not a
+real numerical divergence.
+
+### Comparison vs prior MXFP8 attempts
+
+| Attempt | L0 drift | L31 drift |
+|---|---|---|
+| Baseline (FlashInfer cutlass vs TE cuBLASLt) | max=0.00146 | max=2.0 |
+| Dequant + BF16 BI (W8A16: weight only) | max=0.0469 | max=12.0 |
+| Dequant + BF16 BI (**W8A8: weight + activation**) | **max=0** for L0–L19 | max=0.898 |
+
+The W8A8 round-trip is the right pattern — it produces:
+- Bit-identical residual stream for the first **20 layers** of the
+  network.
+- ~13× smaller L31 drift vs the W8A16 attempt and ~2× smaller than the
+  original FlashInfer-cutlass-vs-TE-cuBLASLt baseline.
+
+### Why drift enters at L20
+
+Layers 0–19 are bit-identical because every step (RMSNorm, RoPE, SDPA,
+attn output projection, residual add, MLP linears, SwiGLU) produces
+byte-identical outputs given byte-identical inputs. At L20 the residual
+stream first picks up ~1 bf16 ULP of drift. This is the same threshold-
+sensitive pattern we saw in BF16 mode at L6 (variance reduction
+divergence in `fused_add_rms_norm` cub-tree vs Triton tl.sum): a kernel
+that *happens* to agree at smaller magnitudes diverges past some
+threshold as the residual stream grows.
+
+The L20 drift is small enough that the next investigation can localise
+it the same way we did the BF16 L6 case — capture per-module inputs on
+both L0 and L20 (`--capture-layers 0,20`) and look for the first module
+whose input is bit-identical but output drifts.
+
+The most likely candidate: vLLM's activation quantiser (FlashInfer
+`mxfp8_quantize`) and TE's `tex.quantize` are byte-identical *for the
+q_proj weight tensor* (verified) but may differ at specific
+larger-magnitude activation distributions. A targeted diff of the
+quantised activation at L20 between the two engines would settle this.
+
+### Remaining caveats
+
+- ⚠️ `compare.py`'s final-logits row is still misleading (compares
+  `m["logits"][0, -1]` which is a padded position on Megatron). Doesn't
+  affect the per-layer/module table.
+- ⚠️ Without `--capture-layers N` for N ≥ 20, we can't yet localise which
+  L20 submodule introduces the drift.
+
+### Updated file/patch inventory (additions)
+
+| Artefact | Path | Purpose |
+|---|---|---|
+| W8A8 round-trip helper | `3rdparty/vllm/vllm/model_executor/kernels/linear/mxfp8/batch_invariant.py::_quant_dequant_bf16_via_mxfp8` | Activation lossy round-trip via FlashInfer mxfp8_quantize + dequant_mxfp8_to_bf16 |
+| Updated kernel | `3rdparty/vllm/vllm/model_executor/kernels/linear/mxfp8/batch_invariant.py` (W8A8) | Adds the activation round-trip before the BF16 BI matmul |
+| L0 W8A8 compare log | `my_script/compare_mxfp8_bi_w8a8_L0.log` | All comparable L0 tensors bit-identical, residual stream bit-identical L0–L19 |
+| vLLM W8A8 capture | `my_script/vllm_capture_mxfp8_bi.pt` (regenerated) | With activation round-trip |
+
+### Recommended next step
+
+Capture L20's per-module inputs on both engines (`--capture-layers 0,20`)
+and run compare; the first module whose input is bit-identical but
+output drifts is the kernel to fix next. This is the same workflow that
+localised the BF16 L6 RMSNorm divergence.
+
+---
+
+## Update 2026-06-01 (final): `--split-all-fused` → bit-identical across all 32 layers
+
+The L20 capture identified the divergence inside L20's attention chain
+(post-SDPA `linear_proj` input drifted by 0.0039). Re-ran Megatron with
+`--split-all-fused` (which unfuses TE's `LayerNormColumnParallelLinear`
+at every layer rather than just layer 0) — same flag that closed BF16
+parity in
+[`llama3_8b_numeric_mismatch.md`](llama3_8b_numeric_mismatch.md). vLLM
+capture unchanged.
+
+### Result: all 32 layers bit-identical
+
+```
+layer | max_abs |  cos_sim  | |vllm|    | |mcore|
+    0 | 0.0     |  0.999994 |  12.1958  |  12.1958
+    1 | 0.0     |  1.000033 | 544.0219  | 544.0219
+   ...
+   19 | 0.0     |  1.000021 | 549.9084  | 549.9084
+   20 | 0.0     |  1.000017 | 550.3365  | 550.3365   (was 0.031 with --split-fused)
+   ...
+   30 | 0.0     |  0.999996 | 564.8802  | 564.8802
+   31 | 0.0     |  0.999996 | 260.4788  | 260.4788   (was 0.898 with --split-fused)
+```
+
+L0 and L20 per-module diffs (positions 0–10):
+
+| Module pair | L0 max_abs | L20 max_abs |
+|---|---|---|
+| `linear_qkv.linear` input (post first RMSNorm) | **0** | **0** |
+| `linear_proj` input (post-SDPA) | **0** | **0** |
+| `linear_fc1.linear` input (post second RMSNorm) | **0** | **0** |
+| `linear_fc2` input (post-SwiGLU) | **0** | **0** |
+
+Every comparable module input is bit-identical at both layers. The
+non-zero diffs that remain
+(`post_attention_layernorm ↔ pre_mlp_layernorm` and `input_layernorm` at
+L20) are the documented module-boundary semantic mismatch (vLLM captures
+pre-add `attn_out`; Megatron captures post-add residual stream) — not
+real numerical divergence.
+
+### Why `--split-all-fused` matters for MXFP8 too
+
+The same fusion-boundary effect from the BF16 work applies here. TE's
+`LayerNormColumnParallelLinear` performs RMSNorm + Linear in one fused
+kernel and **keeps the post-RMSNorm activation in fp32 registers** until
+the GEMM consumes it. vLLM has standalone RMSNorm; the post-RMSNorm
+tensor is materialised in bf16 and re-read by `qkv_proj` /
+`gate_up_proj` — i.e., it goes through a bf16 round-trip.
+
+For BF16 GEMMs the difference was ~1 bf16 ULP per layer. For MXFP8
+GEMMs the difference is amplified at the **activation-quantiser
+boundary**: the quantiser sees fp32-precision input on the fused side
+and bf16-precision input on the unfused (vLLM) side, so the per-block
+amax differs slightly → the E8M0 scale lands on a different bucket for
+some blocks → the resulting (fp8_data, scale) tuples disagree, and the
+quant-then-dequant gives different bf16 outputs.
+
+`--split-all-fused` forces Megatron to materialise the post-RMSNorm
+bf16 tensor at every layer, matching vLLM's behaviour. Both engines'
+quantisers then see byte-identical bf16 input, produce byte-identical
+MXFP8 output, and the BF16 BI matmul yields byte-identical GEMM output.
+
+### Complete recipe for MXFP8 BI cross-engine bit-identity
+
+vLLM:
+```bash
+uv run --extra vllm python my_script/vllm_forward.py \
+    --mxfp8 \
+    --model /path/to/Llama-3.1-8B-Instruct-mxfp8 \
+    --tokenizer meta-llama/Llama-3.1-8B-Instruct \
+    --batch-invariant --capture-layers 0,20
+```
+
+The vLLM patches required (all already in place from BF16 work + this
+MXFP8 work):
+- `BatchInvariantMxfp8LinearKernel` (W8A8: weight + activation lossy
+  round-trip via `mxfp8_e4m3_quantize` + `dequant_mxfp8_to_bf16`, then
+  BF16 BI matmul). Registered first in `_POSSIBLE_MXFP8_KERNELS[CUDA]`.
+- The BF16-era patches inside `vllm/model_executor/layers/layernorm.py`
+  (`RMSNorm.forward_cuda` BI-Triton routing under `VLLM_BATCH_INVARIANT`).
+
+Megatron:
+```bash
+uv run --extra mcore torchrun --nproc_per_node=1 my_script/megatron_forward.py \
+    --mxfp8 --batch-invariant \
+    --split-all-fused \
+    --vllm-rope --vllm-swiglu --vllm-sdpa --vllm-rmsnorm \
+    --capture-layers 0,20
+```
+
+The Megatron patches required:
+- `install_mxfp8_compact_scales()` (property override on
+  `MXFP8Quantizer.optimize_for_gemm`) — auto-applied with
+  `--mxfp8 --batch-invariant`.
+- `install_mxfp8_dequant_for_bi_gemm()` (TE `general_gemm` hook: dequant
+  → bf16 → `BatchInvariantTEGemmFn`) — auto-applied.
+- `install_vllm_style_{rope,swiglu,sdpa,rmsnorm}` (BF16-era patches).
+- `--split-all-fused` (unfuses LN+Linear at **every** layer, not just
+  L0).
+- Seq pad to 32 (auto-applied for MXFP8).
+
+### Comparison vs prior MXFP8 attempts
+
+| Attempt | L0 drift | L20 drift | L31 drift |
+|---|---|---|---|
+| Baseline (FlashInfer cutlass vs TE cuBLASLt, no BI patches) | 0.00146 | n/a | 2.0 |
+| Dequant + BF16 BI (W8A16 — weight only) | 0.0469 | n/a | 12.0 |
+| Dequant + BF16 BI (W8A8 — weight + activation, --split-fused) | 0 | 0.031 | 0.898 |
+| **Dequant + BF16 BI (W8A8, --split-all-fused)** | **0** | **0** | **0** |
+
+### Caveats
+
+- `compare.py`'s final-logits row remains misleading under MXFP8 (Megatron
+  pads seq 11 → 32 for the MXFP8 block-size constraint; `compare.py` takes
+  `m["logits"][0, -1]` which is a padded position). The per-layer table
+  is authoritative. Cleanup todo: capture `real_seq_len` in the payload
+  and use it in `compare.py`.
+- This parity is established for prefill of an 11-token prompt with TP=PP=1
+  on a single GB200. Multi-GPU and multi-prompt batched generation
+  haven't been verified in the BI MXFP8 path; per-block scale layouts
+  may behave differently when activations cross block boundaries
+  asymmetrically.
+
+### Updated file/patch inventory (additions)
+
+| Artefact | Path | Purpose |
+|---|---|---|
+| Final MXFP8 BI L0+L20 vLLM capture | `my_script/vllm_capture_mxfp8_bi.pt` | W8A8 round-trip; matches Megatron L0–L31 |
+| Final MXFP8 BI L0+L20 Megatron capture | `my_script/megatron_capture_mxfp8_splitall_vllmrope_vllmswiglu_vllmsdpa_vllmrmsnorm_bi.pt` | --split-all-fused; all 32 layers bit-identical to vLLM |
+| Final compare log | `my_script/compare_mxfp8_bi_splitall_L0L20.log` | Per-layer residual stream max_abs=0 for all 32 layers |
+
+### Headline
+
+> **MXFP8 cross-engine bit-identity achieved on Llama-3.1-8B-Instruct.**
+> All 32 decoder-layer residual streams match exactly between vLLM
+> (with `BatchInvariantMxfp8LinearKernel` doing W8A8 round-trip) and
+> Megatron (with `--mxfp8 --batch-invariant --split-all-fused
+> --vllm-{rope,swiglu,sdpa,rmsnorm}` + `install_mxfp8_{compact_scales,
+> dequant_for_bi_gemm}`). The fix mirrors the BF16 result: align all
+> kernel families *and* eliminate the TE fused LN+Linear's fp32
+> register-only post-norm tensor by unfusing at every layer.

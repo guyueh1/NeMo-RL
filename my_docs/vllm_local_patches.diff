@@ -1,3 +1,25 @@
+diff --git a/vllm/model_executor/kernels/linear/__init__.py b/vllm/model_executor/kernels/linear/__init__.py
+index 5d513f767..ad1639a46 100644
+--- a/vllm/model_executor/kernels/linear/__init__.py
++++ b/vllm/model_executor/kernels/linear/__init__.py
+@@ -62,6 +62,9 @@ from vllm.model_executor.kernels.linear.mxfp8 import (
+     Mxfp8LinearKernel,
+     Mxfp8LinearLayerConfig,
+ )
++from vllm.model_executor.kernels.linear.mxfp8.batch_invariant import (
++    BatchInvariantMxfp8LinearKernel,
++)
+ from vllm.model_executor.kernels.linear.mxfp8.emulation import (
+     EmulationMxfp8LinearKernel,
+ )
+@@ -244,6 +247,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
+ # in priority/performance order (when available)
+ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
+     PlatformEnum.CUDA: [
++        BatchInvariantMxfp8LinearKernel,
+         FlashInferCutlassMxfp8LinearKernel,
+         MarlinMxfp8LinearKernel,
+         EmulationMxfp8LinearKernel,
 diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
 index d9184bb77..eb8d7eac1 100644
 --- a/vllm/model_executor/layers/layernorm.py
