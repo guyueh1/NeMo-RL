@@ -201,6 +201,76 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
 
+
+
+        # Install vLLM kernel-matching monkey-patches so Megatron's forward
+        # numerics match vLLM bit-for-bit. Runs after enable_batch_invariant_mode
+        # (inside setup_model_and_optimizer) but before any forward pass.
+        # Two independent knobs: BF16 patches (RMSNorm/RoPE/SwiGLU/SDPA) and
+        # MXFP8-specific patches (compact scales + dequant-for-BI-GEMM).
+        megatron_cfg_dict = config["megatron_cfg"]
+        match_vllm_kernels = megatron_cfg_dict.get("match_vllm_kernels")
+        match_vllm_mxfp8_matmul = megatron_cfg_dict.get("match_vllm_mxfp8_matmul")
+
+        if match_vllm_kernels or match_vllm_mxfp8_matmul:
+            if not megatron_cfg_dict.get("batch_invariant_mode"):
+                raise ValueError(
+                    "policy.megatron_cfg.match_vllm_kernels and "
+                    "policy.megatron_cfg.match_vllm_mxfp8_matmul require "
+                    "policy.megatron_cfg.batch_invariant_mode=True; the "
+                    "RMSNorm and MXFP8-dequant patches no-op without "
+                    "batch-invariant mode."
+                )
+
+        if match_vllm_kernels:
+            from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
+                install_match_vllm_kernels,
+                split_all_layers_fused_layernorm_linear,
+            )
+
+            install_match_vllm_kernels()
+        #     split_all_layers_fused_layernorm_linear(model_and_optimizer_state.model)
+
+
+        fp8_cfg = megatron_cfg_dict.get("fp8_cfg", None)
+        mxfp8_active = (
+            fp8_cfg is not None
+            and fp8_cfg.get("enabled", False)
+            and fp8_cfg.get("fp8_recipe") == "mxfp8"
+        )
+
+        if match_vllm_mxfp8_matmul:
+            if not mxfp8_active:
+                raise ValueError(
+                    "policy.megatron_cfg.match_vllm_mxfp8_matmul=True requires "
+                    "policy.megatron_cfg.fp8_cfg.enabled=True with "
+                    'fp8_cfg.fp8_recipe="mxfp8".'
+                )
+            if not match_vllm_kernels:
+                raise ValueError(
+                    "policy.megatron_cfg.match_vllm_mxfp8_matmul=True also "
+                    "requires policy.megatron_cfg.match_vllm_kernels=True; "
+                    "without the BF16 patches the per-layer inputs to the "
+                    "MXFP8 GEMMs already diverge across engines, so matching "
+                    "the GEMM alone does not produce bit-identity."
+                )
+
+            from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
+                install_match_vllm_mxfp8_matmul,
+            )
+
+            install_match_vllm_mxfp8_matmul()
+        elif mxfp8_active and megatron_cfg_dict.get("batch_invariant_mode"):
+            # Megatron's BI general_gemm patch reads `A.is_cuda` on every call,
+            # but TE's MXFP8TensorStorage does not expose `is_cuda`, so any
+            # MXFP8 linear under BI mode raises AttributeError. Route MXFP8
+            # GEMMs to TE's original general_gemm; BF16 GEMMs still hit BI.
+            from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
+                install_mxfp8_passthrough_for_bi_gemm,
+            )
+
+            install_mxfp8_passthrough_for_bi_gemm()
+
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
             self.megatron_cfg.param_sync_func = param_sync_func
