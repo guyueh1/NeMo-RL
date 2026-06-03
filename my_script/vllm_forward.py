@@ -1,5 +1,7 @@
-"""Run a batch of real prompts through a vLLM Llama-3.1-8B engine in prefill
-mode (eager) and save the last-token logits for each prompt.
+r"""Run vLLM prefill and save last-token logits.
+
+Run a batch of real prompts through a vLLM Llama-3.1-8B engine in prefill mode
+(eager) and save the last-token logits for each prompt.
 
 BF16 (default):
     uv run --extra vllm python my_script/vllm_forward.py
@@ -31,9 +33,12 @@ if _pre_args.batch_invariant:
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
 import torch
+from tensor_capture import (
+    install_debug_tensor_hooks,
+    save_debug_tensor_capture_from_env,
+)
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
-
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DATASET = "openai/gsm8k"
@@ -43,9 +48,20 @@ DEFAULT_DATASET_FIELD = "question"
 DEFAULT_NUM_PROMPTS = 32
 
 
+def unwrap_apply_model_result(result):
+    """Return the single-worker result from vLLM's apply_model result."""
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict) and item:
+                return item
+        return result[0] if result else {}
+    return result
+
+
 def install_rmsnorm_bi_residual_patch(model):
-    """Monkey-patch ``RMSNorm.forward_cuda`` to route the fused add+RMSNorm
-    through the BI Triton kernel when a residual tensor is provided.
+    """Route fused add+RMSNorm through the BI Triton kernel.
+
+    Monkey-patch ``RMSNorm.forward_cuda`` when a residual tensor is provided.
 
     Mirrors the small upstream edit we are reverting in
     ``3rdparty/vllm/vllm/model_executor/layers/layernorm.py``. Without this,
@@ -57,8 +73,8 @@ def install_rmsnorm_bi_residual_patch(model):
 
     Runs inside the vLLM worker via ``llm.apply_model``.
     """
-    from vllm.model_executor.layers.layernorm import RMSNorm
     from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+    from vllm.model_executor.layers.layernorm import RMSNorm
 
     orig_forward_cuda = RMSNorm.forward_cuda
 
@@ -84,14 +100,17 @@ def install_rmsnorm_bi_residual_patch(model):
         if isinstance(mod, RMSNorm):
             mod._forward_method = mod.forward_cuda
             patched_count += 1
-    print(f"[vllm-patch] monkey-patched RMSNorm.forward_cuda + rebound "
-          f"{patched_count} instances")
+    print(
+        f"[vllm-patch] monkey-patched RMSNorm.forward_cuda + rebound "
+        f"{patched_count} instances"
+    )
     return None
 
 
 def install_mxfp8_bi_emulation_patch(model):
-    """Monkey-patch ``vllm.utils.flashinfer.mm_mxfp8`` with a dequant + BF16
-    batch-invariant matmul.
+    """Route MXFP8 GEMM through dequant + BF16 batch-invariant matmul.
+
+    Monkey-patch ``vllm.utils.flashinfer.mm_mxfp8``.
 
     Must run inside the vLLM worker process (via ``llm.apply_model``) since
     the engine core is a subprocess; a module-level patch in the parent
@@ -136,7 +155,7 @@ def install_mxfp8_bi_emulation_patch(model):
 
         # Dequant blocks live along the K axis of the original [N, K] weight,
         # so dequant via the original weight view (B.t()), not B itself.
-        A_bf16 = dequant_mxfp8_to_bf16(A, A_scale_2d)                   # [M, K]
+        A_bf16 = dequant_mxfp8_to_bf16(A, A_scale_2d)  # [M, K]
         W_bf16 = dequant_mxfp8_to_bf16(B.t().contiguous(), B_scale_2d)  # [N, K]
 
         # BF16 BI matmul: [M, K] @ [K, N] -> [M, N].
@@ -144,8 +163,10 @@ def install_mxfp8_bi_emulation_patch(model):
         return out.to(out_dtype)
 
     vllm_flashinfer.mm_mxfp8 = _bi_mm_mxfp8
-    print("[vllm-patch] monkey-patched vllm.utils.flashinfer.mm_mxfp8 -> "
-          "dequant + BF16 BI matmul (matmul_persistent)")
+    print(
+        "[vllm-patch] monkey-patched vllm.utils.flashinfer.mm_mxfp8 -> "
+        "dequant + BF16 BI matmul (matmul_persistent)"
+    )
     return None
 
 
@@ -194,15 +215,25 @@ def load_prompts(dataset: str, subset: str, split: str, field: str, n: int, seed
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                   help="Model path or HF id. For --mxfp8, pass the MXFP8 "
-                        "ckpt path produced by convert_hf_bf16_ckpt_to_mxfp8.py.")
-    p.add_argument("--tokenizer", default=None,
-                   help="Tokenizer source (HF id or path). Defaults to "
-                        "--model; useful when the MXFP8 ckpt dir does not "
-                        "bundle tokenizer files.")
-    p.add_argument("--num-prompts", type=int, default=DEFAULT_NUM_PROMPTS,
-                   help="Number of prompts to draw from --dataset (default: 32).")
+    p.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Model path or HF id. For --mxfp8, pass the MXFP8 "
+        "ckpt path produced by convert_hf_bf16_ckpt_to_mxfp8.py.",
+    )
+    p.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Tokenizer source (HF id or path). Defaults to "
+        "--model; useful when the MXFP8 ckpt dir does not "
+        "bundle tokenizer files.",
+    )
+    p.add_argument(
+        "--num-prompts",
+        type=int,
+        default=DEFAULT_NUM_PROMPTS,
+        help="Number of prompts to draw from --dataset (default: 32).",
+    )
     p.add_argument("--dataset", default=DEFAULT_DATASET)
     p.add_argument("--dataset-subset", default=DEFAULT_DATASET_SUBSET)
     p.add_argument("--dataset-split", default=DEFAULT_DATASET_SPLIT)
@@ -210,17 +241,29 @@ def parse_args():
     p.add_argument("--dataset-seed", type=int, default=0)
     p.add_argument("--output", default=None)
     p.add_argument("--batch-invariant", action="store_true")
-    p.add_argument("--mxfp8", action="store_true",
-                   help="Run the model in MXFP8 precision. Requires --model "
-                        "to point at an MXFP8-quantized ckpt (vLLM detects "
-                        "the quantization from the ckpt's quantization_config).")
-    p.add_argument("--mxfp8-bi-emulation", action="store_true",
-                   help="Patch vllm's mm_mxfp8 (called by "
-                        "FlashInferCutlassMxfp8LinearKernel) to dequant both "
-                        "operands to bf16 and route through matmul_persistent "
-                        "(BF16 batch-invariant matmul). Mirrors Megatron's "
-                        "--mxfp8-bi-dequant. Only meaningful with --mxfp8 "
-                        "--batch-invariant.")
+    p.add_argument(
+        "--mxfp8",
+        action="store_true",
+        help="Run the model in MXFP8 precision. Requires --model "
+        "to point at an MXFP8-quantized ckpt (vLLM detects "
+        "the quantization from the ckpt's quantization_config).",
+    )
+    p.add_argument(
+        "--mxfp8-bi-emulation",
+        action="store_true",
+        help="Patch vllm's mm_mxfp8 (called by "
+        "FlashInferCutlassMxfp8LinearKernel) to dequant both "
+        "operands to bf16 and route through matmul_persistent "
+        "(BF16 batch-invariant matmul). Mirrors Megatron's "
+        "--mxfp8-bi-dequant. Only meaningful with --mxfp8 "
+        "--batch-invariant.",
+    )
+    p.add_argument(
+        "--capture-debug-tensors",
+        action="store_true",
+        help="Save layer-entry tensors for every decoder layer and "
+        "input/output tensors for every module in decoder layer 0.",
+    )
     args = p.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
@@ -231,13 +274,21 @@ def parse_args():
 
 def main():
     args = parse_args()
-    print(f"[vllm] precision={'mxfp8' if args.mxfp8 else 'bf16'} "
-          f"batch_invariant={args.batch_invariant} "
-          f"(VLLM_BATCH_INVARIANT={os.environ.get('VLLM_BATCH_INVARIANT', '0')})")
+    print(
+        f"[vllm] precision={'mxfp8' if args.mxfp8 else 'bf16'} "
+        f"batch_invariant={args.batch_invariant} "
+        f"(VLLM_BATCH_INVARIANT={os.environ.get('VLLM_BATCH_INVARIANT', '0')})"
+    )
     print(f"[vllm] model:     {args.model}")
     print(f"[vllm] tokenizer: {args.tokenizer}")
-    print(f"[vllm] dataset:   {args.dataset}:{args.dataset_subset}:"
-          f"{args.dataset_split} field={args.dataset_field!r} n={args.num_prompts}")
+    print(
+        f"[vllm] dataset:   {args.dataset}:{args.dataset_subset}:"
+        f"{args.dataset_split} field={args.dataset_field!r} n={args.num_prompts}"
+    )
+
+    debug_capture_path = args.output + ".debug_tensors.pt"
+    if args.capture_debug_tensors:
+        os.environ["DEBUG_TENSOR_CAPTURE_PATH"] = debug_capture_path
 
     prompts = load_prompts(
         args.dataset,
@@ -249,17 +300,17 @@ def main():
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    token_ids_list = [
-        tokenizer.encode(p, add_special_tokens=True) for p in prompts
-    ]
+    token_ids_list = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
     seq_lens = [len(ids) for ids in token_ids_list]
     # Use the full tokenizer length (incl. added/special tokens), since the LM
     # head's logit dim matches this rather than the base vocab.
     vocab_size = len(tokenizer)
-    print(f"[vllm] loaded {len(prompts)} prompts; "
-          f"seq_len min/mean/max = {min(seq_lens)}/"
-          f"{sum(seq_lens) / len(seq_lens):.1f}/{max(seq_lens)}; "
-          f"vocab_size={vocab_size}")
+    print(
+        f"[vllm] loaded {len(prompts)} prompts; "
+        f"seq_len min/mean/max = {min(seq_lens)}/"
+        f"{sum(seq_lens) / len(seq_lens):.1f}/{max(seq_lens)}; "
+        f"vocab_size={vocab_size}"
+    )
 
     # vLLM auto-detects MXFP8 via the ckpt's `quantization_config`; no extra
     # kwarg is needed. We keep activations in bf16 in both paths.
@@ -287,6 +338,12 @@ def main():
             )
         llm.apply_model(install_mxfp8_bi_emulation_patch)
 
+    if args.capture_debug_tensors:
+        hook_info = unwrap_apply_model_result(
+            llm.apply_model(install_debug_tensor_hooks)
+        )
+        print(f"[vllm] debug tensor hooks installed: {hook_info}")
+
     sampling_params = SamplingParams(
         temperature=0.0,
         top_p=1.0,
@@ -300,8 +357,10 @@ def main():
         sampling_params=sampling_params,
         use_tqdm=False,
     )
-    print(f"[vllm] generated {sum(len(o.outputs[0].token_ids) for o in outputs)} "
-          f"new tokens across {len(outputs)} prompts")
+    print(
+        f"[vllm] generated {sum(len(o.outputs[0].token_ids) for o in outputs)} "
+        f"new tokens across {len(outputs)} prompts"
+    )
 
     # Build (N, V) logprob tensor from outputs[i].outputs[0].logprobs[0],
     # which is a {token_id: Logprob(logprob=..., ...)} dict for the single
@@ -326,6 +385,21 @@ def main():
         "seq_lens": seq_lens,
         "next_token_logprobs": next_token_logprobs,
     }
+    if args.capture_debug_tensors:
+        save_info = unwrap_apply_model_result(
+            llm.apply_model(save_debug_tensor_capture_from_env)
+        )
+        print(f"[vllm] worker saved debug tensors: {save_info}")
+        debug_capture = torch.load(
+            debug_capture_path, map_location="cpu", weights_only=False
+        )
+        payload.update(debug_capture)
+        num_first_layer = len(debug_capture.get("first_layer_inputs", {}))
+        num_layers = debug_capture.get("num_layers", "?")
+        print(
+            f"[vllm] captured {num_first_layer} layer-0 modules; "
+            f"num_layers={num_layers}"
+        )
     torch.save(payload, args.output)
     print(f"[vllm] saved capture to {args.output}")
 

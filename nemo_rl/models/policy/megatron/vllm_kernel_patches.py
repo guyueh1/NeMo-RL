@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Monkey-patches that make Megatron-LM produce bit-identical forward outputs
-to vLLM on Blackwell for the BF16 and MXFP8 batch-invariant paths.
+"""Make Megatron-LM produce bit-identical forward outputs to vLLM.
+
+These monkey-patches target Blackwell BF16 and MXFP8 batch-invariant paths.
 
 Originally developed under ``my_script/megatron_forward.py`` as part of the
 cross-engine numerical-matching effort (see
@@ -37,6 +38,24 @@ import importlib
 import math
 
 import torch
+
+G_VLLM_STYLE_SDPA_SEQ_LENS: list[int] | None = None
+
+
+def set_vllm_style_sdpa_sequence_lengths(seq_lens: torch.Tensor | None) -> None:
+    """Set per-forward sequence lengths for the vLLM-style SDPA patch.
+
+    Megatron/TE sees padded tensors in both unpacked ``sbhd``/``bshd`` and
+    packed ``thd`` layouts. vLLM's decoder prefill path operates on actual
+    request lengths. The worker calls this before each forward when
+    ``input_lengths`` is present so the attention patch can pack only real
+    tokens and ignore pad tokens.
+    """
+    global G_VLLM_STYLE_SDPA_SEQ_LENS
+    if seq_lens is None:
+        G_VLLM_STYLE_SDPA_SEQ_LENS = None
+        return
+    G_VLLM_STYLE_SDPA_SEQ_LENS = [int(item) for item in seq_lens.detach().cpu()]
 
 
 def install_vllm_style_rmsnorm() -> None:
@@ -131,8 +150,9 @@ def install_vllm_style_rmsnom_to_te() -> None:
     )
 
     orig_apply_norm = te_common_mod.apply_normalization
+
     def apply_norm(*args, **kwargs):
-        nomalization = args[7] if len(args) > 7 else kwargs["normalization"]
+        normalization = args[7] if len(args) > 7 else kwargs["normalization"]
         if not normalization == "RMSNorm":
             return orig_apply_norm(*args, **kwargs)
         print("[guyueh] apply_norm")
@@ -143,8 +163,9 @@ def install_vllm_style_rmsnom_to_te() -> None:
         return out, mu, sigma
 
     te_common_mod.apply_normalization = apply_norm
-    
+
     from transformer_engine.pytorch import module as te_module_mod
+
     te_module_mod.apply_normalization = apply_norm
 
 
@@ -228,8 +249,8 @@ def install_vllm_style_swiglu() -> None:
     two separate kernels (silu materialises bf16, then bf16*bf16 multiply),
     so Megatron matches vLLM bit-for-bit.
     """
-    import torch.nn.functional as F
     import megatron.core.fusions.fused_bias_swiglu as swg_mod
+    import torch.nn.functional as F
 
     def _vllm_style_swiglu(y):
         print("[guyueh] _vllm_style_swiglu")
@@ -245,7 +266,9 @@ def install_vllm_style_swiglu() -> None:
     swg_mod.bias_swiglu = _vllm_style_bias_swiglu
 
 
-def install_vllm_style_sdpa() -> None:
+def install_vllm_style_sdpa(
+    *, paged_kv: bool = True, paged_block_size: int = 16
+) -> None:
     """Route TE's ``DotProductAttention`` through vLLM's FA2 kernel.
 
     On Blackwell, vLLM under ``VLLM_BATCH_INVARIANT=1`` rejects FA4 (per
@@ -253,16 +276,239 @@ def install_vllm_style_sdpa() -> None:
     FA2 with ``num_splits=1``. Megatron/TE on Blackwell does not have an
     FA4 path either, but defaults to a different kernel (cuDNN-fused
     attention) that doesn't match FA2 byte-for-byte. This patch makes
-    Megatron call exactly the same ``vllm.vllm_flash_attn.flash_attn_varlen_func``
-    that vLLM does, with ``num_splits=1, fa_version=2``.
+    Megatron call the same vLLM FA2 wrapper with ``num_splits=1,
+    fa_version=2``.
 
-    Forward-only; backward / kv-cache / fp8_output / sliding-window not
-    supported in this wrapper.
+    In no-grad forwards, ``paged_kv=True`` mirrors vLLM decoder prefill more
+    closely by writing K/V through ``reshape_and_cache_flash`` and reading them
+    with ``key_cache`` / ``value_cache`` plus ``block_table`` and ``seqused_k``.
+    When gradients are enabled, the wrapper falls back to direct packed FA2 so
+    training keeps a differentiable attention path.
+
+    Sliding-window / bias / fp8_output are not supported in this wrapper.
     """
     from transformer_engine.pytorch.attention.dot_product_attention import (
         dot_product_attention as dpa_mod,
     )
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
+    from vllm.v1.attention.backends.fa_utils import (
+        flash_attn_varlen_func,
+        reshape_and_cache_flash,
+    )
+
+    def _global_seq_lens(batch_size: int, max_seqlen: int) -> list[int] | None:
+        if G_VLLM_STYLE_SDPA_SEQ_LENS is None:
+            return None
+        if len(G_VLLM_STYLE_SDPA_SEQ_LENS) != batch_size:
+            raise RuntimeError(
+                "vLLM-style SDPA sequence length batch mismatch: "
+                f"{len(G_VLLM_STYLE_SDPA_SEQ_LENS)} vs {batch_size}"
+            )
+        if max(G_VLLM_STYLE_SDPA_SEQ_LENS) > max_seqlen:
+            raise RuntimeError(
+                "vLLM-style SDPA sequence length exceeds tensor sequence dim: "
+                f"{max(G_VLLM_STYLE_SDPA_SEQ_LENS)} > {max_seqlen}"
+            )
+        return G_VLLM_STYLE_SDPA_SEQ_LENS
+
+    def _cu_from_seq_lens(seq_lens: list[int], device: torch.device) -> torch.Tensor:
+        lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        return torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.cumsum(lens, dim=0, dtype=torch.int32),
+            ]
+        )
+
+    def _seq_lens_from_cu(cu_seqlens: torch.Tensor) -> list[int]:
+        diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+        return [int(item) for item in diffs.detach().cpu()]
+
+    def _pack_bshd(tensor: torch.Tensor, seq_lens: list[int]) -> torch.Tensor:
+        return torch.cat(
+            [tensor[batch_idx, :seq_len] for batch_idx, seq_len in enumerate(seq_lens)],
+            dim=0,
+        ).contiguous()
+
+    def _scatter_bshd(
+        packed: torch.Tensor,
+        *,
+        batch_size: int,
+        seq_len: int,
+        seq_lens: list[int],
+    ) -> torch.Tensor:
+        out = packed.new_zeros((batch_size, seq_len, packed.size(1), packed.size(2)))
+        offset = 0
+        for batch_idx, cur_seq_len in enumerate(seq_lens):
+            next_offset = offset + cur_seq_len
+            out[batch_idx, :cur_seq_len] = packed[offset:next_offset]
+            offset = next_offset
+        return out
+
+    def _pack_thd(
+        tensor: torch.Tensor,
+        *,
+        seq_lens: list[int],
+        padded_cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        chunks = []
+        for seq_idx, seq_len in enumerate(seq_lens):
+            start = int(padded_cu_seqlens[seq_idx].item())
+            chunks.append(tensor[start : start + seq_len])
+        return torch.cat(chunks, dim=0).contiguous()
+
+    def _scatter_thd(
+        packed: torch.Tensor,
+        *,
+        total_tokens: int,
+        seq_lens: list[int],
+        padded_cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        out = packed.new_zeros((total_tokens, packed.size(1), packed.size(2)))
+        offset = 0
+        for seq_idx, seq_len in enumerate(seq_lens):
+            next_offset = offset + seq_len
+            start = int(padded_cu_seqlens[seq_idx].item())
+            out[start : start + seq_len] = packed[offset:next_offset]
+            offset = next_offset
+        return out
+
+    def _block_metadata(
+        seq_lens: list[int],
+        *,
+        block_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        max_blocks = math.ceil(max(seq_lens) / block_size)
+        block_table = torch.zeros(
+            (len(seq_lens), max_blocks), dtype=torch.int32, device=device
+        )
+        slot_mapping = []
+        next_block = 0
+        for batch_idx, seq_len in enumerate(seq_lens):
+            num_blocks = math.ceil(seq_len / block_size)
+            blocks = torch.arange(
+                next_block,
+                next_block + num_blocks,
+                dtype=torch.int32,
+                device=device,
+            )
+            block_table[batch_idx, :num_blocks] = blocks
+            for pos in range(seq_len):
+                slot_mapping.append(
+                    (next_block + pos // block_size) * block_size + pos % block_size
+                )
+            next_block += num_blocks
+        return (
+            block_table,
+            torch.tensor(slot_mapping, dtype=torch.int64, device=device),
+            next_block,
+        )
+
+    def _direct_fa2(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        seq_lens: list[int],
+        softmax_scale: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        cu_seqlens = _cu_from_seq_lens(seq_lens, q.device)
+        out = flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            max_seqlen_q=max(seq_lens),
+            cu_seqlens_q=cu_seqlens,
+            max_seqlen_k=max(seq_lens),
+            cu_seqlens_k=cu_seqlens,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            num_splits=1,
+            fa_version=2,
+            deterministic=False,
+        )
+        if isinstance(out, tuple):
+            return out[0]
+        return out
+
+    def _paged_fa2(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        seq_lens: list[int],
+        softmax_scale: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        block_table, slot_mapping, num_blocks = _block_metadata(
+            seq_lens,
+            block_size=paged_block_size,
+            device=q.device,
+        )
+        key_cache = torch.empty(
+            (num_blocks, paged_block_size, k.size(1), k.size(2)),
+            dtype=k.dtype,
+            device=k.device,
+        )
+        value_cache = torch.empty_like(key_cache)
+        scale = torch.ones((), dtype=torch.float32, device=q.device)
+        reshape_and_cache_flash(
+            k,
+            v,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "auto",
+            scale,
+            scale,
+        )
+        out = torch.empty_like(q)
+        result = flash_attn_varlen_func(
+            q=q,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            max_seqlen_q=max(seq_lens),
+            cu_seqlens_q=_cu_from_seq_lens(seq_lens, q.device),
+            max_seqlen_k=max(seq_lens),
+            seqused_k=torch.tensor(seq_lens, dtype=torch.int32, device=q.device),
+            softmax_scale=softmax_scale,
+            causal=causal,
+            block_table=block_table,
+            num_splits=1,
+            fa_version=2,
+        )
+        if isinstance(result, tuple):
+            return result[0]
+        return out
+
+    def _run_fa2(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        seq_lens: list[int],
+        softmax_scale: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        if paged_kv and not torch.is_grad_enabled():
+            return _paged_fa2(
+                q,
+                k,
+                v,
+                seq_lens=seq_lens,
+                softmax_scale=softmax_scale,
+                causal=causal,
+            )
+        return _direct_fa2(
+            q,
+            k,
+            v,
+            seq_lens=seq_lens,
+            softmax_scale=softmax_scale,
+            causal=causal,
+        )
 
     def _vllm_fa2_forward(
         self,
@@ -290,7 +536,6 @@ def install_vllm_style_sdpa() -> None:
         fp8_output=False,
         num_splits=1,
     ):
-        print("[guyueh] _vllm_fa2_forward")
         assert core_attention_bias is None, "bias not supported in vllm-fa2 patch"
         assert alibi_slopes is None, "alibi not supported in vllm-fa2 patch"
         assert inference_params is None, (
@@ -302,49 +547,100 @@ def install_vllm_style_sdpa() -> None:
         if fmt == "sbhd":
             s_q, b_q, n_q, d = query_layer.shape
             s_kv, b_kv, n_kv, _ = key_layer.shape
-            q = query_layer.transpose(0, 1).reshape(b_q * s_q, n_q, d).contiguous()
-            k = key_layer.transpose(0, 1).reshape(b_kv * s_kv, n_kv, d).contiguous()
-            v = value_layer.transpose(0, 1).reshape(b_kv * s_kv, n_kv, d).contiguous()
+            if b_q != b_kv:
+                raise NotImplementedError("cross-attention is not supported")
+            q_bshd = query_layer.transpose(0, 1).contiguous()
+            k_bshd = key_layer.transpose(0, 1).contiguous()
+            v_bshd = value_layer.transpose(0, 1).contiguous()
+            seq_lens = _global_seq_lens(b_q, s_q) or [s_q for _ in range(b_q)]
+            q = _pack_bshd(q_bshd, seq_lens)
+            k = _pack_bshd(k_bshd, seq_lens)
+            v = _pack_bshd(v_bshd, seq_lens)
+            out = _run_fa2(
+                q,
+                k,
+                v,
+                seq_lens=seq_lens,
+                softmax_scale=1.0 / math.sqrt(d),
+                causal=(attn_mask_type or "causal").startswith("causal"),
+            )
+            out = _scatter_bshd(
+                out,
+                batch_size=b_q,
+                seq_len=s_q,
+                seq_lens=seq_lens,
+            ).transpose(0, 1)
+            return out.reshape(s_q, b_q, n_q * d).contiguous()
         elif fmt == "bshd":
             b_q, s_q, n_q, d = query_layer.shape
             b_kv, s_kv, n_kv, _ = key_layer.shape
-            q = query_layer.reshape(b_q * s_q, n_q, d).contiguous()
-            k = key_layer.reshape(b_kv * s_kv, n_kv, d).contiguous()
-            v = value_layer.reshape(b_kv * s_kv, n_kv, d).contiguous()
+            if b_q != b_kv:
+                raise NotImplementedError("cross-attention is not supported")
+            seq_lens = _global_seq_lens(b_q, s_q) or [s_q for _ in range(b_q)]
+            q = _pack_bshd(query_layer.contiguous(), seq_lens)
+            k = _pack_bshd(key_layer.contiguous(), seq_lens)
+            v = _pack_bshd(value_layer.contiguous(), seq_lens)
+            out = _run_fa2(
+                q,
+                k,
+                v,
+                seq_lens=seq_lens,
+                softmax_scale=1.0 / math.sqrt(d),
+                causal=(attn_mask_type or "causal").startswith("causal"),
+            )
+            out = _scatter_bshd(
+                out,
+                batch_size=b_q,
+                seq_len=s_q,
+                seq_lens=seq_lens,
+            )
+            return out.reshape(b_q, s_q, n_q * d).contiguous()
+        elif fmt == "thd":
+            if query_layer.dim() != 3:
+                raise RuntimeError(
+                    "qkv_format='thd' expected query/key/value tensors with "
+                    f"rank 3, got {tuple(query_layer.shape)}"
+                )
+            total_tokens, n_q, d = query_layer.shape
+            if cu_seqlens_q is None:
+                raise RuntimeError("qkv_format='thd' requires cu_seqlens_q")
+            padded_cu = (
+                cu_seqlens_q_padded if cu_seqlens_q_padded is not None else cu_seqlens_q
+            )
+            seq_lens = _global_seq_lens(len(cu_seqlens_q) - 1, total_tokens)
+            if seq_lens is None:
+                seq_lens = _seq_lens_from_cu(cu_seqlens_q)
+            q = _pack_thd(
+                query_layer,
+                seq_lens=seq_lens,
+                padded_cu_seqlens=padded_cu,
+            )
+            k = _pack_thd(
+                key_layer,
+                seq_lens=seq_lens,
+                padded_cu_seqlens=padded_cu,
+            )
+            v = _pack_thd(
+                value_layer,
+                seq_lens=seq_lens,
+                padded_cu_seqlens=padded_cu,
+            )
+            out = _run_fa2(
+                q,
+                k,
+                v,
+                seq_lens=seq_lens,
+                softmax_scale=1.0 / math.sqrt(d),
+                causal=(attn_mask_type or "causal").endswith("causal"),
+            )
+            return _scatter_thd(
+                out,
+                total_tokens=total_tokens,
+                seq_lens=seq_lens,
+                padded_cu_seqlens=padded_cu,
+            )
         else:
             raise NotImplementedError(f"qkv_format={fmt!r} not supported")
-
-        cu_q = torch.arange(
-            0, (b_q + 1) * s_q, s_q, dtype=torch.int32, device=q.device
-        )
-        cu_k = torch.arange(
-            0, (b_kv + 1) * s_kv, s_kv, dtype=torch.int32, device=q.device
-        )
-        softmax_scale = 1.0 / math.sqrt(d)
-        mt = attn_mask_type or "causal"
-        causal = mt.startswith("causal")
-
-        out = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            max_seqlen_q=s_q,
-            cu_seqlens_q=cu_q,
-            max_seqlen_k=s_kv,
-            cu_seqlens_k=cu_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            num_splits=1,
-            fa_version=2,
-            deterministic=False,
-        )
-        if isinstance(out, tuple):
-            out = out[0]
-        out = out.reshape(b_q, s_q, n_q, d)
-        if fmt == "sbhd":
-            out = out.transpose(0, 1)
-            return out.reshape(s_q, b_q, n_q * d).contiguous()
-        return out.reshape(b_q, s_q, n_q * d).contiguous()
 
     dpa_mod.DotProductAttention.forward = _vllm_fa2_forward
 
@@ -395,13 +691,13 @@ def install_mxfp8_passthrough_for_bi_gemm() -> None:
 
     Must be called AFTER ``enable_batch_invariant_mode()``.
     """
+    import megatron.core.extensions.transformer_engine as meg_te
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
+    import transformer_engine.pytorch.module.linear as te_linear_mod
     from megatron.core.transformer.custom_layers import (
         batch_invariant_kernels as bik_mod,
     )
-    import transformer_engine.pytorch.cpp_extensions as te_cpp
-    import transformer_engine.pytorch.module.linear as te_linear_mod
-    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
-    import megatron.core.extensions.transformer_engine as meg_te
 
     if bik_mod._TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError(
@@ -441,13 +737,13 @@ def install_mxfp8_dequant_for_bi_gemm() -> None:
 
     Must be called AFTER ``enable_batch_invariant_mode()``.
     """
+    import megatron.core.extensions.transformer_engine as meg_te
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
+    import transformer_engine.pytorch.module.linear as te_linear_mod
     from megatron.core.transformer.custom_layers import (
         batch_invariant_kernels as bik_mod,
     )
-    import transformer_engine.pytorch.cpp_extensions as te_cpp
-    import transformer_engine.pytorch.module.linear as te_linear_mod
-    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
-    import megatron.core.extensions.transformer_engine as meg_te
 
     if bik_mod._TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError(
@@ -492,9 +788,7 @@ def install_mxfp8_dequant_for_bi_gemm() -> None:
         bias_grad = None
         if grad and bias is not None:
             b_flat = (
-                b_bf16.reshape(-1, b_bf16.shape[-1])
-                if b_bf16.dim() > 2
-                else b_bf16
+                b_bf16.reshape(-1, b_bf16.shape[-1]) if b_bf16.dim() > 2 else b_bf16
             )
             bias_grad = b_flat.sum(dim=0)
 
@@ -570,9 +864,7 @@ def split_all_layers_fused_layernorm_linear(model) -> int:
                 (layer.mlp, "linear_fc1"),
             ):
                 fused = getattr(owner, attr)
-                norm, linear = split_te_layernorm_column_parallel_linear(
-                    fused, config
-                )
+                norm, linear = split_te_layernorm_column_parallel_linear(fused, config)
                 ref_w = fused.weight
                 norm = norm.to(device=ref_w.device, dtype=ref_w.dtype)
                 linear = linear.to(device=ref_w.device, dtype=ref_w.dtype)

@@ -110,6 +110,12 @@ def model_forward(
         # GPTModel.forward signatures do not accept it.
         additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
+    from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
+        set_vllm_style_sdpa_sequence_lengths,
+    )
+
+    set_vllm_style_sdpa_sequence_lengths(data_dict.get("input_lengths"))
+
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
             input_ids=input_ids_cp_sharded,

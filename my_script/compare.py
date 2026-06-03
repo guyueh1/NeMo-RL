@@ -1,5 +1,7 @@
-"""Compare vLLM vs Megatron last-token logits captured by ``vllm_forward.py``
-and ``megatron_forward.py`` over a batch of real prompts.
+"""Compare vLLM vs Megatron last-token logits captured by ``vllm_forward.py``.
+
+Captures are produced by ``vllm_forward.py`` and ``megatron_forward.py`` over a
+batch of real prompts.
 
 Prints per-prompt summary stats and writes a scatter plot of every logit
 value (megatron on the x-axis, vllm on the y-axis) to ``--plot``.
@@ -14,24 +16,49 @@ import os
 
 import torch
 
-
 DEFAULT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--vllm", default=os.path.join(DEFAULT_DIR, "vllm_capture.pt"))
-    p.add_argument("--megatron", default=os.path.join(DEFAULT_DIR, "megatron_capture.pt"))
-    p.add_argument("--batch-invariant", action="store_true",
-                   help="Use *_bi.pt files for both sides")
-    p.add_argument("--mxfp8", action="store_true",
-                   help="Use *_mxfp8*.pt files for both sides")
-    p.add_argument("--plot", default=None,
-                   help="Output path for the scatter PNG "
-                        "(default: my_script/compare_logits_scatter.png).")
-    p.add_argument("--max-points", type=int, default=200_000,
-                   help="Subsample logit pairs to at most this many points "
-                        "in the scatter plot (default: 200000). Set to 0 for all.")
+    p.add_argument(
+        "--megatron", default=os.path.join(DEFAULT_DIR, "megatron_capture.pt")
+    )
+    p.add_argument(
+        "--batch-invariant",
+        action="store_true",
+        help="Use *_bi.pt files for both sides",
+    )
+    p.add_argument(
+        "--mxfp8", action="store_true", help="Use *_mxfp8*.pt files for both sides"
+    )
+    p.add_argument(
+        "--plot",
+        default=None,
+        help="Output path for the scatter PNG "
+        "(default: my_script/compare_logits_scatter.png).",
+    )
+    p.add_argument(
+        "--max-points",
+        type=int,
+        default=200_000,
+        help="Subsample logit pairs to at most this many points "
+        "in the scatter plot (default: 200000). Set to 0 for all.",
+    )
+    p.add_argument(
+        "--compare-modules",
+        action="store_true",
+        help="Print debug tensor diffs when the capture payloads "
+        "contain module_inputs_by_layer/module_outputs_by_layer.",
+    )
+    p.add_argument(
+        "--log-softmax-device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Device used to normalize Megatron logits before "
+        "comparing against vLLM logprobs.",
+    )
     args = p.parse_args()
     suffix = ""
     if args.mxfp8:
@@ -59,11 +86,434 @@ def diff_stats(a, b):
         "a_norm": float(a.norm()),
         "b_norm": float(b.norm()),
         "cos_sim": float(
-            torch.nn.functional.cosine_similarity(
-                a.unsqueeze(0), b.unsqueeze(0)
-            ).item()
+            torch.nn.functional.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
         ),
     }
+
+
+def first_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, dict):
+        for key in ("hidden_states", "x", "input", "residual"):
+            if key in value:
+                found = first_tensor(value[key])
+                if found is not None:
+                    return found
+        for item in value.values():
+            found = first_tensor(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = first_tensor(item)
+            if found is not None:
+                return found
+    return None
+
+
+def get_by_selector(entry, selector):
+    if "+" in selector:
+        terms = []
+        for part in selector.split("+"):
+            term = get_by_selector(entry, part)
+            if not isinstance(term, torch.Tensor):
+                return None
+            terms.append(term)
+        result = terms[0]
+        for term in terms[1:]:
+            if term.shape != result.shape:
+                return None
+            result = result + term
+        return result
+    if selector == "first":
+        return first_tensor(entry)
+    if isinstance(entry, dict) and "args" in entry and selector.startswith("arg"):
+        idx = int(selector[3:])
+        args = entry.get("args", ())
+        if idx < len(args):
+            return first_tensor(args[idx])
+        return None
+    if isinstance(entry, dict) and "kwargs" in entry and selector.startswith("kw."):
+        key = selector[3:]
+        return first_tensor(entry.get("kwargs", {}).get(key))
+    if isinstance(entry, (list, tuple)) and selector.startswith("item"):
+        idx = int(selector[4:])
+        if idx < len(entry):
+            return first_tensor(entry[idx])
+        return None
+    if selector == "output":
+        return first_tensor(entry)
+    return None
+
+
+def select_tensor(entry, selectors):
+    if isinstance(entry, dict) and "__calls__" in entry:
+        calls = entry["__calls__"]
+        for selector in selectors:
+            tensors = []
+            for call in calls:
+                tensor = get_by_selector(call, selector)
+                if not isinstance(tensor, torch.Tensor):
+                    tensors = []
+                    break
+                tensors.append(tensor)
+            tensor = concatenate_call_tensors(tensors)
+            if tensor is not None:
+                return tensor, f"{selector}x{len(tensors)}"
+        return None, None
+
+    for selector in selectors:
+        tensor = get_by_selector(entry, selector)
+        if isinstance(tensor, torch.Tensor):
+            return tensor, selector
+    return None, None
+
+
+def concatenate_call_tensors(tensors):
+    if not tensors:
+        return None
+
+    first = tensors[0]
+    if first.dim() == 0:
+        return torch.stack(tensors, dim=0)
+    for tensor in tensors:
+        if tensor.dim() != first.dim() or tensor.shape[1:] != first.shape[1:]:
+            return None
+    return torch.cat(tensors, dim=0)
+
+
+def normalize_token_layout(tensor, seq_lens):
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+    if tensor.dim() < 2 or not seq_lens:
+        return tensor
+
+    total_tokens = sum(seq_lens)
+    batch = len(seq_lens)
+    max_seq = max(seq_lens)
+
+    if tensor.shape[0] == total_tokens:
+        return tensor
+    if tensor.shape[0] == batch and tensor.shape[1] >= max_seq:
+        return torch.cat(
+            [tensor[i, :seq_len] for i, seq_len in enumerate(seq_lens)],
+            dim=0,
+        )
+    if tensor.shape[1] == batch and tensor.shape[0] >= max_seq:
+        return torch.cat(
+            [tensor[:seq_len, i] for i, seq_len in enumerate(seq_lens)],
+            dim=0,
+        )
+    return tensor
+
+
+def compare_selected_tensor(
+    label,
+    v_entry,
+    m_entry,
+    v_selectors,
+    m_selectors,
+    seq_lens,
+):
+    v_t, v_selector = select_tensor(v_entry, v_selectors)
+    m_t, m_selector = select_tensor(m_entry, m_selectors)
+    if v_t is None or m_t is None:
+        print(f"  {label:<68s} {'MISSING':>11s}")
+        return
+
+    v_t = normalize_token_layout(v_t, seq_lens)
+    m_t = normalize_token_layout(m_t, seq_lens)
+    stats = diff_stats(v_t, m_t)
+    print(
+        f"  {label:<68s} {stats['max_abs_diff']:>11.6f} "
+        f"{stats['mean_abs_diff']:>11.4e} {stats['cos_sim']:>10.6f} "
+        f"{str(tuple(v_t.shape)):>22s} {str(tuple(m_t.shape)):>22s} "
+        f"{v_selector:>10s} {m_selector:>10s}"
+    )
+
+
+def module_inputs(payload):
+    return payload.get("module_inputs_by_layer", {})
+
+
+def module_outputs(payload):
+    return payload.get("module_outputs_by_layer", {})
+
+
+def module_input_calls(payload):
+    return payload.get("module_input_calls_by_layer", {})
+
+
+def module_output_calls(payload):
+    return payload.get("module_output_calls_by_layer", {})
+
+
+def layer_map(source, layer_idx):
+    layer = source.get(layer_idx)
+    if layer is None:
+        layer = source.get(str(layer_idx), {})
+    return layer or {}
+
+
+def get_layer_entry(payload, layer_idx, module_name, outputs=False):
+    call_source = (
+        module_output_calls(payload) if outputs else module_input_calls(payload)
+    )
+    calls = layer_map(call_source, layer_idx).get(module_name)
+    if calls:
+        return {"__calls__": calls}
+
+    source = module_outputs(payload) if outputs else module_inputs(payload)
+    return layer_map(source, layer_idx).get(module_name, {})
+
+
+def layer_entry_stream(payload, layer_idx, seq_lens, is_vllm):
+    entry = get_layer_entry(payload, layer_idx, "<layer>")
+    if is_vllm:
+        selectors = (
+            "kw.hidden_states+kw.residual",
+            "arg1+arg2",
+            "kw.hidden_states",
+            "arg1",
+            "arg0",
+            "first",
+        )
+    else:
+        selectors = ("kw.hidden_states", "arg0", "first")
+    tensor, selector = select_tensor(entry, selectors)
+    if tensor is None:
+        return None, selector
+    return normalize_token_layout(tensor, seq_lens), selector
+
+
+def last_token_offsets(seq_lens):
+    offsets = []
+    total = 0
+    for seq_len in seq_lens:
+        total += seq_len
+        offsets.append(total - 1)
+    return torch.tensor(offsets, dtype=torch.long)
+
+
+def print_layer_entry_last_token_report(v, m, seq_lens, num_layers):
+    if not seq_lens:
+        return
+
+    offsets = last_token_offsets(seq_lens)
+    print("\n" + "=" * 110)
+    print("Layer-entry last-token residual-stream diffs")
+    print("=" * 110)
+    print(f"  {'layer':>5s} {'top prompt max/mean hidden diffs':<90s}")
+    for layer_idx in range(num_layers):
+        v_t, _ = layer_entry_stream(v, layer_idx, seq_lens, is_vllm=True)
+        m_t, _ = layer_entry_stream(m, layer_idx, seq_lens, is_vllm=False)
+        if v_t is None or m_t is None:
+            print(f"  {layer_idx:>5d} MISSING")
+            continue
+        if v_t.shape != m_t.shape or v_t.size(0) <= int(offsets[-1]):
+            print(
+                f"  {layer_idx:>5d} shape mismatch v={tuple(v_t.shape)} "
+                f"m={tuple(m_t.shape)}"
+            )
+            continue
+
+        diff = (v_t[offsets] - m_t[offsets]).abs().float()
+        max_by_prompt = diff.max(dim=1).values
+        mean_by_prompt = diff.mean(dim=1)
+        top = torch.topk(max_by_prompt, k=min(5, len(seq_lens)))
+        parts = [
+            f"p{int(prompt_idx)}:{float(max_by_prompt[prompt_idx]):.6f}/"
+            f"{float(mean_by_prompt[prompt_idx]):.2e}"
+            for prompt_idx in top.indices
+        ]
+        print(f"  {layer_idx:>5d} {' '.join(parts):<90s}")
+
+
+def print_module_capture_report(v, m):
+    v_inputs = module_inputs(v)
+    m_inputs = module_inputs(m)
+    if not v_inputs or not m_inputs:
+        return
+    v_outputs = module_outputs(v)
+    m_outputs = module_outputs(m)
+
+    seq_lens = v.get("seq_lens") or m.get("seq_lens") or []
+    num_layers = min(
+        int(v.get("num_layers", len(v_inputs))),
+        int(m.get("num_layers", len(m_inputs))),
+    )
+
+    print("\n" + "=" * 110)
+    print("Layer-entry hidden-state input diffs")
+    print("=" * 110)
+    print(
+        f"  {'layer':>5s} {'max_abs':>11s} {'mean_abs':>11s} {'cos_sim':>10s} "
+        f"{'v_shape':>22s} {'m_shape':>22s} {'v_sel':>10s} {'m_sel':>10s}"
+    )
+    for layer_idx in range(num_layers):
+        v_entry = get_layer_entry(v, layer_idx, "<layer>")
+        m_entry = get_layer_entry(m, layer_idx, "<layer>")
+        compare_selected_tensor(
+            str(layer_idx),
+            v_entry,
+            m_entry,
+            (
+                "kw.hidden_states+kw.residual",
+                "arg1+arg2",
+                "kw.hidden_states",
+                "arg1",
+                "arg0",
+                "first",
+            ),
+            ("kw.hidden_states", "arg0", "first"),
+            seq_lens,
+        )
+
+    print("\n" + "=" * 110)
+    print("Layer-0 semantic module input diffs")
+    print("=" * 110)
+    print(
+        f"  {'pair':<68s} {'max_abs':>11s} {'mean_abs':>11s} {'cos_sim':>10s} "
+        f"{'v_shape':>22s} {'m_shape':>22s} {'v_sel':>10s} {'m_sel':>10s}"
+    )
+    pairs = [
+        (
+            "layer residual stream",
+            "<layer>",
+            "<layer>",
+            ("kw.hidden_states+kw.residual", "arg1+arg2", "kw.hidden_states", "arg1"),
+            ("kw.hidden_states", "arg0"),
+        ),
+        (
+            "input_layernorm input",
+            "input_layernorm",
+            "input_layernorm",
+            ("arg0", "kw.hidden_states", "first"),
+            ("arg0", "kw.hidden_states", "first"),
+        ),
+        (
+            "post-norm hidden -> qkv",
+            "self_attn.qkv_proj",
+            "self_attention.linear_qkv.linear",
+            ("arg0", "first"),
+            ("arg0", "first"),
+        ),
+        (
+            "SDPA q",
+            "self_attn.attn",
+            "self_attention.core_attention",
+            ("arg0", "first"),
+            ("arg0", "first"),
+        ),
+        (
+            "SDPA k",
+            "self_attn.attn",
+            "self_attention.core_attention",
+            ("arg1",),
+            ("arg1",),
+        ),
+        (
+            "SDPA v",
+            "self_attn.attn",
+            "self_attention.core_attention",
+            ("arg2",),
+            ("arg2",),
+        ),
+        (
+            "attention output -> o_proj",
+            "self_attn.o_proj",
+            "self_attention.linear_proj",
+            ("arg0", "first"),
+            ("arg0", "first"),
+        ),
+        (
+            "post-norm hidden -> fc1",
+            "mlp.gate_up_proj",
+            "mlp.linear_fc1.linear",
+            ("arg0", "first"),
+            ("arg0", "first"),
+        ),
+        (
+            "post-activation -> down/fc2",
+            "mlp.down_proj",
+            "mlp.linear_fc2",
+            ("arg0", "first"),
+            ("arg0", "first"),
+        ),
+    ]
+    for label, v_name, m_name, v_selectors, m_selectors in pairs:
+        v_entry = get_layer_entry(v, 0, v_name)
+        m_entry = get_layer_entry(m, 0, m_name)
+        compare_selected_tensor(
+            label, v_entry, m_entry, v_selectors, m_selectors, seq_lens
+        )
+
+    if v_outputs and m_outputs:
+        print("\n" + "=" * 110)
+        print("Layer-0 semantic module output diffs")
+        print("=" * 110)
+        print(
+            f"  {'pair':<68s} {'max_abs':>11s} {'mean_abs':>11s} "
+            f"{'cos_sim':>10s} {'v_shape':>22s} {'m_shape':>22s} "
+            f"{'v_sel':>10s} {'m_sel':>10s}"
+        )
+        output_pairs = [
+            ("layer residual stream output", "<layer>", "<layer>"),
+            ("input_layernorm output", "input_layernorm", "input_layernorm"),
+            (
+                "qkv projection output",
+                "self_attn.qkv_proj",
+                "self_attention.linear_qkv.linear",
+            ),
+            (
+                "attention kernel output",
+                "self_attn.attn",
+                "self_attention.core_attention",
+            ),
+            (
+                "attention projection output",
+                "self_attn.o_proj",
+                "self_attention.linear_proj",
+            ),
+            ("mlp fc1/gate_up output", "mlp.gate_up_proj", "mlp.linear_fc1.linear"),
+            ("mlp down/fc2 output", "mlp.down_proj", "mlp.linear_fc2"),
+        ]
+        for label, v_name, m_name in output_pairs:
+            v_entry = get_layer_entry(v, 0, v_name, outputs=True)
+            m_entry = get_layer_entry(m, 0, m_name, outputs=True)
+            v_selectors = ("item0+item1", "output", "first")
+            m_selectors = ("item0+item1", "output", "first")
+            compare_selected_tensor(
+                label, v_entry, m_entry, v_selectors, m_selectors, seq_lens
+            )
+
+    print("\n" + "=" * 110)
+    print("Common exact-name layer-0 input diffs")
+    print("=" * 110)
+    v_layer0 = v_inputs.get(0) or v_inputs.get("0") or {}
+    m_layer0 = m_inputs.get(0) or m_inputs.get("0") or {}
+    common = sorted(set(v_layer0) & set(m_layer0))
+    for name in common:
+        compare_selected_tensor(
+            name,
+            get_layer_entry(v, 0, name),
+            get_layer_entry(m, 0, name),
+            (
+                "kw.hidden_states+kw.residual",
+                "arg1+arg2",
+                "kw.hidden_states",
+                "arg1",
+                "arg0",
+                "first",
+            ),
+            ("arg0", "kw.hidden_states", "first"),
+            seq_lens,
+        )
+    print(f"\n  vLLM-only layer-0 names: {sorted(set(v_layer0) - set(m_layer0))}")
+    print(f"  Megatron-only layer-0 names: {sorted(set(m_layer0) - set(v_layer0))}")
+    print_layer_entry_last_token_report(v, m, seq_lens, num_layers)
 
 
 def plot_scatter(v_logits, m_logits, out_path, max_points):
@@ -82,9 +532,7 @@ def plot_scatter(v_logits, m_logits, out_path, max_points):
     full_stats = diff_stats(v_logits, m_logits)
     v_t = v_logits.reshape(-1).float()
     m_t = m_logits.reshape(-1).float()
-    pearson = float(
-        torch.corrcoef(torch.stack([v_t, m_t]))[0, 1].item()
-    )
+    pearson = float(torch.corrcoef(torch.stack([v_t, m_t]))[0, 1].item())
 
     n_total = v_flat.size
     if max_points and n_total > max_points:
@@ -127,8 +575,9 @@ def plot_scatter(v_logits, m_logits, out_path, max_points):
         va="bottom",
         fontsize=9,
         family="monospace",
-        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.8,
-                  edgecolor="gray"),
+        bbox=dict(
+            boxstyle="round,pad=0.4", facecolor="white", alpha=0.8, edgecolor="gray"
+        ),
     )
 
     fig.tight_layout()
@@ -158,14 +607,22 @@ def main():
     m_vocab = m_logits.shape[-1]
     vocab = min(v_vocab, m_vocab)
     if v_vocab != m_vocab:
-        print(f"[warn] vocab mismatch: vllm={v_vocab} megatron={m_vocab}; "
-              f"truncating to {vocab}")
+        print(
+            f"[warn] vocab mismatch: vllm={v_vocab} megatron={m_vocab}; "
+            f"truncating to {vocab}"
+        )
     v_logprobs = v_logprobs[..., :vocab]
     m_logits = m_logits[..., :vocab]
 
     # Convert Megatron's raw logits to logprobs so both sides are directly
-    # comparable.
-    m_logprobs = torch.log_softmax(m_logits, dim=-1)
+    # comparable. vLLM normalizes on GPU, so CUDA is useful for separating
+    # transformer-body drift from log-softmax implementation differences.
+    if args.log_softmax_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--log-softmax-device cuda requires CUDA")
+        m_logprobs = torch.log_softmax(m_logits.cuda(), dim=-1).cpu()
+    else:
+        m_logprobs = torch.log_softmax(m_logits, dim=-1)
 
     v_prompts = v.get("prompts", [])
     m_prompts = m.get("prompts", [])
@@ -174,25 +631,34 @@ def main():
     print(f"vllm     capture : {args.vllm}")
     print(f"megatron capture : {args.megatron}")
     print(f"num prompts      : vllm={len(v_prompts)} megatron={len(m_prompts)}")
-    print(f"logprob shape    : vllm={tuple(v_logprobs.shape)} "
-          f"megatron(logits)={tuple(m_logits.shape)}")
+    print(
+        f"logprob shape    : vllm={tuple(v_logprobs.shape)} "
+        f"megatron(logits)={tuple(m_logits.shape)}"
+    )
+    print(f"log_softmax dev  : {args.log_softmax_device}")
 
     n = min(v_logprobs.shape[0], m_logprobs.shape[0])
     v_logprobs = v_logprobs[:n]
     m_logprobs = m_logprobs[:n]
 
     if v_prompts != m_prompts:
-        print("[warn] prompt lists differ between captures — comparing by index "
-              "anyway, but results may be meaningless")
+        print(
+            "[warn] prompt lists differ between captures — comparing by index "
+            "anyway, but results may be meaningless"
+        )
 
     print("\nPer-prompt next-token logprobs:")
-    print(f"  {'idx':>3} | {'max_abs':>10} | {'mean_abs':>10} | {'cos_sim':>9} | "
-          f"{'|vllm|':>10} | {'|mcore|':>10}")
+    print(
+        f"  {'idx':>3} | {'max_abs':>10} | {'mean_abs':>10} | {'cos_sim':>9} | "
+        f"{'|vllm|':>10} | {'|mcore|':>10}"
+    )
     for i in range(n):
         stats = diff_stats(v_logprobs[i], m_logprobs[i])
-        print(f"  {i:>3} | {stats['max_abs_diff']:>10.6f} | "
-              f"{stats['mean_abs_diff']:>10.4e} | {stats['cos_sim']:>9.6f} | "
-              f"{stats['a_norm']:>10.4f} | {stats['b_norm']:>10.4f}")
+        print(
+            f"  {i:>3} | {stats['max_abs_diff']:>10.6f} | "
+            f"{stats['mean_abs_diff']:>10.4e} | {stats['cos_sim']:>9.6f} | "
+            f"{stats['a_norm']:>10.4f} | {stats['b_norm']:>10.4f}"
+        )
 
     print("\nAggregate (all prompts, all vocab):")
     for k, val in diff_stats(v_logprobs, m_logprobs).items():
@@ -200,6 +666,11 @@ def main():
 
     plot_scatter(v_logprobs, m_logprobs, args.plot, args.max_points)
     print(f"\nscatter plot -> {args.plot}")
+
+    if args.compare_modules or (
+        "module_inputs_by_layer" in v and "module_inputs_by_layer" in m
+    ):
+        print_module_capture_report(v, m)
 
 
 if __name__ == "__main__":

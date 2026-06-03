@@ -1,5 +1,7 @@
-"""Run a batch of real prompts through a Megatron Llama-3.1-8B model
-(forward-only) and save the last-token logits for each prompt.
+r"""Run Megatron forward-only and save last-token logits.
+
+Run a batch of real prompts through a Megatron Llama-3.1-8B model and save the
+last-token logits for each prompt.
 
 BF16 (default):
     uv run --extra mcore torchrun --nproc_per_node=1 my_script/megatron_forward.py
@@ -28,8 +30,8 @@ from megatron.bridge.utils.common_utils import disable_mtp_for_inference, print_
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.transformer.module import Float16Module
+from tensor_capture import get_debug_tensor_capture, install_debug_tensor_hooks
 from transformers import AutoTokenizer
-
 
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DATASET = "openai/gsm8k"
@@ -37,6 +39,8 @@ DEFAULT_DATASET_SUBSET = "main"
 DEFAULT_DATASET_SPLIT = "train"
 DEFAULT_DATASET_FIELD = "question"
 DEFAULT_NUM_PROMPTS = 32
+
+G_VLLM_STYLE_SDPA_SEQ_LENS: list[int] | None = None
 
 
 def load_prompts(dataset, subset, split, field, n, seed):
@@ -78,6 +82,7 @@ def default_output(
     vllm_rmsnorm: bool = False,
     split_all_fused: bool = False,
     mxfp8: bool = False,
+    vllm_paged_sdpa: bool = False,
 ) -> str:
     suffix = ""
     if mxfp8:
@@ -92,6 +97,8 @@ def default_output(
         suffix += "_vllmrope"
     if vllm_swiglu:
         suffix += "_vllmswiglu"
+    if vllm_paged_sdpa:
+        suffix += "_vllmpagedsdpa"
     if vllm_sdpa:
         suffix += "_vllmsdpa"
     if vllm_rmsnorm:
@@ -158,15 +165,19 @@ def install_mxfp8_passthrough_for_bi_gemm():
     storages) and forwards the call to TE's original ``general_gemm``;
     regular CUDA tensors still go through the BI Triton matmul.
     """
-    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik_mod
-    import transformer_engine.pytorch.cpp_extensions as te_cpp
-    import transformer_engine.pytorch.module.linear as te_linear_mod
-    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
     import megatron.core.extensions.transformer_engine as meg_te
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
+    import transformer_engine.pytorch.module.linear as te_linear_mod
+    from megatron.core.transformer.custom_layers import (
+        batch_invariant_kernels as bik_mod,
+    )
 
     if bik_mod._TE_GENERAL_GEMM_ORIG is None:
-        raise RuntimeError("enable_batch_invariant_mode() must run before "
-                           "install_mxfp8_passthrough_for_bi_gemm()")
+        raise RuntimeError(
+            "enable_batch_invariant_mode() must run before "
+            "install_mxfp8_passthrough_for_bi_gemm()"
+        )
 
     orig_gemm = bik_mod._TE_GENERAL_GEMM_ORIG
     bi_gemm = bik_mod._te_general_gemm_patched
@@ -189,9 +200,10 @@ def install_mxfp8_passthrough_for_bi_gemm():
 
 
 def install_mxfp8_dequant_for_bi_gemm():
-    """When ``--batch-invariant`` and ``--mxfp8`` are both on, route MXFP8
-    GEMMs through the BF16 batch-invariant matmul kernel by **dequantising
-    both inputs to bf16** first.
+    """Route MXFP8 GEMMs through BF16 batch-invariant matmul.
+
+    When ``--batch-invariant`` and ``--mxfp8`` are both on, dequantise both
+    inputs to bf16 first.
 
     Mirrors vLLM's ``BatchInvariantMxfp8LinearKernel`` (which dequants weight
     via ``dequant_mxfp8_to_bf16`` and calls ``matmul_persistent``):
@@ -209,15 +221,19 @@ def install_mxfp8_dequant_for_bi_gemm():
     Replaces the earlier ``install_mxfp8_passthrough_for_bi_gemm`` which
     simply fell through to TE's non-BI ``general_gemm`` for MXFP8 calls.
     """
-    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik_mod
-    import transformer_engine.pytorch.cpp_extensions as te_cpp
-    import transformer_engine.pytorch.module.linear as te_linear_mod
-    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
     import megatron.core.extensions.transformer_engine as meg_te
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
+    import transformer_engine.pytorch.module.linear as te_linear_mod
+    from megatron.core.transformer.custom_layers import (
+        batch_invariant_kernels as bik_mod,
+    )
 
     if bik_mod._TE_GENERAL_GEMM_ORIG is None:
-        raise RuntimeError("enable_batch_invariant_mode() must run before "
-                           "install_mxfp8_dequant_for_bi_gemm()")
+        raise RuntimeError(
+            "enable_batch_invariant_mode() must run before "
+            "install_mxfp8_dequant_for_bi_gemm()"
+        )
 
     extract = bik_mod._extract_te_gemm_args
     bi_gemm_fn = bik_mod.BatchInvariantTEGemmFn
@@ -239,7 +255,12 @@ def install_mxfp8_dequant_for_bi_gemm():
         ub = kwargs.get("ub", None)
         ub_type = kwargs.get("ub_type", None)
         bulk_overlap = kwargs.get("bulk_overlap", False)
-        if extra_output is not None or ub is not None or ub_type is not None or bulk_overlap:
+        if (
+            extra_output is not None
+            or ub is not None
+            or ub_type is not None
+            or bulk_overlap
+        ):
             raise RuntimeError(
                 "Batch-invariant GEMM does not support Userbuffers/overlap "
                 "(extra_output/ub/ub_type/bulk_overlap)."
@@ -254,7 +275,9 @@ def install_mxfp8_dequant_for_bi_gemm():
 
         bias_grad = None
         if grad and bias is not None:
-            b_flat = b_bf16.reshape(-1, b_bf16.shape[-1]) if b_bf16.dim() > 2 else b_bf16
+            b_flat = (
+                b_bf16.reshape(-1, b_bf16.shape[-1]) if b_bf16.dim() > 2 else b_bf16
+            )
             bias_grad = b_flat.sum(dim=0)
 
         if out_tensor is not None:
@@ -273,8 +296,11 @@ def install_mxfp8_dequant_for_bi_gemm():
 
 
 def install_vllm_style_rmsnorm():
-    """Monkey-patch Megatron's BI RMSNorm to call vLLM's `rms_norm_batch_invariant`
-    Triton kernel directly, so both engines run the *exact same* CUDA kernel.
+    """Route Megatron's BI RMSNorm through vLLM's BI Triton kernel.
+
+    Monkey-patch Megatron's BI RMSNorm to call vLLM's
+    `rms_norm_batch_invariant` directly, so both engines run the *exact same*
+    CUDA kernel.
 
     Megatron's default `BatchInvariantRMSNormFn` is a PyTorch implementation
     (`mean_dim(x*x)` -> `torch.sqrt` -> multiply). vLLM's `rms_norm_batch_invariant`
@@ -296,7 +322,9 @@ def install_vllm_style_rmsnorm():
     swaps the autograd function that `_te_rmsnorm_forward_patched` invokes by
     global-name lookup.
     """
-    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik_mod
+    from megatron.core.transformer.custom_layers import (
+        batch_invariant_kernels as bik_mod,
+    )
     from vllm.model_executor.layers.batch_invariant import (
         rms_norm as vllm_rms_norm_triton,
     )
@@ -329,10 +357,12 @@ def install_vllm_style_rmsnorm():
     bik_mod.BatchInvariantRMSNormFn = _VllmStyleBatchInvariantRMSNormFn
 
 
-def install_vllm_style_sdpa():
-    """Monkey-patch TE's `DotProductAttention.forward` to dispatch to vLLM's
-    FA2 (`vllm.vllm_flash_attn.flash_attn_varlen_func`) with `num_splits=1`
-    and `fa_version=2` — the exact kernel vLLM uses under
+def install_vllm_style_sdpa(*, paged_kv=False, paged_block_size=16):
+    """Route TE `DotProductAttention.forward` through vLLM FA2.
+
+    Monkey-patch TE's `DotProductAttention.forward` to dispatch to vLLM's FA2
+    (`vllm.vllm_flash_attn.flash_attn_varlen_func`) with `num_splits=1` and
+    `fa_version=2` — the exact kernel vLLM uses under
     `VLLM_BATCH_INVARIANT=1` on Blackwell.
 
     Why FA2 and not FA4: vLLM rejects FA4 in BI mode because FA4 uses
@@ -343,20 +373,135 @@ def install_vllm_style_sdpa():
     FA4 cute kernel; that no longer matches what vLLM actually runs in BI.)
 
     This patch:
-      1. Reshapes Megatron/TE's (s, b, n, d) tensors into FA2 varlen's packed
-         (total_tokens, n, d) layout with a `cu_seqlens` describing one
-         contiguous sequence per batch element.
+      1. Unpads Megatron/TE's (s, b, n, d) tensors into FA2 varlen's packed
+         (total_tokens, n, d) layout with the actual prompt-length
+         `cu_seqlens` that vLLM uses.
       2. Calls `flash_attn_varlen_func(..., fa_version=2, num_splits=1)`.
-      3. Reshapes the (total, n, d) output back to TE's expected
+      3. Scatters the (total, n, d) output back to TE's expected padded
          (s, b, n*d) (or (b, s, n*d) for bshd) layout.
 
-    Inference-only; no bias / sliding window / fp8 / sinks / paged KV.
+    If ``paged_kv`` is enabled, step 2 mirrors vLLM decoder attention more
+    closely: K/V are written through ``reshape_and_cache_flash`` into a
+    block-table KV cache, then FA2 reads ``key_cache`` / ``value_cache`` with
+    ``block_table`` and ``seqused_k``. This is a diagnostic path for matching
+    vLLM's normal decoder prefill path.
+
+    Inference-only; no bias / sliding window / fp8 / sinks.
     """
     import math
+
     from transformer_engine.pytorch.attention.dot_product_attention import (
         dot_product_attention as dpa_mod,
     )
-    from vllm.vllm_flash_attn import flash_attn_varlen_func
+    from vllm.v1.attention.backends.fa_utils import (
+        flash_attn_varlen_func,
+        reshape_and_cache_flash,
+    )
+
+    def _seq_lens_for_batch(batch_size, seqlen):
+        if G_VLLM_STYLE_SDPA_SEQ_LENS is None:
+            return None
+        if len(G_VLLM_STYLE_SDPA_SEQ_LENS) != batch_size:
+            raise RuntimeError(
+                "vllm-style SDPA seq_lens batch mismatch: "
+                f"{len(G_VLLM_STYLE_SDPA_SEQ_LENS)} vs {batch_size}"
+            )
+        if max(G_VLLM_STYLE_SDPA_SEQ_LENS) > seqlen:
+            raise RuntimeError(
+                "vllm-style SDPA seq_lens exceed padded sequence length: "
+                f"{max(G_VLLM_STYLE_SDPA_SEQ_LENS)} > {seqlen}"
+            )
+        return G_VLLM_STYLE_SDPA_SEQ_LENS
+
+    def _pack_bshd(tensor, seq_lens):
+        return torch.cat(
+            [tensor[i, :seq_len] for i, seq_len in enumerate(seq_lens)],
+            dim=0,
+        ).contiguous()
+
+    def _cu_seqlens(seq_lens, device):
+        lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        zeros = torch.zeros(1, dtype=torch.int32, device=device)
+        return torch.cat([zeros, torch.cumsum(lens, dim=0, dtype=torch.int32)])
+
+    def _scatter_bshd(packed, batch_size, seqlen, seq_lens):
+        out = packed.new_zeros((batch_size, seqlen, packed.size(1), packed.size(2)))
+        offset = 0
+        for batch_idx, seq_len in enumerate(seq_lens):
+            next_offset = offset + seq_len
+            out[batch_idx, :seq_len] = packed[offset:next_offset]
+            offset = next_offset
+        return out
+
+    def _block_metadata(seq_lens, block_size, device):
+        max_blocks = math.ceil(max(seq_lens) / block_size)
+        block_table = torch.zeros(
+            (len(seq_lens), max_blocks), dtype=torch.int32, device=device
+        )
+        slot_mapping = []
+        next_block = 0
+        for batch_idx, seq_len in enumerate(seq_lens):
+            num_blocks = math.ceil(seq_len / block_size)
+            blocks = torch.arange(
+                next_block,
+                next_block + num_blocks,
+                dtype=torch.int32,
+                device=device,
+            )
+            block_table[batch_idx, :num_blocks] = blocks
+            for pos in range(seq_len):
+                slot_mapping.append(
+                    (next_block + pos // block_size) * block_size + pos % block_size
+                )
+            next_block += num_blocks
+        return (
+            block_table,
+            torch.tensor(slot_mapping, dtype=torch.int64, device=device),
+            next_block,
+        )
+
+    def _paged_fa2(q, k, v, seq_lens, max_q, max_k, softmax_scale, causal):
+        block_table, slot_mapping, num_blocks = _block_metadata(
+            seq_lens,
+            paged_block_size,
+            q.device,
+        )
+        key_cache = torch.empty(
+            (num_blocks, paged_block_size, k.size(1), k.size(2)),
+            dtype=k.dtype,
+            device=k.device,
+        )
+        value_cache = torch.empty_like(key_cache)
+        scale = torch.ones((), dtype=torch.float32, device=q.device)
+        reshape_and_cache_flash(
+            k,
+            v,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            "auto",
+            scale,
+            scale,
+        )
+        out = torch.empty_like(q)
+        result = flash_attn_varlen_func(
+            q=q,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            max_seqlen_q=max_q,
+            cu_seqlens_q=_cu_seqlens(seq_lens, q.device),
+            max_seqlen_k=max_k,
+            seqused_k=torch.tensor(seq_lens, dtype=torch.int32, device=q.device),
+            softmax_scale=softmax_scale,
+            causal=causal,
+            block_table=block_table,
+            num_splits=1,  # batch-invariant K reduction
+            fa_version=2,  # match vLLM BI path
+        )
+        if isinstance(result, tuple):
+            return result[0]
+        return out
 
     def _vllm_fa2_forward(
         self,
@@ -386,56 +531,102 @@ def install_vllm_style_sdpa():
     ):
         assert core_attention_bias is None, "bias not supported in vllm-fa2 patch"
         assert alibi_slopes is None, "alibi not supported in vllm-fa2 patch"
-        assert inference_params is None, "kv-cache inference not supported in vllm-fa2 patch"
+        assert inference_params is None, (
+            "kv-cache inference not supported in vllm-fa2 patch"
+        )
         assert fp8_output is False, "fp8 output not supported in vllm-fa2 patch"
 
         fmt = qkv_format or getattr(self, "qkv_format", "sbhd")
         if fmt == "sbhd":
-            # (s, b, n, d) -> (b, s, n, d) -> (b*s, n, d)
             s_q, b_q, n_q, d = query_layer.shape
             s_kv, b_kv, n_kv, _ = key_layer.shape
-            q = query_layer.transpose(0, 1).reshape(b_q * s_q, n_q, d).contiguous()
-            k = key_layer.transpose(0, 1).reshape(b_kv * s_kv, n_kv, d).contiguous()
-            v = value_layer.transpose(0, 1).reshape(b_kv * s_kv, n_kv, d).contiguous()
+            q_bshd = query_layer.transpose(0, 1).contiguous()
+            k_bshd = key_layer.transpose(0, 1).contiguous()
+            v_bshd = value_layer.transpose(0, 1).contiguous()
         elif fmt == "bshd":
             b_q, s_q, n_q, d = query_layer.shape
             b_kv, s_kv, n_kv, _ = key_layer.shape
-            q = query_layer.reshape(b_q * s_q, n_q, d).contiguous()
-            k = key_layer.reshape(b_kv * s_kv, n_kv, d).contiguous()
-            v = value_layer.reshape(b_kv * s_kv, n_kv, d).contiguous()
+            q_bshd = query_layer.contiguous()
+            k_bshd = key_layer.contiguous()
+            v_bshd = value_layer.contiguous()
         else:
             raise NotImplementedError(f"qkv_format={fmt!r} not supported")
 
-        cu_q = torch.arange(0, (b_q + 1) * s_q, s_q, dtype=torch.int32, device=q.device)
-        cu_k = torch.arange(0, (b_kv + 1) * s_kv, s_kv, dtype=torch.int32, device=q.device)
+        if b_q != b_kv:
+            raise NotImplementedError("cross-attention is not supported")
+
+        seq_lens = _seq_lens_for_batch(b_q, s_q)
+        if seq_lens is None:
+            q = q_bshd.reshape(b_q * s_q, n_q, d).contiguous()
+            k = k_bshd.reshape(b_kv * s_kv, n_kv, d).contiguous()
+            v = v_bshd.reshape(b_kv * s_kv, n_kv, d).contiguous()
+            cu_q = torch.arange(
+                0, (b_q + 1) * s_q, s_q, dtype=torch.int32, device=q.device
+            )
+            cu_k = torch.arange(
+                0, (b_kv + 1) * s_kv, s_kv, dtype=torch.int32, device=q.device
+            )
+            max_q = s_q
+            max_k = s_kv
+        else:
+            q = _pack_bshd(q_bshd, seq_lens)
+            k = _pack_bshd(k_bshd, seq_lens)
+            v = _pack_bshd(v_bshd, seq_lens)
+            cu_q = _cu_seqlens(seq_lens, q.device)
+            cu_k = cu_q
+            max_q = max(seq_lens)
+            max_k = max_q
+
         softmax_scale = 1.0 / math.sqrt(d)
         mt = attn_mask_type or "causal"
         causal = mt.startswith("causal")
 
-        out = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            max_seqlen_q=s_q,
-            cu_seqlens_q=cu_q,
-            max_seqlen_k=s_kv,
-            cu_seqlens_k=cu_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            num_splits=1,           # batch-invariant K reduction
-            fa_version=2,           # match vLLM BI path
-            deterministic=False,
-        )
-        if isinstance(out, tuple):
-            out = out[0]
-        # out: (b*s, n_q, d)
-        out = out.reshape(b_q, s_q, n_q, d)
+        if paged_kv:
+            seq_lens_for_paged = (
+                seq_lens if seq_lens is not None else [s_q for _ in range(b_q)]
+            )
+            out = _paged_fa2(
+                q,
+                k,
+                v,
+                seq_lens_for_paged,
+                max_q,
+                max_k,
+                softmax_scale,
+                causal,
+            )
+        else:
+            out = flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                max_seqlen_q=max_q,
+                cu_seqlens_q=cu_q,
+                max_seqlen_k=max_k,
+                cu_seqlens_k=cu_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                num_splits=1,  # batch-invariant K reduction
+                fa_version=2,  # match vLLM BI path
+                deterministic=False,
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+        if seq_lens is None:
+            out = out.reshape(b_q, s_q, n_q, d)
+        else:
+            out = _scatter_bshd(out, b_q, s_q, seq_lens)
         if fmt == "sbhd":
             out = out.transpose(0, 1)  # -> (s, b, n_q, d)
             return out.reshape(s_q, b_q, n_q * d).contiguous()
         return out.reshape(b_q, s_q, n_q * d).contiguous()
 
     dpa_mod.DotProductAttention.forward = _vllm_fa2_forward
+
+
+def set_vllm_style_sdpa_seq_lens(seq_lens):
+    global G_VLLM_STYLE_SDPA_SEQ_LENS
+    G_VLLM_STYLE_SDPA_SEQ_LENS = list(seq_lens)
 
 
 def install_vllm_style_swiglu():
@@ -463,13 +654,13 @@ def install_vllm_style_swiglu():
     kernel keep silu in fp32 until the multiply, matching Megatron's compiled
     path. See TODO in `my_docs/llama3_8b_numeric_mismatch.md`.
     """
-    import torch.nn.functional as F
     import megatron.core.fusions.fused_bias_swiglu as swg_mod
+    import torch.nn.functional as F
 
     def _vllm_style_swiglu(y):
         y_1, y_2 = torch.chunk(y, 2, -1)
-        silu_out = F.silu(y_1)        # eager: fp32 compute, materialise bf16
-        return silu_out * y_2          # bf16 * bf16
+        silu_out = F.silu(y_1)  # eager: fp32 compute, materialise bf16
+        return silu_out * y_2  # bf16 * bf16
 
     def _vllm_style_bias_swiglu(y, bias):
         return _vllm_style_swiglu(y + bias)
@@ -479,8 +670,9 @@ def install_vllm_style_swiglu():
 
 
 def install_vllm_style_rope():
-    """Monkey-patch Megatron's `apply_rotary_pos_emb` to match vLLM's numerical
-    behaviour (precision + multiply-add order).
+    """Match vLLM RoPE precision and multiply-add order.
+
+    Monkey-patch Megatron's `apply_rotary_pos_emb`.
 
     vLLM:
       1. Precompute cos/sin in fp32 from fp32 freqs.
@@ -545,6 +737,7 @@ def install_vllm_style_rope():
     # Also patch the re-export in transformer.attention if present so the
     # `attention.py` import binding is updated, not just the rope_utils module.
     import importlib
+
     for mod_name in ("megatron.core.transformer.attention",):
         try:
             mod = importlib.import_module(mod_name)
@@ -555,9 +748,12 @@ def install_vllm_style_rope():
 
 
 class SplitNormLinear(torch.nn.Module):
-    """Drop-in replacement for `TELayerNormColumnParallelLinear` that materialises
-    the post-norm tensor (so a forward hook on `linear` captures vLLM-comparable
-    `qkv_proj` / `gate_up_proj` input)."""
+    """Materialise the post-norm tensor before the wrapped linear.
+
+    Drop-in replacement for `TELayerNormColumnParallelLinear` that lets a
+    forward hook on `linear` capture vLLM-comparable `qkv_proj` /
+    `gate_up_proj` input.
+    """
 
     def __init__(self, norm, linear):
         super().__init__()
@@ -569,12 +765,14 @@ class SplitNormLinear(torch.nn.Module):
 
 
 def split_layer_fused(layer, config):
-    """Unfuse `self_attention.linear_qkv` and `mlp.linear_fc1` on one decoder
-    layer using the upstream `split_te_layernorm_column_parallel_linear`
-    primitive, replacing each with a tiny `SplitNormLinear(norm, linear)`
-    wrapper. This forces the post-norm activation to be materialised in bf16
-    (an extra round-trip) so the layer's numerics match vLLM's standalone
-    `RMSNorm` + `qkv_proj` / `gate_up_proj` path exactly.
+    """Unfuse the first QKV and MLP projection fused modules.
+
+    Unfuse `self_attention.linear_qkv` and `mlp.linear_fc1` on one decoder layer
+    using the upstream `split_te_layernorm_column_parallel_linear` primitive,
+    replacing each with a tiny `SplitNormLinear(norm, linear)` wrapper. This
+    forces the post-norm activation to be materialised in bf16 (an extra
+    round-trip) so the layer's numerics match vLLM's standalone `RMSNorm` +
+    `qkv_proj` / `gate_up_proj` path exactly.
     """
     from megatron.core.extensions.transformer_engine import (
         split_te_layernorm_column_parallel_linear,
@@ -643,8 +841,12 @@ def unwrap(m):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--num-prompts", type=int, default=DEFAULT_NUM_PROMPTS,
-                   help="Number of prompts to draw from --dataset (default: 32).")
+    p.add_argument(
+        "--num-prompts",
+        type=int,
+        default=DEFAULT_NUM_PROMPTS,
+        help="Number of prompts to draw from --dataset (default: 32).",
+    )
     p.add_argument("--dataset", default=DEFAULT_DATASET)
     p.add_argument("--dataset-subset", default=DEFAULT_DATASET_SUBSET)
     p.add_argument("--dataset-split", default=DEFAULT_DATASET_SPLIT)
@@ -652,51 +854,105 @@ def parse_args():
     p.add_argument("--dataset-seed", type=int, default=0)
     p.add_argument("--output", default=None)
     p.add_argument("--batch-invariant", action="store_true")
-    p.add_argument("--split-fused", action="store_true",
-                   help="Unfuse LN+Linear on first layer (linear_qkv, linear_fc1)")
-    p.add_argument("--split-all-fused", action="store_true",
-                   help="Unfuse LN+Linear on ALL decoder layers (implies "
-                        "--split-fused for layer 0). Required for full-depth "
-                        "bit-equality with vLLM's standalone-norm + linear path.")
-    p.add_argument("--no-rope-fusion", action="store_true",
-                   help="Disable TE fused RoPE (apply_rope_fusion=False) to "
-                        "match vLLM's bf16-cast-of-cos/sin precision behavior.")
-    p.add_argument("--vllm-rope", action="store_true",
-                   help="Monkey-patch Megatron's apply_rotary_pos_emb with a "
-                        "PyTorch RoPE that reproduces vLLM's exact precision "
-                        "behaviour (bf16 cos/sin cache, fp32 rotation, single "
-                        "bf16 cast at end).")
-    p.add_argument("--vllm-swiglu", action="store_true",
-                   help="Monkey-patch Megatron's swiglu to bypass torch.compile "
-                        "fusion and match vLLM's two-rounding-event SwiGLU "
-                        "(eager F.silu then bf16 multiply).")
-    p.add_argument("--vllm-sdpa", action="store_true",
-                   help="Monkey-patch TE DotProductAttention to call vLLM's "
-                        "FA2 (flash_attn_varlen_func, fa_version=2, "
-                        "num_splits=1) — the kernel vLLM actually uses under "
-                        "VLLM_BATCH_INVARIANT=1 on Blackwell.")
-    p.add_argument("--vllm-rmsnorm", action="store_true",
-                   help="Monkey-patch Megatron's BI RMSNorm to use 1/sqrt(...) "
-                        "instead of torch.rsqrt(...), matching vLLM's original "
-                        "Triton BI RMSNorm kernel bit-for-bit. Only meaningful "
-                        "in combination with --batch-invariant.")
-    p.add_argument("--mxfp8", action="store_true",
-                   help="Enable MXFP8 (Blackwell-only). Configures the model "
-                        "provider with fp8=<format> and fp8_recipe='mxfp8' so "
-                        "TE's fp8_autocast wraps every decoder layer.")
-    p.add_argument("--fp8-format", default="e4m3", choices=["e4m3", "hybrid"],
-                   help="FP8 element format used by the MXFP8 recipe (default: "
-                        "e4m3). 'hybrid' uses e4m3 for fwd and e5m2 for bwd. "
-                        "Only meaningful with --mxfp8.")
-    p.add_argument("--mxfp8-bi-dequant", action="store_true",
-                   help="Under --mxfp8 --batch-invariant, dequant MXFP8 operands "
-                        "to bf16 and route through the BF16 BI matmul "
-                        "(install_mxfp8_dequant_for_bi_gemm). Default is the "
-                        "passthrough patch which just lets MXFP8 GEMMs use TE's "
-                        "original cuBLASLt kernel.")
+    p.add_argument(
+        "--split-fused",
+        action="store_true",
+        help="Unfuse LN+Linear on first layer (linear_qkv, linear_fc1)",
+    )
+    p.add_argument(
+        "--split-all-fused",
+        action="store_true",
+        help="Unfuse LN+Linear on ALL decoder layers (implies "
+        "--split-fused for layer 0). Required for full-depth "
+        "bit-equality with vLLM's standalone-norm + linear path.",
+    )
+    p.add_argument(
+        "--no-rope-fusion",
+        action="store_true",
+        help="Disable TE fused RoPE (apply_rope_fusion=False) to "
+        "match vLLM's bf16-cast-of-cos/sin precision behavior.",
+    )
+    p.add_argument(
+        "--vllm-rope",
+        action="store_true",
+        help="Monkey-patch Megatron's apply_rotary_pos_emb with a "
+        "PyTorch RoPE that reproduces vLLM's exact precision "
+        "behaviour (bf16 cos/sin cache, fp32 rotation, single "
+        "bf16 cast at end).",
+    )
+    p.add_argument(
+        "--vllm-swiglu",
+        action="store_true",
+        help="Monkey-patch Megatron's swiglu to bypass torch.compile "
+        "fusion and match vLLM's two-rounding-event SwiGLU "
+        "(eager F.silu then bf16 multiply).",
+    )
+    p.add_argument(
+        "--vllm-sdpa",
+        action="store_true",
+        help="Monkey-patch TE DotProductAttention to call vLLM's "
+        "FA2 (flash_attn_varlen_func, fa_version=2, "
+        "num_splits=1) — the kernel vLLM actually uses under "
+        "VLLM_BATCH_INVARIANT=1 on Blackwell.",
+    )
+    p.add_argument(
+        "--vllm-paged-sdpa",
+        action="store_true",
+        help="Monkey-patch TE DotProductAttention to mirror vLLM "
+        "decoder prefill attention: write K/V with "
+        "reshape_and_cache_flash, then call FA2 with "
+        "key_cache/value_cache, block_table, and seqused_k.",
+    )
+    p.add_argument(
+        "--vllm-paged-block-size",
+        type=int,
+        default=16,
+        help="KV-cache block size for --vllm-paged-sdpa. vLLM's "
+        "default FlashAttention block size is 16.",
+    )
+    p.add_argument(
+        "--vllm-rmsnorm",
+        action="store_true",
+        help="Monkey-patch Megatron's BI RMSNorm to use 1/sqrt(...) "
+        "instead of torch.rsqrt(...), matching vLLM's original "
+        "Triton BI RMSNorm kernel bit-for-bit. Only meaningful "
+        "in combination with --batch-invariant.",
+    )
+    p.add_argument(
+        "--mxfp8",
+        action="store_true",
+        help="Enable MXFP8 (Blackwell-only). Configures the model "
+        "provider with fp8=<format> and fp8_recipe='mxfp8' so "
+        "TE's fp8_autocast wraps every decoder layer.",
+    )
+    p.add_argument(
+        "--fp8-format",
+        default="e4m3",
+        choices=["e4m3", "hybrid"],
+        help="FP8 element format used by the MXFP8 recipe (default: "
+        "e4m3). 'hybrid' uses e4m3 for fwd and e5m2 for bwd. "
+        "Only meaningful with --mxfp8.",
+    )
+    p.add_argument(
+        "--mxfp8-bi-dequant",
+        action="store_true",
+        help="Under --mxfp8 --batch-invariant, dequant MXFP8 operands "
+        "to bf16 and route through the BF16 BI matmul "
+        "(install_mxfp8_dequant_for_bi_gemm). Default is the "
+        "passthrough patch which just lets MXFP8 GEMMs use TE's "
+        "original cuBLASLt kernel.",
+    )
+    p.add_argument(
+        "--capture-debug-tensors",
+        action="store_true",
+        help="Save layer-entry tensors for every decoder layer and "
+        "input/output tensors for every module in decoder layer 0.",
+    )
     args = p.parse_args()
+    if args.vllm_sdpa and args.vllm_paged_sdpa:
+        raise SystemExit("--vllm-sdpa and --vllm-paged-sdpa are mutually exclusive")
     if args.split_all_fused:
-        args.split_fused = True   # imply layer-0 split when all-layers split
+        args.split_fused = True  # imply layer-0 split when all-layers split
     if args.output is None:
         args.output = default_output(
             args.batch_invariant,
@@ -708,6 +964,7 @@ def parse_args():
             args.vllm_rmsnorm,
             args.split_all_fused,
             args.mxfp8,
+            args.vllm_paged_sdpa,
         )
     return args
 
@@ -719,6 +976,7 @@ def main():
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             enable_batch_invariant_mode,
         )
+
         enable_batch_invariant_mode()
         print_rank_0("[megatron] batch_invariant_mode ENABLED")
         if args.mxfp8:
@@ -726,18 +984,24 @@ def main():
                 install_mxfp8_compact_scales()
                 install_mxfp8_dequant_for_bi_gemm()
                 print_rank_0("[megatron] MXFP8 quantizers forced to compact scales")
-                print_rank_0("[megatron] BI GEMM patch wrapped: MXFP8 tensors "
-                             "dequant -> bf16 -> BF16 BI matmul (matmul_persistent)")
+                print_rank_0(
+                    "[megatron] BI GEMM patch wrapped: MXFP8 tensors "
+                    "dequant -> bf16 -> BF16 BI matmul (matmul_persistent)"
+                )
             else:
                 install_mxfp8_passthrough_for_bi_gemm()
-                print_rank_0("[megatron] BI GEMM patch wrapped: MXFP8 tensors "
-                             "passthrough to TE's original general_gemm; "
-                             "BF16 ops still hit BI Triton")
+                print_rank_0(
+                    "[megatron] BI GEMM patch wrapped: MXFP8 tensors "
+                    "passthrough to TE's original general_gemm; "
+                    "BF16 ops still hit BI Triton"
+                )
 
     if args.vllm_rmsnorm:
         if not args.batch_invariant:
-            raise SystemExit("--vllm-rmsnorm requires --batch-invariant "
-                             "(patches the BI RMSNorm autograd function)")
+            raise SystemExit(
+                "--vllm-rmsnorm requires --batch-invariant "
+                "(patches the BI RMSNorm autograd function)"
+            )
         install_vllm_style_rmsnorm()
         print_rank_0("[megatron] vllm-style RMSNorm patched (1/sqrt instead of rsqrt)")
 
@@ -752,8 +1016,20 @@ def main():
         print_rank_0("[megatron] vllm-style SwiGLU patched (eager F.silu + bf16 mul)")
 
     if args.vllm_sdpa:
-        install_vllm_style_sdpa()
-        print_rank_0("[megatron] TE DotProductAttention.forward patched -> vLLM FA2 (num_splits=1)")
+        install_vllm_style_sdpa(paged_kv=False)
+        print_rank_0(
+            "[megatron] TE DotProductAttention.forward patched -> vLLM FA2 (num_splits=1)"
+        )
+    if args.vllm_paged_sdpa:
+        install_vllm_style_sdpa(
+            paged_kv=True,
+            paged_block_size=args.vllm_paged_block_size,
+        )
+        print_rank_0(
+            "[megatron] TE DotProductAttention.forward patched -> "
+            "vLLM paged-KV FA2 "
+            f"(block_size={args.vllm_paged_block_size}, num_splits=1)"
+        )
 
     print_rank_0(f"[megatron] loading bridge for {args.model}")
     bridge = AutoBridge.from_hf_pretrained(
@@ -780,7 +1056,9 @@ def main():
         # TE quantizes per-block (1x32, E8M0 scales) at the GEMM boundary.
         model_provider.fp8 = args.fp8_format
         model_provider.fp8_recipe = "mxfp8"
-        print_rank_0(f"[megatron] MXFP8 enabled: fp8={args.fp8_format}, fp8_recipe=mxfp8")
+        print_rank_0(
+            f"[megatron] MXFP8 enabled: fp8={args.fp8_format}, fp8_recipe=mxfp8"
+        )
 
     model_provider.finalize()
     model_provider.initialize_model_parallel(seed=0)
@@ -803,46 +1081,73 @@ def main():
         args.num_prompts,
         args.dataset_seed,
     )
-    token_ids_list = [
-        tokenizer.encode(p, add_special_tokens=True) for p in prompts
-    ]
+    token_ids_list = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
     seq_lens = [len(ids) for ids in token_ids_list]
-    print_rank_0(f"[megatron] dataset: {args.dataset}:{args.dataset_subset}:"
-                 f"{args.dataset_split} field={args.dataset_field!r} "
-                 f"n={len(prompts)}")
-    print_rank_0(f"[megatron] seq_len min/mean/max = {min(seq_lens)}/"
-                 f"{sum(seq_lens) / len(seq_lens):.1f}/{max(seq_lens)}")
+    print_rank_0(
+        f"[megatron] dataset: {args.dataset}:{args.dataset_subset}:"
+        f"{args.dataset_split} field={args.dataset_field!r} "
+        f"n={len(prompts)}"
+    )
+    print_rank_0(
+        f"[megatron] seq_len min/mean/max = {min(seq_lens)}/"
+        f"{sum(seq_lens) / len(seq_lens):.1f}/{max(seq_lens)}"
+    )
+    if args.vllm_sdpa or args.vllm_paged_sdpa:
+        set_vllm_style_sdpa_seq_lens(seq_lens)
+        if args.vllm_paged_sdpa:
+            print_rank_0("[megatron] vllm-paged SDPA using actual seq_lens")
+        else:
+            print_rank_0("[megatron] vllm-style SDPA using packed actual seq_lens")
 
     # Pad all prompts to a common length so they fit in one (B, S) tensor. Under
     # MXFP8 the per-block scaling kernel requires every dim to be a multiple of
     # 32 — round seq_len up accordingly. Causal attention makes the pad
     # positions invisible to the real token positions, so per-prompt last-token
     # logits are unaffected.
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    pad_id = (
+        tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else tokenizer.eos_token_id
+    )
     padded_seq_len = max(seq_lens)
     if args.mxfp8 and padded_seq_len % 32 != 0:
         padded_seq_len = ((padded_seq_len + 31) // 32) * 32
-        print_rank_0(f"[megatron] padded seq_len {max(seq_lens)} -> {padded_seq_len} "
-                     "for MXFP8 (TE MXFP8 block size requires divisibility by 32)")
+        print_rank_0(
+            f"[megatron] padded seq_len {max(seq_lens)} -> {padded_seq_len} "
+            "for MXFP8 (TE MXFP8 block size requires divisibility by 32)"
+        )
 
-    padded_ids = [ids + [pad_id] * (padded_seq_len - len(ids)) for ids in token_ids_list]
+    padded_ids = [
+        ids + [pad_id] * (padded_seq_len - len(ids)) for ids in token_ids_list
+    ]
     input_ids = torch.tensor(padded_ids, dtype=torch.long, device="cuda")
-    position_ids = torch.arange(
-        input_ids.size(1), dtype=torch.long, device=input_ids.device
-    ).unsqueeze(0).expand_as(input_ids)
+    position_ids = (
+        torch.arange(input_ids.size(1), dtype=torch.long, device=input_ids.device)
+        .unsqueeze(0)
+        .expand_as(input_ids)
+    )
 
     assert len(model_list) == 1, "expected one model chunk with pp=1"
     inner = unwrap(model_list[0])
 
     if args.split_all_fused:
         n_split = split_all_layers_fused(inner.decoder, inner.config)
-        print_rank_0(f"[megatron] split fused LN+Linear on ALL {n_split} decoder layers "
-                     "(linear_qkv -> SplitNormLinear, linear_fc1 -> SplitNormLinear)")
+        print_rank_0(
+            f"[megatron] split fused LN+Linear on ALL {n_split} decoder layers "
+            "(linear_qkv -> SplitNormLinear, linear_fc1 -> SplitNormLinear)"
+        )
     elif args.split_fused:
         split_first_layer_fused(inner.decoder.layers[0], inner.config)
-        print_rank_0("[megatron] split fused LN+Linear on first layer "
-                     "(linear_qkv -> SplitNormLinear(norm, linear), "
-                     "linear_fc1 -> SplitNormLinear(norm, linear))")
+        print_rank_0(
+            "[megatron] split fused LN+Linear on first layer "
+            "(linear_qkv -> SplitNormLinear(norm, linear), "
+            "linear_fc1 -> SplitNormLinear(norm, linear))"
+        )
+
+    debug_capture = {}
+    if args.capture_debug_tensors:
+        hook_info = install_debug_tensor_hooks(inner)
+        print_rank_0(f"[megatron] debug tensor hooks installed: {hook_info}")
 
     with torch.no_grad():
         fwd_bwd = get_forward_backward_func()
@@ -875,12 +1180,21 @@ def main():
         last_token_logits_cpu = logits_cpu[torch.arange(len(prompts)), idx]
 
     if dist.is_initialized() and dist.get_rank() == 0:
+        if args.capture_debug_tensors:
+            debug_capture = get_debug_tensor_capture(inner)
+            num_first_layer = len(debug_capture.get("first_layer_inputs", {}))
+            num_layers = debug_capture.get("num_layers", "?")
+            print(
+                f"[megatron] captured {num_first_layer} layer-0 modules; "
+                f"num_layers={num_layers}"
+            )
         payload = {
             "prompts": prompts,
             "token_ids_list": token_ids_list,
             "seq_lens": seq_lens,
             "last_token_logits": last_token_logits_cpu,
         }
+        payload.update(debug_capture)
         torch.save(payload, args.output)
         print(f"[megatron] saved capture to {args.output}")
 
