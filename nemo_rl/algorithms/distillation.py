@@ -49,6 +49,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation import should_skip_vllm_refit
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
@@ -455,12 +456,19 @@ def setup(
         init_reference_model=False,
     )
 
-    if student_generation is not None:
+    skip_generation_refit = should_skip_vllm_refit(generation_config)
+    if student_generation is not None and not skip_generation_refit:
         state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
+    elif student_generation is not None:
+        print(
+            "Skipping vLLM refit metadata preparation because "
+            "policy.generation.vllm_cfg.skip_refit=true.",
+            flush=True,
+        )
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and not skip_generation_refit:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()
@@ -475,6 +483,12 @@ def setup(
         )  # type: ignore
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
+    elif not colocated_inference and skip_generation_refit:
+        print(
+            "Skipping policy/generation collective initialization because "
+            "policy.generation.vllm_cfg.skip_refit=true.",
+            flush=True,
+        )
 
     loss_fn = DistillationLossFn(loss_config)
 
@@ -529,6 +543,13 @@ def distillation_train(
     if student_generation is None:
         student_generation = student_policy  # type: ignore
         NEED_REFIT = False
+    elif should_skip_vllm_refit(master_config.policy["generation"]):
+        NEED_REFIT = False
+        print(
+            "Skipping student policy-to-vLLM refit because "
+            "policy.generation.vllm_cfg.skip_refit=true.",
+            flush=True,
+        )
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
 

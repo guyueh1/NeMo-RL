@@ -28,7 +28,10 @@ from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    should_skip_vllm_refit,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
@@ -201,6 +204,35 @@ def test_vllm_worker_sleep_uses_discard_weight_level(monkeypatch):
     worker.llm.sleep.assert_called_once_with(level=2)
 
 
+def test_vllm_generation_install_batch_invariant_rmsnorm_patch(monkeypatch):
+    vllm_generation = VllmGeneration.__new__(VllmGeneration)
+    vllm_generation.worker_group = MagicMock()
+    vllm_generation.worker_group.run_all_workers_single_data.return_value = [
+        "worker_future"
+    ]
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+        lambda futures: [{"already_installed": False, "rebound_count": 65}],
+    )
+
+    result = vllm_generation.install_batch_invariant_rmsnorm_patch()
+
+    assert result == [{"already_installed": False, "rebound_count": 65}]
+    vllm_generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "install_batch_invariant_rmsnorm_patch",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+def test_vllm_worker_install_batch_invariant_rmsnorm_patch_rejects_async():
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = MagicMock()
+
+    with pytest.raises(RuntimeError, match="sync vLLM"):
+        worker.install_batch_invariant_rmsnorm_patch()
+
+
 @pytest.mark.asyncio
 async def test_vllm_async_worker_sleep_uses_discard_weight_level(monkeypatch):
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
@@ -268,6 +300,30 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
+def test_configure_generation_config_skip_refit_uses_real_startup_weights():
+    """skip_refit mode keeps vLLM on model_name weights without policy weight sync."""
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_cfg"]["skip_refit"] = True
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    with pytest.warns(UserWarning, match="vllm_cfg.skip_refit=True"):
+        configured = configure_generation_config(
+            vllm_config,
+            tokenizer,
+            is_eval=False,
+        )
+
+    assert configured["vllm_cfg"]["load_format"] == "auto"
+
+
+def test_should_skip_vllm_refit_reads_vllm_cfg_flag():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    assert not should_skip_vllm_refit(vllm_config)
+
+    vllm_config["vllm_cfg"]["skip_refit"] = True
+    assert should_skip_vllm_refit(vllm_config)
 
 
 def get_basic_megatron_test_config(

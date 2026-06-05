@@ -802,6 +802,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    def install_debug_tensor_hooks(self, max_calls_per_module: int = 1) -> list[Any]:
+        """Install tensor dump hooks on policy workers."""
+        return self.run_all_workers_single_data(
+            "install_debug_tensor_hooks",
+            max_calls_per_module=max_calls_per_module,
+        )
+
+    def clear_debug_tensor_capture(self) -> list[Any]:
+        """Clear policy tensor captures while keeping hooks installed."""
+        return self.run_all_workers_single_data("clear_debug_tensor_capture")
+
+    def save_debug_tensor_capture(
+        self, output_dir: str, prefix: str, step: int
+    ) -> list[Any]:
+        """Save tensor captures from policy workers."""
+        return self.run_all_workers_single_data(
+            "save_debug_tensor_capture",
+            output_dir=output_dir,
+            prefix=prefix,
+            step=step,
+        )
+
     def invalidate_kv_cache(self, *args: Any, **kwargs: Any) -> bool:
         # We don't need to do anything here
         return True

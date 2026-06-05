@@ -15,6 +15,7 @@
 import copy
 import gc
 import os
+import pprint
 import sys
 from importlib.util import find_spec
 from typing import Any, Optional, cast
@@ -35,6 +36,17 @@ from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generati
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+
+def _dump_debug_vllm_kwargs(label: str, kwargs: dict[str, Any]) -> None:
+    if os.environ.get("NEMO_RL_DUMP_VLLM_ENGINE_ARGS") != "1":
+        return
+
+    print(
+        f"[vllm-engine-args] {label} pid={os.getpid()}\n"
+        f"{pprint.pformat(kwargs, sort_dicts=True)}",
+        flush=True,
+    )
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -144,6 +156,11 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
+        self.use_batch_invariant_rmsnorm = (
+            self.cfg["vllm_cfg"].get("use_batch_invariant_rmsnorm", None) is True
+        )
+        if self.use_batch_invariant_rmsnorm:
+            os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -569,6 +586,7 @@ class BaseVllmGenerationWorker:
             logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
+        _dump_debug_vllm_kwargs("nemo_rl.sync_llm", llm_kwargs)
 
         self._create_engine(llm_kwargs)
 
@@ -612,16 +630,18 @@ class BaseVllmGenerationWorker:
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
 
-        return self.SamplingParams(
-            temperature=temperature,
-            top_p=self.cfg["top_p"],
-            top_k=top_k_val,
-            max_tokens=max_tokens,
-            logprobs=0,
-            stop_token_ids=self.cfg["stop_token_ids"],
-            stop=stop_strings,
-            include_stop_str_in_output=True,
-        )
+        sampling_kwargs = {
+            "temperature": temperature,
+            "top_p": self.cfg["top_p"],
+            "top_k": top_k_val,
+            "max_tokens": max_tokens,
+            "logprobs": 0,
+            "stop_token_ids": self.cfg["stop_token_ids"],
+            "stop": stop_strings,
+            "include_stop_str_in_output": True,
+        }
+        _dump_debug_vllm_kwargs("nemo_rl.generate_sampling", sampling_kwargs)
+        return self.SamplingParams(**sampling_kwargs)
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
@@ -634,6 +654,87 @@ class BaseVllmGenerationWorker:
         torch.cuda.profiler.stop()
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+
+    def install_batch_invariant_rmsnorm_patch(self) -> list[dict[str, Any]]:
+        """Install the batch-invariant residual RMSNorm patch."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "Batch-invariant residual RMSNorm patch is currently supported "
+                "only with sync vLLM. Set "
+                "policy.generation.vllm_cfg.async_engine=false."
+            )
+        results = self.llm.collective_rpc(
+            "install_batch_invariant_rmsnorm_patch",
+            args=tuple(),
+        )
+        return cast(list[dict[str, Any]], results)
+
+    def install_debug_tensor_hooks(
+        self, max_calls_per_module: int = 1
+    ) -> list[dict[str, Any]]:
+        """Install tensor dump hooks on the vLLM engine model."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "Tensor dump hooks are currently supported only with sync vLLM. "
+                "Set policy.generation.vllm_cfg.async_engine=false."
+            )
+        results = self.llm.collective_rpc(
+            "install_debug_tensor_hooks",
+            args=(max_calls_per_module,),
+        )
+        return cast(list[dict[str, Any]], results)
+
+    def inspect_layernorm_impl(self) -> list[dict[str, Any]]:
+        """Inspect the runtime vLLM layernorm implementation."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "Layernorm implementation inspection is currently supported only "
+                "with sync vLLM. Set policy.generation.vllm_cfg.async_engine=false."
+            )
+        results = self.llm.collective_rpc(
+            "inspect_layernorm_impl",
+            args=tuple(),
+        )
+        return cast(list[dict[str, Any]], results)
+
+    def clear_debug_tensor_capture(self) -> list[dict[str, Any]]:
+        """Clear captured tensors while preserving installed vLLM hooks."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "Tensor dump hooks are currently supported only with sync vLLM. "
+                "Set policy.generation.vllm_cfg.async_engine=false."
+            )
+        results = self.llm.collective_rpc(
+            "clear_debug_tensor_capture",
+            args=tuple(),
+        )
+        return cast(list[dict[str, Any]], results)
+
+    def save_debug_tensor_capture(
+        self, output_dir: str, prefix: str, step: int
+    ) -> list[dict[str, Any]]:
+        """Save captured tensors from each vLLM internal worker."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "Tensor dump hooks are currently supported only with sync vLLM. "
+                "Set policy.generation.vllm_cfg.async_engine=false."
+            )
+        worker_label = f"outer_pid{os.getpid()}"
+        results = self.llm.collective_rpc(
+            "save_debug_tensor_capture",
+            args=(output_dir, prefix, step, worker_label),
+        )
+        return cast(list[dict[str, Any]], results)
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get speculative decoding metrics from the vLLM engine.
@@ -827,6 +928,92 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
 
         return return_data
+
+    @wrap_with_nvtx_name("vllm_genertion_worker/score_prompt_logprobs")
+    def score_prompt_logprobs(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[dict[str, torch.Tensor]]:
+        """Score each token in a full sequence using vLLM prompt logprobs."""
+        if len(data["input_ids"]) == 0:
+            return BatchedDataDict(
+                {
+                    "logprobs": torch.zeros((0, 0), dtype=torch.float32),
+                    "input_lengths": torch.zeros(0, dtype=torch.long),
+                }
+            )
+
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
+        input_ids = data["input_ids"]
+        input_lengths = data["input_lengths"]
+        prompts = format_prompt_for_vllm_generation(data)
+        sampling_kwargs = {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "max_tokens": 1,
+            "logprobs": None,
+            "prompt_logprobs": 0,
+            "ignore_eos": True,
+        }
+        _dump_debug_vllm_kwargs("nemo_rl.prefill_score_sampling", sampling_kwargs)
+        sampling_params = self.SamplingParams(**sampling_kwargs)
+
+        assert self.llm is not None, (
+            "Attempting to score with either an uninitialized vLLM or non-model-owner"
+        )
+        outputs = self.llm.generate(prompts, sampling_params)
+
+        logprobs = torch.zeros_like(input_ids, dtype=torch.float32)
+        for sample_idx, output in enumerate(outputs):
+            prompt_logprobs = output.prompt_logprobs
+            if prompt_logprobs is None:
+                raise RuntimeError(
+                    f"vLLM did not return prompt_logprobs for sample {sample_idx}"
+                )
+            valid_length = int(input_lengths[sample_idx].item())
+            for token_pos in range(1, valid_length):
+                logprobs_index = self._prompt_logprobs_index(
+                    prompt_logprobs=prompt_logprobs,
+                    token_position=token_pos,
+                    num_tokens=valid_length,
+                )
+                token_id = int(input_ids[sample_idx, token_pos].item())
+                logprobs[sample_idx, token_pos] = self._selected_logprob(
+                    prompt_logprobs[logprobs_index], token_id
+                )
+
+        return BatchedDataDict(
+            {
+                "logprobs": logprobs,
+                "input_lengths": input_lengths.detach().clone(),
+            }
+        )
+
+    @staticmethod
+    def _prompt_logprobs_index(
+        *, prompt_logprobs: list[Any], token_position: int, num_tokens: int
+    ) -> int:
+        if len(prompt_logprobs) == num_tokens:
+            return token_position
+        if len(prompt_logprobs) == num_tokens - 1:
+            return token_position - 1
+        raise RuntimeError(
+            f"unexpected prompt_logprobs length {len(prompt_logprobs)} for "
+            f"{num_tokens} prompt tokens"
+        )
+
+    @staticmethod
+    def _selected_logprob(logprob_dict: dict[int, Any] | None, token_id: int) -> float:
+        if logprob_dict is None:
+            raise RuntimeError(f"missing prompt logprob dictionary for {token_id=}")
+        logprob = logprob_dict.get(token_id)
+        if logprob is None:
+            available = ", ".join(str(key) for key in list(logprob_dict)[:8])
+            raise RuntimeError(
+                f"selected {token_id=} not present in prompt logprobs; "
+                f"first available keys: {available}"
+            )
+        return float(logprob.logprob)
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate_text")
     def generate_text(

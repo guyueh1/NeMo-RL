@@ -68,6 +68,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation import should_skip_vllm_refit
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -599,6 +600,21 @@ def setup(
         """Initialize vLLM generation workers."""
         t0 = time.perf_counter()
         pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
+        if (
+            generation_config["vllm_cfg"].get("use_batch_invariant_rmsnorm", None)
+            is True
+        ):
+            if generation_config["vllm_cfg"]["async_engine"]:
+                raise ValueError(
+                    "policy.generation.vllm_cfg.use_batch_invariant_rmsnorm=True "
+                    "requires policy.generation.vllm_cfg.async_engine=false."
+                )
+            patch_info = pg.install_batch_invariant_rmsnorm_patch()
+            print(
+                "  ✓ Installed vLLM batch-invariant residual RMSNorm patch: "
+                f"{patch_info}",
+                flush=True,
+            )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -671,6 +687,7 @@ def setup(
         return policy_generation, policy
 
     # Handle generation-specific setup
+    skip_generation_refit = should_skip_vllm_refit(generation_config)
     if backend == "megatron":
         # Megatron generation: policy_generation is None, only initialize policy
         policy_generation = None
@@ -751,7 +768,7 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and not skip_generation_refit:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -769,11 +786,23 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    elif not colocated_inference and skip_generation_refit:
+        print(
+            "Skipping policy/generation collective initialization because "
+            "policy.generation.vllm_cfg.skip_refit=true.",
+            flush=True,
+        )
 
     # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
+    if policy_generation is not None and not skip_generation_refit:
+        state_dict_info = policy.prepare_refit_info()
         policy_generation.prepare_refit_info(state_dict_info)
+    elif policy_generation is not None:
+        print(
+            "Skipping vLLM refit metadata preparation because "
+            "policy.generation.vllm_cfg.skip_refit=true.",
+            flush=True,
+        )
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -1359,6 +1388,13 @@ def grpo_train(
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
+    elif should_skip_vllm_refit(master_config.policy["generation"]):
+        NEED_REFIT = False
+        print(
+            "Skipping policy-to-vLLM refit because "
+            "policy.generation.vllm_cfg.skip_refit=true.",
+            flush=True,
+        )
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
@@ -2529,6 +2565,13 @@ def async_grpo_train(
     if policy_generation is None:
         policy_generation = policy
         NEED_REFIT = False
+    elif should_skip_vllm_refit(master_config.policy["generation"]):
+        NEED_REFIT = False
+        print(
+            "Skipping policy-to-vLLM refit because "
+            "policy.generation.vllm_cfg.skip_refit=true.",
+            flush=True,
+        )
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 

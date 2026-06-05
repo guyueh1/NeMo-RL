@@ -201,8 +201,6 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
 
-
-
         # Install vLLM kernel-matching monkey-patches so Megatron's forward
         # numerics match vLLM bit-for-bit. Runs after enable_batch_invariant_mode
         # (inside setup_model_and_optimizer) but before any forward pass.
@@ -225,12 +223,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         if match_vllm_kernels:
             from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
                 install_match_vllm_kernels,
-                split_all_layers_fused_layernorm_linear,
             )
 
             install_match_vllm_kernels()
-        #     split_all_layers_fused_layernorm_linear(model_and_optimizer_state.model)
-
 
         fp8_cfg = megatron_cfg_dict.get("fp8_cfg", None)
         mxfp8_active = (
@@ -315,6 +310,46 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+    def install_debug_tensor_hooks(
+        self, max_calls_per_module: int = 1
+    ) -> dict[str, Any]:
+        """Install tensor dump hooks on the Megatron policy model."""
+        from nemo_rl.utils.debug_tensor_capture import install_debug_tensor_hooks
+
+        return install_debug_tensor_hooks(
+            self.model,
+            max_calls_per_module=max_calls_per_module,
+        )
+
+    def clear_debug_tensor_capture(self) -> dict[str, Any]:
+        """Clear captured tensors while preserving installed Megatron hooks."""
+        from nemo_rl.utils.debug_tensor_capture import clear_debug_tensor_capture
+
+        return clear_debug_tensor_capture(self.model)
+
+    def save_debug_tensor_capture(
+        self, output_dir: str, prefix: str, step: int
+    ) -> dict[str, Any]:
+        """Save captured Megatron policy tensors for this rank."""
+        from nemo_rl.utils.debug_tensor_capture import save_debug_tensor_capture
+
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else self.rank
+        )
+        path = os.path.join(output_dir, f"{prefix}_step{step:06d}_rank{rank}.pt")
+        return save_debug_tensor_capture(
+            self.model,
+            path,
+            metadata={
+                "framework": "megatron",
+                "rank": rank,
+                "pid": os.getpid(),
+                "step": step,
+            },
+        )
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)

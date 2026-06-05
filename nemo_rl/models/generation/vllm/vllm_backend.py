@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import os
 import traceback
 from typing import Any
 
@@ -52,6 +53,64 @@ def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor
 
 
 class VllmInternalWorkerExtension:
+    def install_batch_invariant_rmsnorm_patch(self) -> dict[str, Any]:
+        """Install the batch-invariant residual RMSNorm patch on vLLM."""
+        from nemo_rl.models.generation.vllm.batch_invariant import (
+            install_batch_invariant_rmsnorm_patch,
+        )
+
+        return install_batch_invariant_rmsnorm_patch(self.model_runner.model)
+
+    def install_debug_tensor_hooks(
+        self, max_calls_per_module: int = 1
+    ) -> dict[str, Any]:
+        """Install tensor dump hooks on the vLLM engine model."""
+        from nemo_rl.utils.debug_tensor_capture import install_debug_tensor_hooks
+
+        return install_debug_tensor_hooks(
+            self.model_runner.model,
+            max_calls_per_module=max_calls_per_module,
+        )
+
+    def inspect_layernorm_impl(self) -> dict[str, Any]:
+        """Inspect the runtime vLLM layernorm implementation."""
+        from nemo_rl.utils.debug_tensor_capture import inspect_vllm_layernorm_impl
+
+        return inspect_vllm_layernorm_impl(self.model_runner.model)
+
+    def clear_debug_tensor_capture(self) -> dict[str, Any]:
+        """Clear captured tensors while preserving installed vLLM hooks."""
+        from nemo_rl.utils.debug_tensor_capture import clear_debug_tensor_capture
+
+        return clear_debug_tensor_capture(self.model_runner.model)
+
+    def save_debug_tensor_capture(
+        self,
+        output_dir: str,
+        prefix: str,
+        step: int,
+        worker_label: str,
+    ) -> dict[str, Any]:
+        """Save captured vLLM tensors for this internal worker."""
+        from nemo_rl.utils.debug_tensor_capture import save_debug_tensor_capture
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        path = os.path.join(
+            output_dir,
+            f"{prefix}_step{step:06d}_{worker_label}_vllm_rank{rank}_pid{os.getpid()}.pt",
+        )
+        return save_debug_tensor_capture(
+            self.model_runner.model,
+            path,
+            metadata={
+                "framework": "vllm",
+                "rank": rank,
+                "pid": os.getpid(),
+                "worker_label": worker_label,
+                "step": step,
+            },
+        )
+
     def init_collective(
         self,
         rank_prefix: int,

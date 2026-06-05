@@ -149,6 +149,8 @@ class VllmGeneration(GenerationInterface):
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
+        if self.cfg["vllm_cfg"].get("use_batch_invariant_rmsnorm", None) is True:
+            env_vars["VLLM_BATCH_INVARIANT"] = "1"
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
@@ -512,6 +514,40 @@ class VllmGeneration(GenerationInterface):
 
         return combined
 
+    def score_prompt_logprobs(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[dict[str, Any]]:
+        """Score full sequences with vLLM prompt logprobs."""
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "score_prompt_logprobs is currently supported only with sync vLLM. "
+                "Set policy.generation.vllm_cfg.async_engine=false."
+            )
+
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "input_ids and input_lengths are required in data for vLLM scoring"
+        )
+
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
+            dp_size, allow_uneven_shards=True
+        )
+        future_bundle = self.worker_group.run_all_workers_sharded_data(
+            "score_prompt_logprobs",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=None,
+            output_is_replicated=None,
+        )
+        results = self.worker_group.get_all_worker_results(future_bundle)
+        return BatchedDataDict.from_batches(
+            results,
+            pad_value_dict={"logprobs": 0},
+        )
+
     def generate_text(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -815,6 +851,52 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
+
+    def install_batch_invariant_rmsnorm_patch(self) -> list[Any]:
+        """Install the batch-invariant residual RMSNorm patch on vLLM workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "install_batch_invariant_rmsnorm_patch",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
+    def install_debug_tensor_hooks(self, max_calls_per_module: int = 1) -> list[Any]:
+        """Install tensor dump hooks on generation workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "install_debug_tensor_hooks",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            max_calls_per_module=max_calls_per_module,
+        )
+        return ray.get(futures)
+
+    def inspect_layernorm_impl(self) -> list[Any]:
+        """Inspect runtime layernorm implementation on generation workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "inspect_layernorm_impl",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
+    def clear_debug_tensor_capture(self) -> list[Any]:
+        """Clear generation tensor captures while keeping hooks installed."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "clear_debug_tensor_capture",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
+    def save_debug_tensor_capture(
+        self, output_dir: str, prefix: str, step: int
+    ) -> list[Any]:
+        """Save tensor captures from generation workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "save_debug_tensor_capture",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            output_dir=output_dir,
+            prefix=prefix,
+            step=step,
+        )
+        return ray.get(futures)
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
