@@ -95,7 +95,6 @@ def install_vllm_style_rmsnorm() -> None:
 
         @staticmethod
         def forward(ctx, x, weight, eps, zero_centered_gamma):
-            print("[guyueh] _VllmStyleBatchInvariantRMSNormFn.forward")
             if not x.is_cuda:
                 raise RuntimeError("Batch-invariant RMSNorm requires CUDA tensors.")
             w_eff = (weight + 1.0) if zero_centered_gamma else weight
@@ -144,29 +143,58 @@ def install_vllm_style_rmsnorm() -> None:
 
 
 def install_vllm_style_rmsnom_to_te() -> None:
-    from transformer_engine.pytorch.module import _common as te_common_mod
-    from vllm.model_executor.layers.batch_invariant import (
-        rms_norm as vllm_rms_norm_triton,
+    from megatron.core.transformer.custom_layers import (
+        batch_invariant_kernels as bik_mod,
     )
 
-    orig_apply_norm = te_common_mod.apply_normalization
+    te_modules = []
+    for module_name in (
+        "transformer_engine.pytorch.module._common",
+        "transformer_engine.pytorch.module.layernorm_linear",
+        "transformer_engine.pytorch.module.layernorm_mlp",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if hasattr(module, "apply_normalization"):
+            te_modules.append(module)
+
+    if not te_modules:
+        raise RuntimeError("could not find TE apply_normalization entry points")
+
+    orig_apply_norm = te_modules[0].apply_normalization
 
     def apply_norm(*args, **kwargs):
         normalization = args[7] if len(args) > 7 else kwargs["normalization"]
-        if not normalization == "RMSNorm":
+        if normalization != "RMSNorm":
             return orig_apply_norm(*args, **kwargs)
-        print("[guyueh] apply_norm")
-        x, weight, eps, zero_centered_gamma = args[0], args[2], args[4], args[-1]
-        w_eff = (weight + 1.0) if zero_centered_gamma else weight
-        out = vllm_rms_norm_triton(x, w_eff, eps)
-        _, mu, sigma = orig_apply_norm(*args, **kwargs)
-        return out, mu, sigma
+        x = args[0] if len(args) > 0 else kwargs["inputmat"]
+        ln_out = args[1] if len(args) > 1 else kwargs.get("ln_out")
+        weight = args[2] if len(args) > 2 else kwargs["ln_weight"]
+        eps = args[4] if len(args) > 4 else kwargs["eps"]
+        zero_centered_gamma = (
+            args[9] if len(args) > 9 else kwargs["zero_centered_gamma"]
+        )
+        out = bik_mod.BatchInvariantRMSNormFn.apply(
+            x,
+            weight,
+            eps,
+            zero_centered_gamma,
+        )
+        if ln_out is not None:
+            ln_out.copy_(out)
+            out = ln_out
 
-    te_common_mod.apply_normalization = apply_norm
+        # TE's fused LayerNormLinear custom autograd saves rsigma from
+        # apply_normalization for backward. Forward matching is what we need for
+        # logprob comparisons, but returning a formula-consistent rsigma keeps
+        # the custom backward path well-formed.
+        rsigma = torch.rsqrt((x.float() * x.float()).mean(dim=-1) + eps)
+        return out, None, rsigma
 
-    from transformer_engine.pytorch import module as te_module_mod
-
-    te_module_mod.apply_normalization = apply_norm
+    for module in te_modules:
+        module.apply_normalization = apply_norm
 
 
 def install_vllm_style_rope() -> None:
@@ -191,7 +219,6 @@ def install_vllm_style_rope() -> None:
         mscale: float = 1.0,
         cp_group=None,
     ):
-        print("[guyueh] _vllm_style_apply_rope")
         assert cu_seqlens is None, "vllm-style RoPE patch only supports non-thd"
         rot_dim = freqs.shape[-1]
         t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
@@ -253,13 +280,11 @@ def install_vllm_style_swiglu() -> None:
     import torch.nn.functional as F
 
     def _vllm_style_swiglu(y):
-        print("[guyueh] _vllm_style_swiglu")
         y_1, y_2 = torch.chunk(y, 2, -1)
         silu_out = F.silu(y_1)
         return silu_out * y_2
 
     def _vllm_style_bias_swiglu(y, bias):
-        print("[guyueh] _vllm_style_bias_swiglu")
         return _vllm_style_swiglu(y + bias)
 
     swg_mod.swiglu = _vllm_style_swiglu
@@ -753,10 +778,44 @@ def install_mxfp8_dequant_for_bi_gemm() -> None:
 
     extract = bik_mod._extract_te_gemm_args
     bi_gemm_fn = bik_mod.BatchInvariantTEGemmFn
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        dequant_mxfp8_to_bf16,
+        mxfp8_e4m3_quantize,
+    )
 
-    def _maybe_dequant_to_bf16(t):
+    def _maybe_dequant_to_bf16(
+        t,
+        *,
+        quantize_plain_tensor: bool,
+    ):
         if t is None or isinstance(t, torch.Tensor):
+            if isinstance(t, torch.Tensor):
+                if (
+                    quantize_plain_tensor
+                    and t.dtype == torch.bfloat16
+                    and t.shape[-1] % MXFP8_BLOCK_SIZE == 0
+                ):
+                    q_tensor, q_scales = mxfp8_e4m3_quantize(
+                        t.contiguous(),
+                        is_sf_swizzled_layout=False,
+                    )
+                    return dequant_mxfp8_to_bf16(q_tensor, q_scales)
             return t
+        data = getattr(t, "_rowwise_data", None)
+        scale_inv = getattr(t, "_rowwise_scale_inv", None)
+        if data is not None and scale_inv is not None:
+            if getattr(t, "_with_gemm_swizzled_scales", False):
+                raise RuntimeError(
+                    "vLLM-style MXFP8 dequant requires compact rowwise scales."
+                )
+            if data.dtype == torch.uint8:
+                data = data.view(torch.float8_e4m3fn)
+            leading_dim = math.prod(data.shape[:-1])
+            scale_cols = data.shape[-1] // MXFP8_BLOCK_SIZE
+            scale_inv = scale_inv[:leading_dim, :scale_cols].contiguous()
+            scale_inv = scale_inv.view(*data.shape[:-1], scale_cols)
+            return dequant_mxfp8_to_bf16(data, scale_inv)
         if hasattr(t, "dequantize"):
             return t.dequantize(dtype=torch.bfloat16)
         return t
@@ -778,8 +837,19 @@ def install_mxfp8_dequant_for_bi_gemm() -> None:
                 "(extra_output/ub/ub_type/bulk_overlap)."
             )
 
-        a_bf16 = _maybe_dequant_to_bf16(a)
-        b_bf16 = _maybe_dequant_to_bf16(b)
+        # vLLM's MXFP8 linear quantizes plain BF16 activations before GEMM and
+        # dequants both operands before the BI matmul patch. TE sometimes sends
+        # BF16 tensors through this hook under the MXFP8 recipe, so mirror that
+        # quantize-dequant round trip for inference/logprob forwards.
+        quantize_plain_tensor = not torch.is_grad_enabled()
+        a_bf16 = _maybe_dequant_to_bf16(
+            a,
+            quantize_plain_tensor=quantize_plain_tensor,
+        )
+        b_bf16 = _maybe_dequant_to_bf16(
+            b,
+            quantize_plain_tensor=quantize_plain_tensor,
+        )
 
         result = bi_gemm_fn.apply(
             a_bf16, b_bf16, bias if not grad else None, out_dtype, layout

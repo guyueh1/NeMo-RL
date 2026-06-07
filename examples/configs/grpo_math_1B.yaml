@@ -38,6 +38,7 @@ grpo:
     target_min: 0.0
     target_max: 1.0
   seq_logprob_error_threshold: null
+  recompute_generation_logprobs_with_vllm_prefill: false
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
@@ -317,6 +318,9 @@ policy:
       # Numeric matching mode: route vLLM residual RMSNorm through the same
       # batch-invariant Triton path used by standalone matching scripts.
       use_batch_invariant_rmsnorm: false
+      # Numeric matching mode for MXFP8: route vLLM MXFP8 dense matmuls through
+      # dequant + BF16 batch-invariant matmul, matching Megatron.
+      match_vllm_mxfp8_matmul: false
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0

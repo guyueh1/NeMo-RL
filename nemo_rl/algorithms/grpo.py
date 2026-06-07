@@ -69,7 +69,10 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation import should_skip_vllm_refit
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+    GenerationInterface,
+)
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -169,6 +172,11 @@ class GRPOConfig(TypedDict):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None
+    # Recompute rollout generation logprobs by rescoring prompt+response as a
+    # full prefill through vLLM. This is useful when the generation-time decode
+    # path numerics intentionally differ from the full-sequence scoring path used
+    # for policy logprobs.
+    recompute_generation_logprobs_with_vllm_prefill: NotRequired[bool]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -615,6 +623,28 @@ def setup(
                 f"{patch_info}",
                 flush=True,
             )
+        if generation_config["vllm_cfg"].get("match_vllm_mxfp8_matmul", None) is True:
+            if generation_config["vllm_cfg"]["async_engine"]:
+                raise ValueError(
+                    "policy.generation.vllm_cfg.match_vllm_mxfp8_matmul=True "
+                    "requires policy.generation.vllm_cfg.async_engine=false."
+                )
+            if generation_config["vllm_cfg"]["precision"] != "fp8":
+                raise ValueError(
+                    "policy.generation.vllm_cfg.match_vllm_mxfp8_matmul=True "
+                    "requires policy.generation.vllm_cfg.precision=fp8."
+                )
+            if generation_config["vllm_cfg"].get("is_mx", None) is not True:
+                raise ValueError(
+                    "policy.generation.vllm_cfg.match_vllm_mxfp8_matmul=True "
+                    "requires policy.generation.vllm_cfg.is_mx=true."
+                )
+            patch_info = pg.install_mxfp8_bi_emulation_patch()
+            print(
+                "  ✓ Installed vLLM MXFP8 dequant + BF16 BI matmul patch: "
+                f"{patch_info}",
+                flush=True,
+            )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -702,6 +732,14 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
+        if generation_config["vllm_cfg"].get("use_batch_invariant_rmsnorm") is True:
+            if not generation_config["vllm_cfg"].get("enforce_eager", False):
+                generation_config["vllm_cfg"]["enforce_eager"] = True
+                print(
+                    "  ✓ Auto-enabled policy.generation.vllm_cfg.enforce_eager "
+                    "for batch-invariant vLLM RMSNorm",
+                    flush=True,
+                )
         if generation_config["vllm_cfg"]["precision"] == "fp8":
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
@@ -1353,6 +1391,208 @@ def compute_and_apply_seq_logprob_error_masking(
     return max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct
 
 
+def compute_generation_policy_logprob_abs_diff_metrics(
+    train_data: BatchedDataDict,
+) -> dict[str, float]:
+    """Compute masked diff metrics between generation and policy logprobs."""
+    token_mask = train_data["token_mask"][:, 1:]
+    sample_mask = train_data["sample_mask"]
+    generation_logprobs = train_data["generation_logprobs"][:, 1:].to(torch.float32)
+    policy_logprobs = train_data["prev_logprobs"][:, 1:].to(torch.float32)
+    mask = (token_mask * sample_mask.unsqueeze(-1)).bool()
+    token_count = mask.sum().item()
+
+    if not mask.any():
+        return {
+            "generation_policy_logprob_abs_diff/mean": 0.0,
+            "generation_policy_logprob_abs_diff/max": 0.0,
+            "generation_policy_logprob_rel_diff/mean": 0.0,
+            "generation_policy_logprob_rel_diff/max": 0.0,
+            "generation_policy_logprob_signed_diff/mean": 0.0,
+            "generation_policy_logprob_diff/num_tokens": 0.0,
+        }
+
+    diff = generation_logprobs - policy_logprobs
+    abs_diff = torch.abs(diff)
+    rel_diff = abs_diff / torch.clamp(torch.abs(generation_logprobs), min=1e-12)
+    masked_diff = diff[mask]
+    masked_abs_diff = abs_diff[mask]
+    masked_rel_diff = rel_diff[mask]
+    return {
+        "generation_policy_logprob_abs_diff/mean": masked_abs_diff.mean().item(),
+        "generation_policy_logprob_abs_diff/max": masked_abs_diff.max().item(),
+        "generation_policy_logprob_rel_diff/mean": masked_rel_diff.mean().item(),
+        "generation_policy_logprob_rel_diff/max": masked_rel_diff.max().item(),
+        "generation_policy_logprob_signed_diff/mean": masked_diff.mean().item(),
+        "generation_policy_logprob_diff/num_tokens": float(token_count),
+    }
+
+
+def update_generation_policy_logprob_diff_cumulative(
+    cumulative_metrics: dict[str, float],
+    step_metrics: dict[str, float],
+) -> dict[str, float]:
+    """Update and return cumulative generation-policy logprob diff metrics."""
+    num_tokens = step_metrics["generation_policy_logprob_diff/num_tokens"]
+    cumulative_metrics["steps"] += 1.0
+    cumulative_metrics["num_tokens"] += num_tokens
+    if num_tokens > 0:
+        cumulative_metrics["abs_diff_sum"] += (
+            step_metrics["generation_policy_logprob_abs_diff/mean"] * num_tokens
+        )
+        cumulative_metrics["rel_diff_sum"] += (
+            step_metrics["generation_policy_logprob_rel_diff/mean"] * num_tokens
+        )
+        cumulative_metrics["signed_diff_sum"] += (
+            step_metrics["generation_policy_logprob_signed_diff/mean"] * num_tokens
+        )
+        cumulative_metrics["max_abs_diff"] = max(
+            cumulative_metrics["max_abs_diff"],
+            step_metrics["generation_policy_logprob_abs_diff/max"],
+        )
+        cumulative_metrics["max_rel_diff"] = max(
+            cumulative_metrics["max_rel_diff"],
+            step_metrics["generation_policy_logprob_rel_diff/max"],
+        )
+
+    total_tokens = cumulative_metrics["num_tokens"]
+    if total_tokens == 0:
+        mean_abs_diff = 0.0
+        mean_rel_diff = 0.0
+        mean_signed_diff = 0.0
+    else:
+        mean_abs_diff = cumulative_metrics["abs_diff_sum"] / total_tokens
+        mean_rel_diff = cumulative_metrics["rel_diff_sum"] / total_tokens
+        mean_signed_diff = cumulative_metrics["signed_diff_sum"] / total_tokens
+
+    return {
+        "generation_policy_logprob_abs_diff/cumulative_mean": mean_abs_diff,
+        "generation_policy_logprob_abs_diff/cumulative_max": cumulative_metrics[
+            "max_abs_diff"
+        ],
+        "generation_policy_logprob_rel_diff/cumulative_mean": mean_rel_diff,
+        "generation_policy_logprob_rel_diff/cumulative_max": cumulative_metrics[
+            "max_rel_diff"
+        ],
+        "generation_policy_logprob_signed_diff/cumulative_mean": mean_signed_diff,
+        "generation_policy_logprob_diff/cumulative_num_tokens": total_tokens,
+        "generation_policy_logprob_diff/cumulative_num_steps": cumulative_metrics[
+            "steps"
+        ],
+    }
+
+
+def print_generation_policy_logprob_diff_summary(
+    metrics: dict[str, float],
+    *,
+    header: str,
+) -> None:
+    """Print generation-policy logprob diff metrics."""
+    print(header, flush=True)
+    print(
+        f"  • Mean abs diff: {metrics['generation_policy_logprob_abs_diff/mean']:.6f}",
+        flush=True,
+    )
+    print(
+        f"  • Max abs diff: {metrics['generation_policy_logprob_abs_diff/max']:.6f}",
+        flush=True,
+    )
+    print(
+        f"  • Mean rel diff: {metrics['generation_policy_logprob_rel_diff/mean']:.6f}",
+        flush=True,
+    )
+    print(
+        f"  • Max rel diff: {metrics['generation_policy_logprob_rel_diff/max']:.6f}",
+        flush=True,
+    )
+    print(
+        "  • Mean signed diff: "
+        f"{metrics['generation_policy_logprob_signed_diff/mean']:.6f}",
+        flush=True,
+    )
+    print(
+        "  • Compared tokens: "
+        f"{metrics['generation_policy_logprob_diff/num_tokens']:.0f}",
+        flush=True,
+    )
+
+
+def print_cumulative_generation_policy_logprob_diff_summary(
+    metrics: dict[str, float],
+    *,
+    header: str,
+) -> None:
+    """Print cumulative generation-policy logprob diff metrics."""
+    print(header, flush=True)
+    print(
+        "  • Cumulative mean abs diff: "
+        f"{metrics['generation_policy_logprob_abs_diff/cumulative_mean']:.6f}",
+        flush=True,
+    )
+    print(
+        "  • Cumulative max abs diff: "
+        f"{metrics['generation_policy_logprob_abs_diff/cumulative_max']:.6f}",
+        flush=True,
+    )
+    print(
+        "  • Cumulative mean rel diff: "
+        f"{metrics['generation_policy_logprob_rel_diff/cumulative_mean']:.6f}",
+        flush=True,
+    )
+    print(
+        "  • Cumulative max rel diff: "
+        f"{metrics['generation_policy_logprob_rel_diff/cumulative_max']:.6f}",
+        flush=True,
+    )
+    print(
+        "  • Cumulative mean signed diff: "
+        f"{metrics['generation_policy_logprob_signed_diff/cumulative_mean']:.6f}",
+        flush=True,
+    )
+    print(
+        "  • Compared tokens: "
+        f"{metrics['generation_policy_logprob_diff/cumulative_num_tokens']:.0f}",
+        flush=True,
+    )
+    print(
+        "  • Compared steps: "
+        f"{metrics['generation_policy_logprob_diff/cumulative_num_steps']:.0f}",
+        flush=True,
+    )
+
+
+def score_generation_logprobs_with_vllm_prefill(
+    policy_generation: GenerationInterface,
+    repeated_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    master_config: MasterConfig,
+) -> torch.Tensor:
+    """Score rollout prompt+response tokens with vLLM prompt prefill logprobs."""
+    score_prompt_logprobs = getattr(policy_generation, "score_prompt_logprobs", None)
+    if score_prompt_logprobs is None:
+        raise RuntimeError(
+            "grpo.recompute_generation_logprobs_with_vllm_prefill=True requires "
+            "a generation backend that exposes score_prompt_logprobs."
+        )
+
+    flat_messages, input_lengths = batched_message_log_to_flat_message(
+        repeated_batch["message_log"],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+        make_sequence_length_divisible_by=master_config.policy[
+            "make_sequence_length_divisible_by"
+        ],
+    )
+    score_data = BatchedDataDict[GenerationDatumSpec](
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+        }
+    )
+    score_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
+    score_data.to("cpu")
+    return score_prompt_logprobs(score_data)["logprobs"]
+
+
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -1422,6 +1662,15 @@ def grpo_train(
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    logprob_diff_cumulative_metrics = {
+        "steps": 0.0,
+        "num_tokens": 0.0,
+        "abs_diff_sum": 0.0,
+        "rel_diff_sum": 0.0,
+        "signed_diff_sum": 0.0,
+        "max_abs_diff": 0.0,
+        "max_rel_diff": 0.0,
+    }
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -1561,6 +1810,7 @@ def grpo_train(
                     policy_generation, "snapshot_step_metrics"
                 ):
                     policy_generation.snapshot_step_metrics()
+                prefill_generation_logprobs = None
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
@@ -1619,6 +1869,30 @@ def grpo_train(
                             max_rollout_turns=master_config.grpo["max_rollout_turns"],
                             greedy=False,
                         )
+                    if master_config.grpo.get(
+                        "recompute_generation_logprobs_with_vllm_prefill", None
+                    ):
+                        if _should_use_nemo_gym(
+                            master_config
+                        ) or _should_use_async_rollouts(master_config):
+                            raise RuntimeError(
+                                "grpo.recompute_generation_logprobs_with_vllm_prefill "
+                                "is currently supported only for synchronous "
+                                "single-turn vLLM rollouts."
+                            )
+                        print(
+                            "▶ Recomputing generation logprobs with vLLM prefill...",
+                            flush=True,
+                        )
+                        with timer.time("vllm_prefill_generation_logprobs"):
+                            prefill_generation_logprobs = (
+                                score_generation_logprobs_with_vllm_prefill(
+                                    policy_generation=policy_generation,
+                                    repeated_batch=repeated_batch,
+                                    tokenizer=tokenizer,
+                                    master_config=master_config,
+                                )
+                            )
                     policy_generation.finish_generation(
                         discard_weights=colocated_inference
                     )
@@ -1799,6 +2073,18 @@ def grpo_train(
                     )
                     train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
+                    if prefill_generation_logprobs is not None:
+                        if (
+                            prefill_generation_logprobs.shape
+                            != train_data["generation_logprobs"].shape
+                        ):
+                            raise RuntimeError(
+                                "vLLM prefill generation logprobs shape "
+                                f"{tuple(prefill_generation_logprobs.shape)} does "
+                                "not match rollout generation logprobs shape "
+                                f"{tuple(train_data['generation_logprobs'].shape)}"
+                            )
+                        train_data["generation_logprobs"] = prefill_generation_logprobs
 
                     metrics_logging_data["content"] = flat_messages["content"]
 
@@ -1863,10 +2149,21 @@ def grpo_train(
                         "seq_logprob_error_threshold requires prev_logprobs computation; "
                         "cannot use with force_on_policy_ratio=True"
                     )
+                    logprob_abs_diff_metrics = {
+                        "generation_policy_logprob_abs_diff/mean": float("nan"),
+                        "generation_policy_logprob_abs_diff/max": float("nan"),
+                        "generation_policy_logprob_rel_diff/mean": float("nan"),
+                        "generation_policy_logprob_rel_diff/max": float("nan"),
+                        "generation_policy_logprob_signed_diff/mean": float("nan"),
+                        "generation_policy_logprob_diff/num_tokens": 0.0,
+                    }
                     max_seq_mult_prob_error = 0.0
                     num_masked_seqs = 0
                     masked_correct_pct = 0.0
                 else:
+                    logprob_abs_diff_metrics = (
+                        compute_generation_policy_logprob_abs_diff_metrics(train_data)
+                    )
                     (
                         max_seq_mult_prob_error,
                         num_masked_seqs,
@@ -1876,6 +2173,21 @@ def grpo_train(
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
+
+                cumulative_logprob_diff_metrics = (
+                    update_generation_policy_logprob_diff_cumulative(
+                        logprob_diff_cumulative_metrics,
+                        logprob_abs_diff_metrics,
+                    )
+                )
+                print_generation_policy_logprob_diff_summary(
+                    logprob_abs_diff_metrics,
+                    header="📊 Generation-Policy Logprob Difference:",
+                )
+                print_cumulative_generation_policy_logprob_diff_summary(
+                    cumulative_logprob_diff_metrics,
+                    header="📊 Cumulative Generation-Policy Logprob Difference:",
+                )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -2042,7 +2354,9 @@ def grpo_train(
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                # Always log sequence-level error metrics (useful for deciding threshold)
+                # Always log logprob error metrics (useful for deciding thresholds)
+                metrics.update(logprob_abs_diff_metrics)
+                metrics.update(cumulative_logprob_diff_metrics)
                 metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
                 metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
                 metrics["masked_correct_pct"] = masked_correct_pct
@@ -2228,6 +2542,14 @@ def grpo_train(
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            print(
+                "  • Mean Generation-Policy Logprob Abs Diff: "
+                f"{metrics['generation_policy_logprob_abs_diff/mean']:.6f}"
+            )
+            print(
+                "  • Max Generation-Policy Logprob Abs Diff: "
+                f"{metrics['generation_policy_logprob_abs_diff/max']:.6f}"
+            )
             if master_config.grpo["use_dynamic_sampling"]:
                 print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
@@ -2542,7 +2864,6 @@ def async_grpo_train(
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
-
     if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config.grpo["async_grpo"].get("in_flight_weight_updates", False):
             print(
@@ -2974,10 +3295,21 @@ def async_grpo_train(
                         "seq_logprob_error_threshold requires prev_logprobs computation; "
                         "cannot use with force_on_policy_ratio=True"
                     )
+                    logprob_abs_diff_metrics = {
+                        "generation_policy_logprob_abs_diff/mean": float("nan"),
+                        "generation_policy_logprob_abs_diff/max": float("nan"),
+                        "generation_policy_logprob_rel_diff/mean": float("nan"),
+                        "generation_policy_logprob_rel_diff/max": float("nan"),
+                        "generation_policy_logprob_signed_diff/mean": float("nan"),
+                        "generation_policy_logprob_diff/num_tokens": 0.0,
+                    }
                     max_seq_mult_prob_error = 0.0
                     num_masked_seqs = 0
                     masked_correct_pct = 0.0
                 else:
+                    logprob_abs_diff_metrics = (
+                        compute_generation_policy_logprob_abs_diff_metrics(train_data)
+                    )
                     (
                         max_seq_mult_prob_error,
                         num_masked_seqs,
@@ -2987,6 +3319,17 @@ def async_grpo_train(
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
+
+                print(
+                    "  • Mean Generation-Policy Logprob Abs Diff: "
+                    f"{logprob_abs_diff_metrics['generation_policy_logprob_abs_diff/mean']:.6f}",
+                    flush=True,
+                )
+                print(
+                    "  • Max Generation-Policy Logprob Abs Diff: "
+                    f"{logprob_abs_diff_metrics['generation_policy_logprob_abs_diff/max']:.6f}",
+                    flush=True,
+                )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -3163,7 +3506,8 @@ def async_grpo_train(
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                # Always log sequence-level error metrics (useful for deciding threshold)
+                # Always log logprob error metrics (useful for deciding thresholds)
+                metrics.update(logprob_abs_diff_metrics)
                 metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
                 metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
                 metrics["masked_correct_pct"] = masked_correct_pct
@@ -3316,6 +3660,14 @@ def async_grpo_train(
             if "draft_loss" in metrics:
                 print(f"  • Draft Loss: {metrics['draft_loss']:.4f}")
             print(f"  • Generation KL Error: {metrics['gen_kl_error']:.4f}")
+            print(
+                "  • Mean Generation-Policy Logprob Abs Diff: "
+                f"{metrics['generation_policy_logprob_abs_diff/mean']:.6f}"
+            )
+            print(
+                "  • Max Generation-Policy Logprob Abs Diff: "
+                f"{metrics['generation_policy_logprob_abs_diff/max']:.6f}"
+            )
             print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(f"  • Buffer Size: {buffer_size_current}")
             print(f"  • Avg Trajectory Age: {avg_trajectory_age:.2f} steps")

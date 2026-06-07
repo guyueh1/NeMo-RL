@@ -671,6 +671,21 @@ class BaseVllmGenerationWorker:
         )
         return cast(list[dict[str, Any]], results)
 
+    def install_mxfp8_bi_emulation_patch(self) -> list[dict[str, Any]]:
+        """Install the MXFP8 dequant + BF16 BI matmul patch."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "MXFP8 BI emulation patch is currently supported only with "
+                "sync vLLM. Set policy.generation.vllm_cfg.async_engine=false."
+            )
+        results = self.llm.collective_rpc(
+            "install_mxfp8_bi_emulation_patch",
+            args=tuple(),
+        )
+        return cast(list[dict[str, Any]], results)
+
     def install_debug_tensor_hooks(
         self, max_calls_per_module: int = 1
     ) -> list[dict[str, Any]]:
@@ -946,10 +961,11 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         input_ids = data["input_ids"]
         input_lengths = data["input_lengths"]
         prompts = format_prompt_for_vllm_generation(data)
+        top_k_cfg = self.cfg["top_k"]
         sampling_kwargs = {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": -1,
+            "temperature": self.cfg["temperature"],
+            "top_p": self.cfg["top_p"],
+            "top_k": top_k_cfg if top_k_cfg is not None else -1,
             "max_tokens": 1,
             "logprobs": None,
             "prompt_logprobs": 0,

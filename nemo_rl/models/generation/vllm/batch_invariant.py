@@ -22,6 +22,8 @@ import torch
 
 G_PATCH_MARKER_ATTR = "_nemo_rl_batch_invariant_residual_rmsnorm_patch"
 G_ORIGINAL_FORWARD_ATTR = "_nemo_rl_original_forward_cuda"
+G_MXFP8_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_emulation_patch"
+G_ORIGINAL_MXFP8_MM_ATTR = "_nemo_rl_original_mm_mxfp8"
 
 
 def install_batch_invariant_rmsnorm_patch(model: torch.nn.Module) -> dict[str, Any]:
@@ -79,4 +81,78 @@ def install_batch_invariant_rmsnorm_patch(model: torch.nn.Module) -> dict[str, A
     return {
         "already_installed": already_installed,
         "rebound_count": rebound_count,
+    }
+
+
+def install_mxfp8_bi_emulation_patch(model: torch.nn.Module) -> dict[str, Any]:
+    """Route vLLM MXFP8 GEMM through dequant + BF16 BI matmul.
+
+    vLLM's MXFP8 dense linear path normally calls FlashInfer/CUTLASS
+    ``mm_mxfp8``. Megatron's matching path dequants TE MXFP8 operands to BF16
+    and then calls the BF16 batch-invariant persistent matmul. This patch makes
+    vLLM generation use the same operation when
+    ``policy.generation.vllm_cfg.match_vllm_mxfp8_matmul=true``.
+    """
+    del model  # The patch is module-level inside the vLLM worker process.
+
+    import vllm.utils.flashinfer as vllm_flashinfer
+    from vllm.model_executor.layers.batch_invariant import matmul_persistent
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        dequant_mxfp8_to_bf16,
+    )
+
+    current_mm_mxfp8 = vllm_flashinfer.mm_mxfp8
+    already_installed = bool(
+        getattr(current_mm_mxfp8, G_MXFP8_PATCH_MARKER_ATTR, False)
+    )
+    original_mm_mxfp8 = getattr(
+        current_mm_mxfp8,
+        G_ORIGINAL_MXFP8_MM_ATTR,
+        current_mm_mxfp8,
+    )
+
+    if not already_installed:
+
+        def _unswizzle_mxfp8_scale(
+            scale_1d: torch.Tensor,
+            *,
+            m: int,
+            k: int,
+        ) -> torch.Tensor:
+            factor = MXFP8_BLOCK_SIZE * 4
+            num_m_tiles = (m + 127) // 128
+            num_k_tiles = (k + factor - 1) // factor
+            scale_cols = k // MXFP8_BLOCK_SIZE
+            scale_5d = scale_1d.view(num_m_tiles, num_k_tiles, 32, 4, 4)
+            scale_unswizzled = scale_5d.transpose(1, 3).contiguous()
+            scale_padded = scale_unswizzled.view(num_m_tiles * 128, num_k_tiles * 4)
+            return scale_padded[:m, :scale_cols].contiguous()
+
+        def _bi_mm_mxfp8(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+            out_dtype: torch.dtype,
+            backend: str = "cutlass",  # noqa: ARG001 - preserves vLLM API.
+        ) -> torch.Tensor:
+            # a: [M, K] activation. b: [K, N] transposed [N, K] weight.
+            m, k = a.shape
+            n = b.shape[1]
+
+            a_scale_2d = _unswizzle_mxfp8_scale(a_scale, m=m, k=k)
+            b_scale_2d = _unswizzle_mxfp8_scale(b_scale, m=n, k=k)
+
+            a_bf16 = dequant_mxfp8_to_bf16(a, a_scale_2d)
+            weight_bf16 = dequant_mxfp8_to_bf16(b.t().contiguous(), b_scale_2d)
+            return matmul_persistent(a_bf16, weight_bf16.t()).to(out_dtype)
+
+        setattr(_bi_mm_mxfp8, G_MXFP8_PATCH_MARKER_ATTR, True)
+        setattr(_bi_mm_mxfp8, G_ORIGINAL_MXFP8_MM_ATTR, original_mm_mxfp8)
+        vllm_flashinfer.mm_mxfp8 = _bi_mm_mxfp8
+
+    return {
+        "already_installed": already_installed,
+        "patched": True,
     }
