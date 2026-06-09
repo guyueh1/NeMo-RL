@@ -61,7 +61,6 @@ dependencies = [
   "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
-  "setuptools_scm",
 ]
 
 [project.optional-dependencies]
@@ -100,11 +99,13 @@ vllm = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   # Default wheels on GitHub are cu130. See v0.20.0 release assets:
   # https://github.com/vllm-project/vllm/releases/tag/v0.20.0
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm==0.20.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
-  "vllm"
 ]
 sglang = [
   "sglang",
@@ -131,13 +132,6 @@ mcore = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  # FA4 (cute DSL) — provided by vLLM's bundled vllm.vllm_flash_attn.cute module
-  # plus cutlass-dsl/cuda-python/quack/triton runtime. Added so the mcore venv
-  # can call vLLM's FA4 kernel for SDPA bit-equality experiments
-  # (see my_script/megatron_forward.py --vllm-sdpa).
-  "vllm",
-  "nvidia-cutlass-dsl>=4.4.0.dev1",
-  "cuda-python",
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
@@ -225,7 +219,6 @@ sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", s
 sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "sgl-kernel" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "905018803414702e414a86716484ed4115b37ba6" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
-vllm = {path = "3rdparty/vllm", editable = true}
 
 [tool.uv.workspace]
 members = [
@@ -261,7 +254,6 @@ no-build-isolation-package = [
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "sglang-kernel",
-  "vllm",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -361,11 +353,6 @@ conflicts = [
     { extra = "automodel" },
     { extra = "vllm" },
   ],
-  # NOTE: removed [vllm, mcore] conflict on 2026-05-31 to allow installing vLLM's
-  # FA4 (cute DSL) kernel into the mcore venv for SDPA bit-equality experiments
-  # (see my_docs/llama3_8b_numeric_mismatch.md Module 5 and
-  # my_script/megatron_forward.py --vllm-sdpa). If this causes uv lock issues,
-  # restore the conflict and add a separate `mcore_with_vllm_fa4` extra.
 ]
 
 
