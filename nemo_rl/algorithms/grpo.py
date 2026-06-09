@@ -68,10 +68,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation.interfaces import (
-    GenerationDatumSpec,
-    GenerationInterface,
-)
+from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -171,11 +168,6 @@ class GRPOConfig(TypedDict):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None
-    # Recompute rollout generation logprobs by rescoring prompt+response as a
-    # full prefill through vLLM. This is useful when the generation-time decode
-    # path numerics intentionally differ from the full-sequence scoring path used
-    # for policy logprobs.
-    recompute_generation_logprobs_with_vllm_prefill: NotRequired[bool]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -1551,38 +1543,6 @@ def print_cumulative_generation_policy_logprob_diff_summary(
     )
 
 
-def score_generation_logprobs_with_vllm_prefill(
-    policy_generation: GenerationInterface,
-    repeated_batch: BatchedDataDict[DatumSpec],
-    tokenizer: TokenizerType,
-    master_config: MasterConfig,
-) -> torch.Tensor:
-    """Score rollout prompt+response tokens with vLLM prompt prefill logprobs."""
-    score_prompt_logprobs = getattr(policy_generation, "score_prompt_logprobs", None)
-    if score_prompt_logprobs is None:
-        raise RuntimeError(
-            "grpo.recompute_generation_logprobs_with_vllm_prefill=True requires "
-            "a generation backend that exposes score_prompt_logprobs."
-        )
-
-    flat_messages, input_lengths = batched_message_log_to_flat_message(
-        repeated_batch["message_log"],
-        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-        make_sequence_length_divisible_by=master_config.policy[
-            "make_sequence_length_divisible_by"
-        ],
-    )
-    score_data = BatchedDataDict[GenerationDatumSpec](
-        {
-            "input_ids": flat_messages["token_ids"],
-            "input_lengths": input_lengths,
-        }
-    )
-    score_data.update(flat_messages.get_multimodal_dict(as_tensors=False))
-    score_data.to("cpu")
-    return score_prompt_logprobs(score_data)["logprobs"]
-
-
 # ===============================================================================
 # Training & Validation
 # ===============================================================================
@@ -1793,7 +1753,6 @@ def grpo_train(
                     policy_generation, "snapshot_step_metrics"
                 ):
                     policy_generation.snapshot_step_metrics()
-                prefill_generation_logprobs = None
                 with timer.time("generation"):
                     # Clear logger metrics for each generation step
                     if policy_generation is not None:
@@ -1852,30 +1811,6 @@ def grpo_train(
                             max_rollout_turns=master_config.grpo["max_rollout_turns"],
                             greedy=False,
                         )
-                    if master_config.grpo.get(
-                        "recompute_generation_logprobs_with_vllm_prefill", None
-                    ):
-                        if _should_use_nemo_gym(
-                            master_config
-                        ) or _should_use_async_rollouts(master_config):
-                            raise RuntimeError(
-                                "grpo.recompute_generation_logprobs_with_vllm_prefill "
-                                "is currently supported only for synchronous "
-                                "single-turn vLLM rollouts."
-                            )
-                        print(
-                            "▶ Recomputing generation logprobs with vLLM prefill...",
-                            flush=True,
-                        )
-                        with timer.time("vllm_prefill_generation_logprobs"):
-                            prefill_generation_logprobs = (
-                                score_generation_logprobs_with_vllm_prefill(
-                                    policy_generation=policy_generation,
-                                    repeated_batch=repeated_batch,
-                                    tokenizer=tokenizer,
-                                    master_config=master_config,
-                                )
-                            )
                     policy_generation.finish_generation(
                         discard_weights=colocated_inference
                     )
@@ -2056,18 +1991,6 @@ def grpo_train(
                     )
                     train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
-                    if prefill_generation_logprobs is not None:
-                        if (
-                            prefill_generation_logprobs.shape
-                            != train_data["generation_logprobs"].shape
-                        ):
-                            raise RuntimeError(
-                                "vLLM prefill generation logprobs shape "
-                                f"{tuple(prefill_generation_logprobs.shape)} does "
-                                "not match rollout generation logprobs shape "
-                                f"{tuple(train_data['generation_logprobs'].shape)}"
-                            )
-                        train_data["generation_logprobs"] = prefill_generation_logprobs
 
                     metrics_logging_data["content"] = flat_messages["content"]
 
