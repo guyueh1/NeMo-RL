@@ -41,13 +41,6 @@ policy: &POLICY_BASE
     logprob_batch_size: 1
     max_total_sequence_length: 8192
     precision: "bfloat16"
-    # Enable BF16 true-on-policy numeric matching across Megatron/vLLM:
-    # Megatron BI mode, VLLM_BATCH_INVARIANT, and BF16 kernel patches.
-    bf16_true_on_policy: false
-    # Enable MXFP8 batch-invariant matmul patches. Requires bf16_true_on_policy=true
-    # and MXFP8 fp8 recipe. Select backend with
-    # NEMO_RL_MXFP8_MATMUL_BI_BACKEND={native,qdq}.
-    mxfp8_matmul_batch_invariant: false
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false

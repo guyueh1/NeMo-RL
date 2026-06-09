@@ -409,65 +409,19 @@ def setup(
     # ==========================
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
-    bf16_true_on_policy = policy_config.get("bf16_true_on_policy") is True
-    mxfp8_matmul_batch_invariant = (
-        policy_config.get("mxfp8_matmul_batch_invariant") is True
-    )
-    if mxfp8_matmul_batch_invariant and not bf16_true_on_policy:
-        raise ValueError(
-            "policy.mxfp8_matmul_batch_invariant=True requires "
-            "policy.bf16_true_on_policy=True."
-        )
 
     if backend == "megatron":
         student_generation = None
     elif backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
-        if bf16_true_on_policy:
-            if not generation_config["vllm_cfg"].get("enforce_eager", False):
-                generation_config["vllm_cfg"]["enforce_eager"] = True
-                print(
-                    "  ✓ Auto-enabled policy.generation.vllm_cfg.enforce_eager "
-                    "for policy.bf16_true_on_policy",
-                    flush=True,
-                )
-        if bf16_true_on_policy or mxfp8_matmul_batch_invariant:
-            if generation_config["vllm_cfg"]["async_engine"]:
-                raise ValueError(
-                    "policy.bf16_true_on_policy=True or "
-                    "policy.mxfp8_matmul_batch_invariant=True requires "
-                    "policy.generation.vllm_cfg.async_engine=false."
-                )
-        if mxfp8_matmul_batch_invariant:
-            if generation_config["vllm_cfg"]["precision"] != "fp8":
-                raise ValueError(
-                    "policy.mxfp8_matmul_batch_invariant=True "
-                    "requires policy.generation.vllm_cfg.precision=fp8."
-                )
-            if generation_config["vllm_cfg"].get("is_mx", None) is not True:
-                raise ValueError(
-                    "policy.mxfp8_matmul_batch_invariant=True "
-                    "requires policy.generation.vllm_cfg.is_mx=true."
-                )
         if "vllm_cfg" in generation_config:
             ## make vllm hf overrides match the training policy
             generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
         student_generation = VllmGeneration(
-            cluster=inference_cluster,
-            config=generation_config,
-            bf16_true_on_policy=bf16_true_on_policy,
+            cluster=inference_cluster, config=generation_config
         )
-        if bf16_true_on_policy or mxfp8_matmul_batch_invariant:
-            patch_info = student_generation.install_true_on_policy_patches(
-                bf16_true_on_policy=bf16_true_on_policy,
-                mxfp8_matmul_batch_invariant=mxfp8_matmul_batch_invariant,
-            )
-            print(
-                f"  ✓ Installed vLLM true-on-policy patches: {patch_info}",
-                flush=True,
-            )
         student_generation.finish_generation()
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",

@@ -216,7 +216,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
 
         if bf16_true_on_policy or mxfp8_matmul_batch_invariant:
-            from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
+            from nemo_rl.models.megatron.vllm_kernel_patches import (
                 install_true_on_policy_patches,
             )
 

@@ -110,7 +110,7 @@ def model_forward(
         # GPTModel.forward signatures do not accept it.
         additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
-    from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
+    from nemo_rl.models.megatron.vllm_kernel_patches import (
         set_vllm_style_sdpa_sequence_lengths,
     )
 
