@@ -70,7 +70,7 @@ class VllmInternalWorkerExtension:
         )
 
     def install_batch_invariant_rmsnorm_patch(self) -> dict[str, Any]:
-        """Install the batch-invariant residual RMSNorm patch on vLLM."""
+        """Install the Megatron-style RMSNorm patch on vLLM."""
         from nemo_rl.models.generation.vllm.batch_invariant import (
             install_batch_invariant_rmsnorm_patch,
         )

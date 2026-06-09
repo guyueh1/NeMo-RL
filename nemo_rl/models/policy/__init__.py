@@ -364,8 +364,9 @@ class PolicyConfig(TypedDict):
     max_total_sequence_length: int
     # When True, enable BF16 true-on-policy numeric matching. This turns on
     # Megatron batch-invariant mode, sets VLLM_BATCH_INVARIANT for vLLM, and
-    # installs BF16 vLLM-matching patches in both engines. Recommended default:
-    # false.
+    # installs BF16 parity patches. vLLM RMSNorm/RoPE/SwiGLU are patched toward
+    # Megatron; Megatron attention is patched toward vLLM FA2. Recommended
+    # default: false.
     bf16_true_on_policy: NotRequired[bool]
     # When True, install the MXFP8 batch-invariant matmul patch in both engines.
     # Requires bf16_true_on_policy=true and MXFP8 fp8 recipe. Select the backend

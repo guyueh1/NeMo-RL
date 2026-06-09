@@ -12,28 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Make Megatron-LM produce bit-identical forward outputs to vLLM.
+"""Megatron-side true-on-policy runtime patches.
 
 These monkey-patches target Blackwell BF16 and MXFP8 batch-invariant paths.
 
 Originally developed under ``my_script/megatron_forward.py`` as part of the
 cross-engine numerical-matching effort (see
 ``skills/debug-generation-training-mismatch/SKILL.md``). Ported here so an RL
-run can install the same patches inside ``MegatronPolicyWorker.__init__`` when
-``policy.bf16_true_on_policy`` is set to True.
+run can install the same patches inside ``MegatronPolicyWorker.__init__``.
 
-All six patches are class-level / module-level monkey-patches: they take
-effect for every layer of every model from the moment they're applied,
-without any per-layer instrumentation.
+``policy.bf16_true_on_policy`` enables Megatron-Core batch-invariant mode before
+this module is called. The remaining BF16 Megatron-side patch here is the SDPA
+path, which still routes TE attention through vLLM's FA2 wrapper. RMSNorm, RoPE,
+and SwiGLU parity are handled in the opposite direction by patching vLLM to
+match Megatron.
 
-The four BF16-only patches are safe to apply unconditionally; MXFP8-specific
-patches are gated by ``policy.mxfp8_matmul_batch_invariant`` and
+MXFP8-specific patches are gated by ``policy.mxfp8_matmul_batch_invariant`` and
 ``NEMO_RL_MXFP8_MATMUL_BI_BACKEND``.
 """
 
 from __future__ import annotations
 
-import importlib
 import math
 
 import torch
@@ -57,239 +56,6 @@ def set_vllm_style_sdpa_sequence_lengths(seq_lens: torch.Tensor | None) -> None:
         G_VLLM_STYLE_SDPA_SEQ_LENS = None
         return
     G_VLLM_STYLE_SDPA_SEQ_LENS = [int(item) for item in seq_lens.detach().cpu()]
-
-
-def install_vllm_style_rmsnorm() -> None:
-    """Route Megatron's BI RMSNorm through vLLM's exact Triton kernel.
-
-    Replaces ``MegatronCore``'s ``BatchInvariantRMSNormFn`` (PyTorch
-    ``mean_dim(x*x) + torch.sqrt`` chain) with one that dispatches to
-    vLLM's ``rms_norm_batch_invariant`` Triton kernel. Both engines then
-    invoke the literally identical kernel on identical inputs, producing
-    byte-identical output.
-
-    Must be called AFTER ``enable_batch_invariant_mode()`` so the
-    ``_te_rmsnorm_forward_patched`` global lookup resolves to the
-    patched ``BatchInvariantRMSNormFn``.
-    """
-    from megatron.core.transformer.custom_layers import (
-        batch_invariant_kernels as bik_mod,
-    )
-    from vllm.model_executor.layers.batch_invariant import (
-        rms_norm as vllm_rms_norm_triton,
-    )
-
-    class _VllmStyleBatchInvariantRMSNormFn(torch.autograd.Function):
-        """RMSNorm autograd Fn dispatching to vLLM's BI Triton kernel.
-
-        Forward dispatches to vLLM's `rms_norm` Triton kernel for bit-identical
-        cross-engine output. Backward follows the standard RMSNorm gradient
-        formula in fp32; rsigma is recomputed (cheap) instead of being saved.
-
-        With `y_i = x_i * w_eff_i * r` where `r = (mean(x^2) + eps)^(-1/2)`:
-            dL/dw_i = sum_batch(go_i * x_i * r)
-            dL/dx_i = go_i * w_eff_i * r
-                      - (r^3 / H) * x_i * sum_j(go_j * w_eff_j * x_j)
-        and `w_eff = w + 1` if `zero_centered_gamma`, else `w_eff = w` (the
-        +1 is a constant offset, so dL/dw = dL/dw_eff unchanged).
-        """
-
-        @staticmethod
-        def forward(ctx, x, weight, eps, zero_centered_gamma):
-            if not x.is_cuda:
-                raise RuntimeError("Batch-invariant RMSNorm requires CUDA tensors.")
-            w_eff = (weight + 1.0) if zero_centered_gamma else weight
-            out = vllm_rms_norm_triton(x, w_eff, eps)
-            ctx.eps = eps
-            ctx.zero_centered_gamma = zero_centered_gamma
-            ctx.save_for_backward(x, weight)
-            return out
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            x, weight = ctx.saved_tensors
-            eps = ctx.eps
-            w_eff = (weight + 1.0) if ctx.zero_centered_gamma else weight
-
-            x_fp32 = x.float()
-            w_fp32 = w_eff.to(device=x.device, dtype=torch.float32)
-            go_fp32 = grad_output.float()
-            hidden_size = x.shape[-1]
-
-            # Recompute rsigma in fp32 (~1 fp32 op per element; matches the
-            # `1.0 / torch.sqrt(mean(x^2) + eps)` formula used by vLLM's
-            # Triton kernel up to sqrt precision).
-            mean_sq = (x_fp32 * x_fp32).mean(dim=-1, keepdim=True)
-            rsigma = 1.0 / torch.sqrt(mean_sq + eps)
-
-            # grad_weight: sum_batch(go * x * rsigma). Reduce over every
-            # leading dim; keep only the last (hidden) dim.
-            reduce_dims = tuple(range(go_fp32.ndim - 1))
-            grad_weight = (
-                (go_fp32 * x_fp32 * rsigma).sum(dim=reduce_dims).to(weight.dtype)
-            )
-
-            # grad_x: combine the direct term and the through-rsigma term.
-            inner = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
-            rsigma_cubed = rsigma * rsigma * rsigma
-            grad_x_fp32 = (
-                go_fp32 * w_fp32 * rsigma
-                - (w_fp32 * rsigma_cubed) * inner * x_fp32 / hidden_size
-            )
-            grad_x = grad_x_fp32.to(x.dtype)
-
-            return grad_x, grad_weight, None, None
-
-    bik_mod.BatchInvariantRMSNormFn = _VllmStyleBatchInvariantRMSNormFn
-
-
-def install_vllm_style_rmsnom_to_te() -> None:
-    from megatron.core.transformer.custom_layers import (
-        batch_invariant_kernels as bik_mod,
-    )
-
-    te_modules = []
-    for module_name in (
-        "transformer_engine.pytorch.module._common",
-        "transformer_engine.pytorch.module.layernorm_linear",
-        "transformer_engine.pytorch.module.layernorm_mlp",
-    ):
-        try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        if hasattr(module, "apply_normalization"):
-            te_modules.append(module)
-
-    if not te_modules:
-        raise RuntimeError("could not find TE apply_normalization entry points")
-
-    orig_apply_norm = te_modules[0].apply_normalization
-
-    def apply_norm(*args, **kwargs):
-        normalization = args[7] if len(args) > 7 else kwargs["normalization"]
-        if normalization != "RMSNorm":
-            return orig_apply_norm(*args, **kwargs)
-        x = args[0] if len(args) > 0 else kwargs["inputmat"]
-        ln_out = args[1] if len(args) > 1 else kwargs.get("ln_out")
-        weight = args[2] if len(args) > 2 else kwargs["ln_weight"]
-        eps = args[4] if len(args) > 4 else kwargs["eps"]
-        zero_centered_gamma = (
-            args[9] if len(args) > 9 else kwargs["zero_centered_gamma"]
-        )
-        out = bik_mod.BatchInvariantRMSNormFn.apply(
-            x,
-            weight,
-            eps,
-            zero_centered_gamma,
-        )
-        if ln_out is not None:
-            ln_out.copy_(out)
-            out = ln_out
-
-        # TE's fused LayerNormLinear custom autograd saves rsigma from
-        # apply_normalization for backward. Forward matching is what we need for
-        # logprob comparisons, but returning a formula-consistent rsigma keeps
-        # the custom backward path well-formed.
-        rsigma = torch.rsqrt((x.float() * x.float()).mean(dim=-1) + eps)
-        return out, None, rsigma
-
-    for module in te_modules:
-        module.apply_normalization = apply_norm
-
-
-def install_vllm_style_rope() -> None:
-    """Replace Megatron's ``apply_rotary_pos_emb`` to match vLLM's RoPE numerics.
-
-    vLLM's recipe (per ``csrc/pos_encoding_kernels.cu``):
-      1. fp32 cos/sin from fp32 freqs.
-      2. cast cos/sin to bf16 at module init (lossy).
-      3. inside the C++ wrapper, upcast cos_sin_cache back to fp32.
-      4. read bf16 q/k -> fp32 -> rotation in fp32 -> single bf16 store.
-
-    This patch replicates all four steps in PyTorch so Megatron's
-    intermediate bf16 rounding events disappear.
-    """
-    from megatron.core.models.common.embeddings import rope_utils
-
-    def _vllm_style_apply_rope(
-        t: torch.Tensor,
-        freqs: torch.Tensor,
-        config,
-        cu_seqlens=None,
-        mscale: float = 1.0,
-        cp_group=None,
-    ):
-        assert cu_seqlens is None, "vllm-style RoPE patch only supports non-thd"
-        rot_dim = freqs.shape[-1]
-        t_rot, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-
-        # Steps 1-3: compute cos/sin in fp32, cast through bf16 (precision
-        # loss), then back to fp32.
-        target_dtype = t.dtype
-        cos = (torch.cos(freqs) * mscale).to(target_dtype).to(torch.float32)
-        sin = (torch.sin(freqs) * mscale).to(target_dtype).to(torch.float32)
-
-        # Megatron passes freqs already duplicated via cat(f, f). Take the
-        # first half to apply the same per-element cos to x1 and x2.
-        cos_h = cos[..., : rot_dim // 2]
-        sin_h = sin[..., : rot_dim // 2]
-
-        # Step 4: rotation in fp32, single bf16 cast at end.
-        t_rot_fp32 = t_rot.to(torch.float32)
-        if not getattr(config, "rotary_interleaved", False):
-            x1, x2 = torch.chunk(t_rot_fp32, 2, dim=-1)
-            o1 = x1 * cos_h - x2 * sin_h
-            o2 = x2 * cos_h + x1 * sin_h
-            out_fp32 = torch.cat((o1, o2), dim=-1)
-        else:
-            x1 = t_rot_fp32[..., 0::2]
-            x2 = t_rot_fp32[..., 1::2]
-            o1 = x1 * cos_h - x2 * sin_h
-            o2 = x2 * cos_h + x1 * sin_h
-            out_fp32 = torch.stack((o1, o2), dim=-1).flatten(-2)
-
-        out = out_fp32.to(target_dtype)
-        return torch.cat((out, t_pass), dim=-1) if t_pass.numel() > 0 else out
-
-    rope_utils.apply_rotary_pos_emb = _vllm_style_apply_rope
-    # Also patch the re-export in transformer.attention so any imports of
-    # ``apply_rotary_pos_emb`` from that module pick up the patched version.
-    for mod_name in ("megatron.core.transformer.attention",):
-        try:
-            mod = importlib.import_module(mod_name)
-            if hasattr(mod, "apply_rotary_pos_emb"):
-                mod.apply_rotary_pos_emb = _vllm_style_apply_rope
-        except ImportError:
-            pass
-
-
-def install_vllm_style_swiglu() -> None:
-    """Replace Megatron's SwiGLU to match vLLM's ``silu_and_mul`` CUDA kernel.
-
-    vLLM's hand-written CUDA kernel does two bf16 rounding events:
-    ``silu(gate) -> bf16; bf16 * up_bf16 -> bf16``. Megatron's default
-    ``@jit_fuser`` (``torch.compile``) fuses the chain into one Triton
-    kernel that keeps the silu output in fp32 (only ONE bf16 round at the
-    final store), creating ~1 bf16 ULP drift at ``linear_fc2`` input.
-
-    This patch replaces ``swiglu`` with an eager-mode version that runs as
-    two separate kernels (silu materialises bf16, then bf16*bf16 multiply),
-    so Megatron matches vLLM bit-for-bit.
-    """
-    import megatron.core.fusions.fused_bias_swiglu as swg_mod
-    import torch.nn.functional as F
-
-    def _vllm_style_swiglu(y):
-        y_1, y_2 = torch.chunk(y, 2, -1)
-        silu_out = F.silu(y_1)
-        return silu_out * y_2
-
-    def _vllm_style_bias_swiglu(y, bias):
-        return _vllm_style_swiglu(y + bias)
-
-    swg_mod.swiglu = _vllm_style_swiglu
-    swg_mod.bias_swiglu = _vllm_style_bias_swiglu
 
 
 def install_vllm_style_sdpa(
@@ -1108,18 +874,17 @@ def split_all_layers_fused_layernorm_linear(model) -> int:
     return total_layers
 
 
-def install_match_vllm_kernels() -> None:
-    """Install the four BF16 kernel-matching patches for vLLM bit-identity.
+def install_megatron_true_on_policy_patches() -> None:
+    """Install Megatron-side BF16 true-on-policy patches.
 
-    Installs ``install_vllm_style_{rmsnorm, rope, swiglu, sdpa}``. These
-    cover the BF16 forward path (every linear, RoPE, SwiGLU, attention).
+    Megatron keeps its own BI RMSNorm, RoPE, and SwiGLU implementations. The
+    corresponding vLLM operations are patched on the generation side to match
+    Megatron. The remaining Megatron-side BF16 patch is attention, which routes
+    TE ``DotProductAttention`` through vLLM's FA2 wrapper.
 
     Pre-conditions:
-      - The RMSNorm patch only takes effect when batch-invariant mode is
-        enabled (it replaces ``BatchInvariantRMSNormFn``, which the
-        ``_te_rmsnorm_forward_patched`` shim looks up at call time).
-        Therefore the caller must have set ``policy.bf16_true_on_policy=true`` so
-        ``enable_batch_invariant_mode()`` has already run.
+      - The caller must have set ``policy.bf16_true_on_policy=true`` so
+        Megatron's ``enable_batch_invariant_mode()`` has already run.
       - Recommended call site: ``MegatronPolicyWorkerImpl.__init__``,
         immediately after ``setup_model_and_optimizer`` returns.
 
@@ -1128,10 +893,6 @@ def install_match_vllm_kernels() -> None:
     :func:`install_bi_mxfp8_matmul` (and ensure the model is running the
     MXFP8 fp8 recipe).
     """
-    install_vllm_style_rmsnorm()
-    install_vllm_style_rmsnom_to_te()
-    install_vllm_style_rope()
-    install_vllm_style_swiglu()
     install_vllm_style_sdpa()
 
 
@@ -1150,7 +911,8 @@ def install_bi_mxfp8_matmul_qdq() -> None:
         (``policy.megatron_cfg.fp8_cfg.fp8_recipe == "mxfp8"``); otherwise
         the patches are no-ops because no MXFP8 tensors will reach the
         GEMM hook.
-      - Typically used together with :func:`install_match_vllm_kernels`
+      - Typically used together with
+        :func:`install_megatron_true_on_policy_patches`
         — without the BF16 patches the per-layer activations leading into
         the MXFP8 GEMMs already disagree across engines, so matching the
         GEMM alone is not enough.
@@ -1177,12 +939,12 @@ def install_true_on_policy_patches(
         raise ValueError(
             "policy.mxfp8_matmul_batch_invariant=True requires "
             "policy.bf16_true_on_policy=True because that flag enables "
-            "Megatron batch-invariant mode and the BF16 vLLM-matching patches."
+            "Megatron batch-invariant mode and the BF16 true-on-policy patches."
         )
 
     if bf16_true_on_policy:
-        install_match_vllm_kernels()
-        installed["bf16_true_on_policy"] = "match_vllm_kernels"
+        install_megatron_true_on_policy_patches()
+        installed["bf16_true_on_policy"] = "megatron_true_on_policy_patches"
 
     if mxfp8_matmul_batch_invariant:
         if not mxfp8_active:

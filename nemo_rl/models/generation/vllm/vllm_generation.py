@@ -855,7 +855,7 @@ class VllmGeneration(GenerationInterface):
         return futures
 
     def install_batch_invariant_rmsnorm_patch(self) -> list[Any]:
-        """Install the batch-invariant residual RMSNorm patch on vLLM workers."""
+        """Install the Megatron-style RMSNorm patch on vLLM workers."""
         futures = self.worker_group.run_all_workers_single_data(
             "install_batch_invariant_rmsnorm_patch",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],

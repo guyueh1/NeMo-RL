@@ -22,9 +22,11 @@ NEMO_RL_MXFP8_MATMUL_BI_BACKEND=native  # or qdq
 ```
 
 `policy.bf16_true_on_policy` turns on Megatron BI mode, vLLM
-`VLLM_BATCH_INVARIANT`, and the BF16 vLLM-matching patches. It requires sync
-vLLM (`policy.generation.vllm_cfg.async_engine=false`). For vLLM tensor hooks,
-force eager mode.
+`VLLM_BATCH_INVARIANT`, and the BF16 parity patches. vLLM RMSNorm, RoPE, and
+SwiGLU are patched to match Megatron; Megatron attention is still patched to
+use vLLM FA2. It requires sync vLLM
+(`policy.generation.vllm_cfg.async_engine=false`). For vLLM tensor hooks, force
+eager mode.
 
 `policy.mxfp8_matmul_batch_invariant` requires `bf16_true_on_policy=true`,
 vLLM `precision=fp8`, `is_mx=true`, and Megatron `fp8_cfg.enabled=true` with
@@ -116,13 +118,14 @@ cache profile can leave memory fragmented for a following Megatron process.
 - Fusion boundary: TE `LayerNormColumnParallelLinear` hooks capture the pre-norm
   residual stream, while vLLM hooks usually capture the post-RMSNorm tensor.
   Use `--split-fused` for layer 0 or `--split-all-fused` for full-depth parity.
-- RMSNorm: old vLLM residual add+RMSNorm used the fused CUDA path even in BI
-  mode. The true-on-policy patch routes residual RMSNorm through the same BI
-  Triton path used by Megatron.
+- RMSNorm: true-on-policy routes vLLM RMSNorm through Megatron-Core's
+  `BatchInvariantRMSNormFn`, including the residual-add path.
 - RoPE: vLLM and Megatron differ in cos/sin caching, casting, and kernel
-  ordering. Use the vLLM-style RoPE patch when comparing engines.
+  ordering. True-on-policy patches vLLM base RoPE to Megatron's unfused
+  PyTorch formula.
 - SwiGLU: vLLM's historical CUDA `SiluAndMul` and Megatron's fused elementwise
-  path can differ by one BF16 rounding event. Use the vLLM-style SwiGLU patch.
+  path can differ by one BF16 rounding event. True-on-policy patches vLLM
+  `SiluAndMul` to Megatron's fused SwiGLU function.
 - SDPA: TE attention and vLLM attention can differ even with identical Q/K/V.
   Use the vLLM-style SDPA patch and make sequence lengths explicit.
 - MXFP8 padding: Megatron/TE MXFP8 activations require dimensions divisible by

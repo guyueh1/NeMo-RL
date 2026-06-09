@@ -670,13 +670,13 @@ class BaseVllmGenerationWorker:
         return cast(list[dict[str, Any]], results)
 
     def install_batch_invariant_rmsnorm_patch(self) -> list[dict[str, Any]]:
-        """Install the batch-invariant residual RMSNorm patch."""
+        """Install the Megatron-style RMSNorm patch."""
         if self.llm is None:
             return []
         if self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
-                "Batch-invariant residual RMSNorm patch is currently supported "
-                "only with sync vLLM. Set "
+                "Megatron-style RMSNorm patch is currently supported only with "
+                "sync vLLM. Set "
                 "policy.generation.vllm_cfg.async_engine=false."
             )
         results = self.llm.collective_rpc(
