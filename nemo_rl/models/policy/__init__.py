@@ -368,10 +368,10 @@ class PolicyConfig(TypedDict):
     # Megatron; Megatron attention is patched toward vLLM FA2. Recommended
     # default: false.
     bf16_true_on_policy: NotRequired[bool]
-    # When True, install the MXFP8 batch-invariant matmul patch in both engines.
-    # Requires bf16_true_on_policy=true and MXFP8 fp8 recipe. Select the backend
-    # with NEMO_RL_MXFP8_MATMUL_BI_BACKEND={native,qdq}. Recommended default:
-    # false.
+    # When True, install the MXFP8 batch-invariant matmul runtime patch in both
+    # engines. Requires bf16_true_on_policy=true and MXFP8 fp8 recipe. Select
+    # the backend with NEMO_RL_MXFP8_MATMUL_BI_BACKEND={native,qdq}.
+    # Recommended default: false.
     mxfp8_matmul_batch_invariant: NotRequired[bool]
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]

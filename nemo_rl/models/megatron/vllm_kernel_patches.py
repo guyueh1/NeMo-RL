@@ -737,6 +737,8 @@ def install_mxfp8_native_for_bi_gemm() -> None:
         batch_invariant_kernels as bik_mod,
     )
 
+    from nemo_rl.models.mxfp8_bi_matmul import mxfp8_matmul_persistent
+
     if bik_mod._TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError(
             "enable_batch_invariant_mode() must run before "
@@ -745,7 +747,6 @@ def install_mxfp8_native_for_bi_gemm() -> None:
 
     orig_gemm = bik_mod._TE_GENERAL_GEMM_ORIG
     extract = bik_mod._extract_te_gemm_args
-    native_mxfp8_matmul = bik_mod.mxfp8_matmul_persistent
     bf16_bi_gemm = bik_mod._te_general_gemm_patched
 
     def _wrapper(*args, **kwargs):
@@ -785,7 +786,7 @@ def install_mxfp8_native_for_bi_gemm() -> None:
             leading_shape = b.shape[:-1]
             activation_mxfp8 = _mxfp8_operand_from_plain_tensor(b)
 
-        result_2d = native_mxfp8_matmul(
+        result_2d = mxfp8_matmul_persistent(
             activation_mxfp8,
             weight_mxfp8,
             bias=bias,

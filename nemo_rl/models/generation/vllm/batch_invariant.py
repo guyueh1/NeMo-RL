@@ -390,7 +390,8 @@ def install_mxfp8_bi_matmul_patch(model: torch.nn.Module) -> dict[str, Any]:
     del model  # The patch is module-level inside the vLLM worker process.
 
     import vllm.utils.flashinfer as vllm_flashinfer
-    from vllm.model_executor.layers.batch_invariant import mxfp8_matmul_persistent
+
+    from nemo_rl.models.mxfp8_bi_matmul import mxfp8_matmul_persistent
 
     current_mm_mxfp8 = vllm_flashinfer.mm_mxfp8
     already_installed = bool(
