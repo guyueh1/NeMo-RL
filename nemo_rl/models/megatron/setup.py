@@ -489,7 +489,7 @@ def setup_model_config(
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
 
-    model_cfg.batch_invariant_mode = config["megatron_cfg"].get("batch_invariant_mode", False)
+    model_cfg.batch_invariant_mode = config.get("bf16_true_on_policy") is True
 
     # Validate optimizer configuration
     _validate_optimizer_config(config)
@@ -972,6 +972,7 @@ def setup_model_and_optimizer(
     from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
         enable_batch_invariant_mode,
     )
+
     if megatron_cfg.model.batch_invariant_mode:
         enable_batch_invariant_mode()
 

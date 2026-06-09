@@ -49,7 +49,6 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation import should_skip_vllm_refit
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
@@ -410,19 +409,65 @@ def setup(
     # ==========================
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    bf16_true_on_policy = policy_config.get("bf16_true_on_policy") is True
+    mxfp8_matmul_batch_invariant = (
+        policy_config.get("mxfp8_matmul_batch_invariant") is True
+    )
+    if mxfp8_matmul_batch_invariant and not bf16_true_on_policy:
+        raise ValueError(
+            "policy.mxfp8_matmul_batch_invariant=True requires "
+            "policy.bf16_true_on_policy=True."
+        )
 
     if backend == "megatron":
         student_generation = None
     elif backend == "vllm":
         generation_config = cast(VllmConfig, generation_config)
+        if bf16_true_on_policy:
+            if not generation_config["vllm_cfg"].get("enforce_eager", False):
+                generation_config["vllm_cfg"]["enforce_eager"] = True
+                print(
+                    "  ✓ Auto-enabled policy.generation.vllm_cfg.enforce_eager "
+                    "for policy.bf16_true_on_policy",
+                    flush=True,
+                )
+        if bf16_true_on_policy or mxfp8_matmul_batch_invariant:
+            if generation_config["vllm_cfg"]["async_engine"]:
+                raise ValueError(
+                    "policy.bf16_true_on_policy=True or "
+                    "policy.mxfp8_matmul_batch_invariant=True requires "
+                    "policy.generation.vllm_cfg.async_engine=false."
+                )
+        if mxfp8_matmul_batch_invariant:
+            if generation_config["vllm_cfg"]["precision"] != "fp8":
+                raise ValueError(
+                    "policy.mxfp8_matmul_batch_invariant=True "
+                    "requires policy.generation.vllm_cfg.precision=fp8."
+                )
+            if generation_config["vllm_cfg"].get("is_mx", None) is not True:
+                raise ValueError(
+                    "policy.mxfp8_matmul_batch_invariant=True "
+                    "requires policy.generation.vllm_cfg.is_mx=true."
+                )
         if "vllm_cfg" in generation_config:
             ## make vllm hf overrides match the training policy
             generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
         student_generation = VllmGeneration(
-            cluster=inference_cluster, config=generation_config
+            cluster=inference_cluster,
+            config=generation_config,
+            bf16_true_on_policy=bf16_true_on_policy,
         )
+        if bf16_true_on_policy or mxfp8_matmul_batch_invariant:
+            patch_info = student_generation.install_true_on_policy_patches(
+                bf16_true_on_policy=bf16_true_on_policy,
+                mxfp8_matmul_batch_invariant=mxfp8_matmul_batch_invariant,
+            )
+            print(
+                f"  ✓ Installed vLLM true-on-policy patches: {patch_info}",
+                flush=True,
+            )
         student_generation.finish_generation()
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -456,19 +501,12 @@ def setup(
         init_reference_model=False,
     )
 
-    skip_generation_refit = should_skip_vllm_refit(generation_config)
-    if student_generation is not None and not skip_generation_refit:
+    if student_generation is not None:
         state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
-    elif student_generation is not None:
-        print(
-            "Skipping vLLM refit metadata preparation because "
-            "policy.generation.vllm_cfg.skip_refit=true.",
-            flush=True,
-        )
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference and not skip_generation_refit:
+    if not colocated_inference:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()
@@ -483,12 +521,6 @@ def setup(
         )  # type: ignore
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
-    elif not colocated_inference and skip_generation_refit:
-        print(
-            "Skipping policy/generation collective initialization because "
-            "policy.generation.vllm_cfg.skip_refit=true.",
-            flush=True,
-        )
 
     loss_fn = DistillationLossFn(loss_config)
 
@@ -543,13 +575,6 @@ def distillation_train(
     if student_generation is None:
         student_generation = student_policy  # type: ignore
         NEED_REFIT = False
-    elif should_skip_vllm_refit(master_config.policy["generation"]):
-        NEED_REFIT = False
-        print(
-            "Skipping student policy-to-vLLM refit because "
-            "policy.generation.vllm_cfg.skip_refit=true.",
-            flush=True,
-        )
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
 

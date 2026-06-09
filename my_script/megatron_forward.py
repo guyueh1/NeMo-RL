@@ -700,7 +700,7 @@ def install_vllm_style_swiglu():
     NOTE: This is a *downgrade* on Megatron's side for the sake of cross-
     engine bit equality. The "correct" long-term fix is to make vLLM's CUDA
     kernel keep silu in fp32 until the multiply, matching Megatron's compiled
-    path. See TODO in `my_docs/llama3_8b_numeric_mismatch.md`.
+    path. See `skills/debug-generation-training-mismatch/SKILL.md`.
     """
     import megatron.core.fusions.fused_bias_swiglu as swg_mod
     import torch.nn.functional as F

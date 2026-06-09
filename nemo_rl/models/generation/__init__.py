@@ -44,17 +44,9 @@ def configure_generation_config(
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
         # set load_format
-        skip_refit = should_skip_vllm_refit(config)
-        config["vllm_cfg"]["load_format"] = "auto" if is_eval or skip_refit else "dummy"
-        if skip_refit and not is_eval:
-            warnings.warn(
-                "vllm_cfg.skip_refit=True: vLLM will load model weights with "
-                "load_format='auto' and NeMo-RL will skip policy-to-vLLM refit. "
-                "Use this only when generation should remain on model_name weights.",
-                UserWarning,
-            )
+        config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
-        if speculative_config and not skip_refit:
+        if speculative_config:
             # Speculative decoding needs real startup weights unless the draft
             # weights will be pushed into vLLM during the initial refit.
             if not is_eval and not has_refit_draft_weights:
@@ -78,12 +70,3 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     return config
-
-
-def should_skip_vllm_refit(config: GenerationConfig) -> bool:
-    """Return whether vLLM generation should skip policy weight refit."""
-    if config["backend"] != "vllm":
-        return False
-
-    config = cast(VllmConfig, config)
-    return config["vllm_cfg"].get("skip_refit") is True

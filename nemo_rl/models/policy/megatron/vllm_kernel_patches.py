@@ -18,17 +18,17 @@ These monkey-patches target Blackwell BF16 and MXFP8 batch-invariant paths.
 
 Originally developed under ``my_script/megatron_forward.py`` as part of the
 cross-engine numerical-matching effort (see
-``my_docs/llama3_8b_numeric_mismatch.md`` and
-``my_docs/llama3_8b_mxfp8_numeric_mismatch.md``). Ported here so an RL run
-can install the same patches inside ``MegatronPolicyWorker.__init__`` when
-``policy.megatron_cfg.match_vllm_kernels`` is set to True.
+``skills/debug-generation-training-mismatch/SKILL.md``). Ported here so an RL
+run can install the same patches inside ``MegatronPolicyWorker.__init__`` when
+``policy.bf16_true_on_policy`` is set to True.
 
 All six patches are class-level / module-level monkey-patches: they take
 effect for every layer of every model from the moment they're applied,
 without any per-layer instrumentation.
 
 The four BF16-only patches are safe to apply unconditionally; MXFP8-specific
-patches are gated by the policy Megatron MXFP8 BI config flags.
+patches are gated by ``policy.mxfp8_matmul_batch_invariant`` and
+``NEMO_RL_MXFP8_MATMUL_BI_BACKEND``.
 """
 
 from __future__ import annotations
@@ -37,6 +37,8 @@ import importlib
 import math
 
 import torch
+
+from nemo_rl.models.true_on_policy import get_mxfp8_matmul_bi_backend
 
 G_VLLM_STYLE_SDPA_SEQ_LENS: list[int] | None = None
 
@@ -1116,8 +1118,7 @@ def install_match_vllm_kernels() -> None:
       - The RMSNorm patch only takes effect when batch-invariant mode is
         enabled (it replaces ``BatchInvariantRMSNormFn``, which the
         ``_te_rmsnorm_forward_patched`` shim looks up at call time).
-        Therefore the caller must have set
-        ``policy.megatron_cfg.batch_invariant_mode = true`` so
+        Therefore the caller must have set ``policy.bf16_true_on_policy=true`` so
         ``enable_batch_invariant_mode()`` has already run.
       - Recommended call site: ``MegatronPolicyWorkerImpl.__init__``,
         immediately after ``setup_model_and_optimizer`` returns.
@@ -1143,7 +1144,7 @@ def install_bi_mxfp8_matmul_qdq() -> None:
     dequants both inputs to bf16 and routes through the BF16 BI matmul).
 
     Pre-conditions:
-      - ``policy.megatron_cfg.batch_invariant_mode = true`` (the dequant
+      - ``policy.bf16_true_on_policy=true`` (the dequant
         hook is wired into Megatron's BI ``general_gemm`` patch).
       - The model is running the MXFP8 fp8 recipe
         (``policy.megatron_cfg.fp8_cfg.fp8_recipe == "mxfp8"``); otherwise
@@ -1161,3 +1162,48 @@ def install_bi_mxfp8_matmul_qdq() -> None:
 def install_bi_mxfp8_matmul() -> None:
     """Install native MXFP8 batch-invariant GEMM patches."""
     install_mxfp8_native_for_bi_gemm()
+
+
+def install_true_on_policy_patches(
+    *,
+    bf16_true_on_policy: bool,
+    mxfp8_matmul_batch_invariant: bool,
+    mxfp8_active: bool,
+) -> dict[str, str]:
+    """Install Megatron true-on-policy patches controlled by policy flags."""
+    installed: dict[str, str] = {}
+
+    if mxfp8_matmul_batch_invariant and not bf16_true_on_policy:
+        raise ValueError(
+            "policy.mxfp8_matmul_batch_invariant=True requires "
+            "policy.bf16_true_on_policy=True because that flag enables "
+            "Megatron batch-invariant mode and the BF16 vLLM-matching patches."
+        )
+
+    if bf16_true_on_policy:
+        install_match_vllm_kernels()
+        installed["bf16_true_on_policy"] = "match_vllm_kernels"
+
+    if mxfp8_matmul_batch_invariant:
+        if not mxfp8_active:
+            raise ValueError(
+                "policy.mxfp8_matmul_batch_invariant=True requires "
+                "policy.megatron_cfg.fp8_cfg.enabled=True with "
+                'fp8_cfg.fp8_recipe="mxfp8".'
+            )
+
+        backend = get_mxfp8_matmul_bi_backend()
+        if backend == "qdq":
+            install_bi_mxfp8_matmul_qdq()
+        else:
+            install_bi_mxfp8_matmul()
+        installed["mxfp8_matmul_batch_invariant"] = backend
+    elif mxfp8_active and bf16_true_on_policy:
+        # Megatron's BI general_gemm patch reads `A.is_cuda` on every call,
+        # but TE's MXFP8TensorStorage does not expose `is_cuda`, so any
+        # MXFP8 linear under BI mode raises AttributeError. Route MXFP8
+        # GEMMs to TE's original general_gemm; BF16 GEMMs still hit BI.
+        install_mxfp8_passthrough_for_bi_gemm()
+        installed["mxfp8_matmul_batch_invariant"] = "passthrough"
+
+    return installed

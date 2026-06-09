@@ -68,7 +68,6 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation import should_skip_vllm_refit
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -561,6 +560,15 @@ def setup(
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    bf16_true_on_policy = policy_config.get("bf16_true_on_policy") is True
+    mxfp8_matmul_batch_invariant = (
+        policy_config.get("mxfp8_matmul_batch_invariant") is True
+    )
+    if mxfp8_matmul_batch_invariant and not bf16_true_on_policy:
+        raise ValueError(
+            "policy.mxfp8_matmul_batch_invariant=True requires "
+            "policy.bf16_true_on_policy=True."
+        )
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
@@ -607,64 +615,37 @@ def setup(
     def init_vllm():
         """Initialize vLLM generation workers."""
         t0 = time.perf_counter()
-        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-        if (
-            generation_config["vllm_cfg"].get("use_batch_invariant_rmsnorm", None)
-            is True
-        ):
+        if bf16_true_on_policy or mxfp8_matmul_batch_invariant:
             if generation_config["vllm_cfg"]["async_engine"]:
                 raise ValueError(
-                    "policy.generation.vllm_cfg.use_batch_invariant_rmsnorm=True "
-                    "requires policy.generation.vllm_cfg.async_engine=false."
+                    "policy.bf16_true_on_policy=True or "
+                    "policy.mxfp8_matmul_batch_invariant=True requires "
+                    "policy.generation.vllm_cfg.async_engine=false."
                 )
-            patch_info = pg.install_batch_invariant_rmsnorm_patch()
-            print(
-                "  ✓ Installed vLLM batch-invariant residual RMSNorm patch: "
-                f"{patch_info}",
-                flush=True,
-            )
-        use_bi_mxfp8_matmul_qdq = (
-            generation_config["vllm_cfg"].get("use_bi_mxfp8_matmul_qdq", None) is True
-        )
-        use_bi_mxfp8_matmul = (
-            generation_config["vllm_cfg"].get("use_bi_mxfp8_matmul", None) is True
-        )
-        if use_bi_mxfp8_matmul_qdq and use_bi_mxfp8_matmul:
-            raise ValueError(
-                "Set only one of "
-                "policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=True "
-                "or policy.generation.vllm_cfg.use_bi_mxfp8_matmul=True."
-            )
-        if use_bi_mxfp8_matmul_qdq or use_bi_mxfp8_matmul:
-            if generation_config["vllm_cfg"]["async_engine"]:
-                raise ValueError(
-                    "policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=True "
-                    "or policy.generation.vllm_cfg.use_bi_mxfp8_matmul=True "
-                    "requires policy.generation.vllm_cfg.async_engine=false."
-                )
+        if mxfp8_matmul_batch_invariant:
             if generation_config["vllm_cfg"]["precision"] != "fp8":
                 raise ValueError(
-                    "policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=True "
-                    "or policy.generation.vllm_cfg.use_bi_mxfp8_matmul=True "
+                    "policy.mxfp8_matmul_batch_invariant=True "
                     "requires policy.generation.vllm_cfg.precision=fp8."
                 )
             if generation_config["vllm_cfg"].get("is_mx", None) is not True:
                 raise ValueError(
-                    "policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=True "
-                    "or policy.generation.vllm_cfg.use_bi_mxfp8_matmul=True "
+                    "policy.mxfp8_matmul_batch_invariant=True "
                     "requires policy.generation.vllm_cfg.is_mx=true."
                 )
-        if use_bi_mxfp8_matmul_qdq:
-            patch_info = pg.install_mxfp8_bi_emulation_patch()
-            print(
-                "  ✓ Installed vLLM MXFP8 dequant + BF16 BI matmul patch: "
-                f"{patch_info}",
-                flush=True,
+
+        pg = VllmGeneration(
+            cluster=inference_cluster,
+            config=generation_config,
+            bf16_true_on_policy=bf16_true_on_policy,
+        )
+        if bf16_true_on_policy or mxfp8_matmul_batch_invariant:
+            patch_info = pg.install_true_on_policy_patches(
+                bf16_true_on_policy=bf16_true_on_policy,
+                mxfp8_matmul_batch_invariant=mxfp8_matmul_batch_invariant,
             )
-        if use_bi_mxfp8_matmul:
-            patch_info = pg.install_mxfp8_bi_matmul_patch()
             print(
-                f"  ✓ Installed vLLM native MXFP8 BI matmul patch: {patch_info}",
+                f"  ✓ Installed vLLM true-on-policy patches: {patch_info}",
                 flush=True,
             )
         pg.finish_generation()
@@ -739,7 +720,6 @@ def setup(
         return policy_generation, policy
 
     # Handle generation-specific setup
-    skip_generation_refit = should_skip_vllm_refit(generation_config)
     if backend == "megatron":
         # Megatron generation: policy_generation is None, only initialize policy
         policy_generation = None
@@ -754,12 +734,12 @@ def setup(
     elif backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
-        if generation_config["vllm_cfg"].get("use_batch_invariant_rmsnorm") is True:
+        if bf16_true_on_policy:
             if not generation_config["vllm_cfg"].get("enforce_eager", False):
                 generation_config["vllm_cfg"]["enforce_eager"] = True
                 print(
                     "  ✓ Auto-enabled policy.generation.vllm_cfg.enforce_eager "
-                    "for batch-invariant vLLM RMSNorm",
+                    "for policy.bf16_true_on_policy",
                     flush=True,
                 )
         if generation_config["vllm_cfg"]["precision"] == "fp8":
@@ -828,7 +808,7 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference and not skip_generation_refit:
+    if not colocated_inference:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -846,23 +826,11 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
-    elif not colocated_inference and skip_generation_refit:
-        print(
-            "Skipping policy/generation collective initialization because "
-            "policy.generation.vllm_cfg.skip_refit=true.",
-            flush=True,
-        )
 
     # prepare refit info
-    if policy_generation is not None and not skip_generation_refit:
+    if policy_generation is not None:
         state_dict_info = policy.prepare_refit_info()
         policy_generation.prepare_refit_info(state_dict_info)
-    elif policy_generation is not None:
-        print(
-            "Skipping vLLM refit metadata preparation because "
-            "policy.generation.vllm_cfg.skip_refit=true.",
-            flush=True,
-        )
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -1650,13 +1618,6 @@ def grpo_train(
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
-    elif should_skip_vllm_refit(master_config.policy["generation"]):
-        NEED_REFIT = False
-        print(
-            "Skipping policy-to-vLLM refit because "
-            "policy.generation.vllm_cfg.skip_refit=true.",
-            flush=True,
-        )
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None  # for mypy type check
 
@@ -2908,13 +2869,6 @@ def async_grpo_train(
     if policy_generation is None:
         policy_generation = policy
         NEED_REFIT = False
-    elif should_skip_vllm_refit(master_config.policy["generation"]):
-        NEED_REFIT = False
-        print(
-            "Skipping policy-to-vLLM refit because "
-            "policy.generation.vllm_cfg.skip_refit=true.",
-            flush=True,
-        )
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 

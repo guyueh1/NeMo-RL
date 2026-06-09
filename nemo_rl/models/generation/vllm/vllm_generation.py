@@ -51,10 +51,12 @@ class VllmGeneration(GenerationInterface):
         config: VllmConfig,
         name_prefix: str = "vllm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
+        bf16_true_on_policy: bool = False,
     ):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
+        self.bf16_true_on_policy = bf16_true_on_policy
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -149,7 +151,7 @@ class VllmGeneration(GenerationInterface):
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
-        if self.cfg["vllm_cfg"].get("use_batch_invariant_rmsnorm", None) is True:
+        if self.bf16_true_on_policy:
             env_vars["VLLM_BATCH_INVARIANT"] = "1"
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
@@ -856,6 +858,21 @@ class VllmGeneration(GenerationInterface):
         """Install the batch-invariant residual RMSNorm patch on vLLM workers."""
         futures = self.worker_group.run_all_workers_single_data(
             "install_batch_invariant_rmsnorm_patch",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
+    def install_true_on_policy_patches(
+        self,
+        *,
+        bf16_true_on_policy: bool,
+        mxfp8_matmul_batch_invariant: bool,
+    ) -> list[Any]:
+        """Install true-on-policy patches on vLLM workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "install_true_on_policy_patches",
+            bf16_true_on_policy=bf16_true_on_policy,
+            mxfp8_matmul_batch_invariant=mxfp8_matmul_batch_invariant,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         return ray.get(futures)

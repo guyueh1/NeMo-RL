@@ -47,10 +47,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation import (
-    configure_generation_config,
-    should_skip_vllm_refit,
-)
+from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.utils.config import (
@@ -831,13 +828,6 @@ def run_logprob_comparison(
     if policy_generation is None:
         policy_generation = policy  # type: ignore[assignment]
         need_refit = False
-    elif should_skip_vllm_refit(master_config.policy["generation"]):
-        need_refit = False
-        print(
-            "Skipping policy-to-vLLM refit because "
-            "policy.generation.vllm_cfg.skip_refit=true.",
-            flush=True,
-        )
 
     assert policy_generation is not None
     policy_generation_stale = True

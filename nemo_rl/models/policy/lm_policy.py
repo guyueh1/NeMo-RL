@@ -238,15 +238,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         worker_py_executable = None
         if megatron_enable:
-            megatron_cfg = config["megatron_cfg"]
-            needs_vllm_in_worker = any(
-                bool(megatron_cfg.get(key, False))
-                for key in (
-                    "match_vllm_kernels",
-                    "match_vllm_mxfp8_matmul",
-                    "use_bi_mxfp8_matmul",
-                    "use_bi_mxfp8_matmul_qdq",
-                )
+            needs_vllm_in_worker = (
+                config.get("bf16_true_on_policy") is True
+                or config.get("mxfp8_matmul_batch_invariant") is True
             )
             if needs_vllm_in_worker:
                 worker_py_executable = PY_EXECUTABLES.MCORE_VLLM

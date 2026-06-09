@@ -27,22 +27,6 @@ class VllmSpecificArgs(TypedDict):
     skip_tokenizer_init: bool
     async_engine: bool
     load_format: NotRequired[str]
-    # Debug mode for comparing NeMo-RL vLLM against standalone vLLM. When true,
-    # configure_generation_config forces load_format="auto" and GRPO/distillation
-    # skip policy-to-vLLM weight refit, so generation stays on the weights loaded
-    # by vLLM from model_name. Recommended default: false.
-    skip_refit: NotRequired[bool]
-    # When true, set VLLM_BATCH_INVARIANT=1 and patch vLLM residual RMSNorm to
-    # use the same batch-invariant Triton RMSNorm path as standalone numeric
-    # comparison scripts. Recommended default: false.
-    use_batch_invariant_rmsnorm: NotRequired[bool]
-    # Numeric matching mode for MXFP8: route vLLM dense MXFP8 matmuls through
-    # dequant + BF16 batch-invariant matmul. Recommended default: false.
-    use_bi_mxfp8_matmul_qdq: NotRequired[bool]
-    # Native MXFP8 batch-invariant matmul mode: route vLLM dense MXFP8 matmuls
-    # through the Triton block-scaled MXFP8 BI matmul. Recommended default:
-    # false.
-    use_bi_mxfp8_matmul: NotRequired[bool]
     precision: NotRequired[str]
     is_mx: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]

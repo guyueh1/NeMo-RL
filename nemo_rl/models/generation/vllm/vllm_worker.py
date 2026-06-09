@@ -156,11 +156,6 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
-        self.use_batch_invariant_rmsnorm = (
-            self.cfg["vllm_cfg"].get("use_batch_invariant_rmsnorm", None) is True
-        )
-        if self.use_batch_invariant_rmsnorm:
-            os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -654,6 +649,25 @@ class BaseVllmGenerationWorker:
         torch.cuda.profiler.stop()
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+
+    def install_true_on_policy_patches(
+        self,
+        bf16_true_on_policy: bool,
+        mxfp8_matmul_batch_invariant: bool,
+    ) -> list[dict[str, Any]]:
+        """Install vLLM true-on-policy patches."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "True-on-policy vLLM patches are currently supported only "
+                "with sync vLLM. Set policy.generation.vllm_cfg.async_engine=false."
+            )
+        results = self.llm.collective_rpc(
+            "install_true_on_policy_patches",
+            args=(bf16_true_on_policy, mxfp8_matmul_batch_invariant),
+        )
+        return cast(list[dict[str, Any]], results)
 
     def install_batch_invariant_rmsnorm_patch(self) -> list[dict[str, Any]]:
         """Install the batch-invariant residual RMSNorm patch."""

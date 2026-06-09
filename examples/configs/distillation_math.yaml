@@ -41,6 +41,13 @@ policy: &POLICY_BASE
     logprob_batch_size: 1
     max_total_sequence_length: 8192
     precision: "bfloat16"
+    # Enable BF16 true-on-policy numeric matching across Megatron/vLLM:
+    # Megatron BI mode, VLLM_BATCH_INVARIANT, and BF16 kernel patches.
+    bf16_true_on_policy: false
+    # Enable MXFP8 batch-invariant matmul patches. Requires bf16_true_on_policy=true
+    # and MXFP8 fp8 recipe. Select backend with
+    # NEMO_RL_MXFP8_MATMUL_BI_BACKEND={native,qdq}.
+    mxfp8_matmul_batch_invariant: false
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false
@@ -87,12 +94,6 @@ policy: &POLICY_BASE
 
     megatron_cfg: &MEGATRON_BASE
         enabled: false
-        # Numeric matching mode for MXFP8: route Megatron MXFP8 dense matmuls
-        # through dequant + BF16 batch-invariant matmul.
-        use_bi_mxfp8_matmul_qdq: false
-        # Native MXFP8 batch-invariant mode: route Megatron MXFP8 dense matmuls
-        # through the Triton block-scaled MXFP8 BI matmul in no-grad forwards.
-        use_bi_mxfp8_matmul: false
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
@@ -211,18 +212,6 @@ policy: &POLICY_BASE
             gpu_memory_utilization: 0.6
             max_model_len: ${...max_total_sequence_length} # refer to local policy/teacher config
             enforce_eager: False
-            # Debug mode: load vLLM weights from policy.model_name with load_format="auto"
-            # and skip policy-to-vLLM refit. Keep false for training.
-            skip_refit: false
-            # Numeric matching mode: route vLLM residual RMSNorm through the same
-            # batch-invariant Triton path used by standalone matching scripts.
-            use_batch_invariant_rmsnorm: false
-            # Numeric matching mode for MXFP8: route vLLM MXFP8 dense matmuls
-            # through dequant + BF16 batch-invariant matmul.
-            use_bi_mxfp8_matmul_qdq: false
-            # Native MXFP8 batch-invariant mode: route vLLM MXFP8 dense matmuls
-            # through the Triton block-scaled MXFP8 BI matmul.
-            use_bi_mxfp8_matmul: false
             use_deep_gemm: False
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0

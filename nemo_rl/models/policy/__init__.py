@@ -275,22 +275,6 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
-    # When True, install BF16 kernel-matching monkey-patches so Megatron's
-    # forward numerics match vLLM bit-for-bit on Blackwell (RMSNorm, RoPE,
-    # SwiGLU, SDPA). Requires batch_invariant_mode=true. See
-    # nemo_rl/models/policy/megatron/vllm_kernel_patches.py and
-    # my_docs/llama3_8b_numeric_mismatch.md.
-    match_vllm_kernels: NotRequired[bool]
-    # When True, additionally install the MXFP8-specific QDQ patches (compact
-    # scales + dequant-for-BI-GEMM). Requires batch_invariant_mode=true,
-    # fp8_cfg.enabled=true with fp8_cfg.fp8_recipe="mxfp8", and (typically)
-    # match_vllm_kernels=true since the BF16 path feeds the MXFP8 GEMMs.
-    # See my_docs/llama3_8b_mxfp8_numeric_mismatch.md.
-    use_bi_mxfp8_matmul_qdq: NotRequired[bool]
-    # When True, route MXFP8 GEMMs through the native Triton block-scaled
-    # MXFP8 batch-invariant matmul. Requires batch_invariant_mode=true and
-    # fp8_cfg.enabled=true with fp8_cfg.fp8_recipe="mxfp8".
-    use_bi_mxfp8_matmul: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):
@@ -378,6 +362,16 @@ class PolicyConfig(TypedDict):
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
+    # When True, enable BF16 true-on-policy numeric matching. This turns on
+    # Megatron batch-invariant mode, sets VLLM_BATCH_INVARIANT for vLLM, and
+    # installs BF16 vLLM-matching patches in both engines. Recommended default:
+    # false.
+    bf16_true_on_policy: NotRequired[bool]
+    # When True, install the MXFP8 batch-invariant matmul patch in both engines.
+    # Requires bf16_true_on_policy=true and MXFP8 fp8 recipe. Select the backend
+    # with NEMO_RL_MXFP8_MATMUL_BI_BACKEND={native,qdq}. Recommended default:
+    # false.
+    mxfp8_matmul_batch_invariant: NotRequired[bool]
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]
     refit_buffer_size_gb: NotRequired[float]

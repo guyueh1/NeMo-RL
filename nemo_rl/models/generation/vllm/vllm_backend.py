@@ -53,6 +53,22 @@ def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor
 
 
 class VllmInternalWorkerExtension:
+    def install_true_on_policy_patches(
+        self,
+        bf16_true_on_policy: bool,
+        mxfp8_matmul_batch_invariant: bool,
+    ) -> dict[str, Any]:
+        """Install vLLM true-on-policy patches."""
+        from nemo_rl.models.generation.vllm.batch_invariant import (
+            install_true_on_policy_patches,
+        )
+
+        return install_true_on_policy_patches(
+            self.model_runner.model,
+            bf16_true_on_policy=bf16_true_on_policy,
+            mxfp8_matmul_batch_invariant=mxfp8_matmul_batch_invariant,
+        )
+
     def install_batch_invariant_rmsnorm_patch(self) -> dict[str, Any]:
         """Install the batch-invariant residual RMSNorm patch on vLLM."""
         from nemo_rl.models.generation.vllm.batch_invariant import (

@@ -20,6 +20,8 @@ from typing import Any
 
 import torch
 
+from nemo_rl.models.true_on_policy import get_mxfp8_matmul_bi_backend
+
 G_PATCH_MARKER_ATTR = "_nemo_rl_batch_invariant_residual_rmsnorm_patch"
 G_ORIGINAL_FORWARD_ATTR = "_nemo_rl_original_forward_cuda"
 G_MXFP8_QDQ_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_qdq_patch"
@@ -92,7 +94,8 @@ def install_mxfp8_bi_emulation_patch(model: torch.nn.Module) -> dict[str, Any]:
     ``mm_mxfp8``. Megatron's matching path dequants TE MXFP8 operands to BF16
     and then calls the BF16 batch-invariant persistent matmul. This patch makes
     vLLM generation use the same operation when
-    ``policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=true``.
+    ``policy.mxfp8_matmul_batch_invariant=true`` and
+    ``NEMO_RL_MXFP8_MATMUL_BI_BACKEND=qdq``.
     """
     del model  # The patch is module-level inside the vLLM worker process.
 
@@ -245,3 +248,35 @@ def install_mxfp8_bi_matmul_patch(model: torch.nn.Module) -> dict[str, Any]:
         "already_installed": already_installed,
         "patched": True,
     }
+
+
+def install_true_on_policy_patches(
+    model: torch.nn.Module,
+    *,
+    bf16_true_on_policy: bool,
+    mxfp8_matmul_batch_invariant: bool,
+) -> dict[str, Any]:
+    """Install vLLM true-on-policy patches controlled by policy-level flags."""
+    results: dict[str, Any] = {}
+
+    if mxfp8_matmul_batch_invariant and not bf16_true_on_policy:
+        raise ValueError(
+            "policy.mxfp8_matmul_batch_invariant=True requires "
+            "policy.bf16_true_on_policy=True because that flag enables "
+            "VLLM_BATCH_INVARIANT and the BF16 vLLM patches."
+        )
+
+    if bf16_true_on_policy:
+        results["batch_invariant_rmsnorm"] = install_batch_invariant_rmsnorm_patch(
+            model
+        )
+
+    if mxfp8_matmul_batch_invariant:
+        backend = get_mxfp8_matmul_bi_backend()
+        results["mxfp8_matmul_backend"] = backend
+        if backend == "qdq":
+            results["mxfp8_matmul"] = install_mxfp8_bi_emulation_patch(model)
+        else:
+            results["mxfp8_matmul"] = install_mxfp8_bi_matmul_patch(model)
+
+    return results

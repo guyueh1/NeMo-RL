@@ -353,6 +353,10 @@ conflicts = [
     { extra = "automodel" },
     { extra = "vllm" },
   ],
+  [
+    { extra = "vllm" },
+    { extra = "mcore" },
+  ],
 ]
 
 
