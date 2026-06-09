@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Mapping
 from typing import Any
@@ -74,6 +75,49 @@ def find_decoder_layers(model: torch.nn.Module) -> torch.nn.ModuleList:
                 return module
 
     raise RuntimeError("Could not find decoder layers on model.")
+
+
+def _callable_info(fn: Any) -> dict[str, Any]:
+    func = getattr(fn, "__func__", fn)
+    try:
+        source = inspect.getsource(func)
+    except (OSError, TypeError):
+        source = None
+    return {
+        "repr": repr(fn),
+        "module": getattr(func, "__module__", None),
+        "qualname": getattr(func, "__qualname__", None),
+        "source_head": source[:800] if isinstance(source, str) else None,
+    }
+
+
+def inspect_vllm_layernorm_impl(model: torch.nn.Module) -> dict[str, Any]:
+    """Inspect the runtime RMSNorm implementation used by vLLM layer 0."""
+    layers = find_decoder_layers(model)
+    layer0 = layers[0]
+    module = getattr(layer0, "post_attention_layernorm", None)
+    if module is None:
+        raise RuntimeError("layer 0 does not expose post_attention_layernorm")
+
+    from vllm.model_executor.layers import layernorm as vllm_layernorm
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    return {
+        "module_class": module.__class__.__module__
+        + "."
+        + module.__class__.__qualname__,
+        "is_rmsnorm": isinstance(module, RMSNorm),
+        "variance_epsilon": getattr(module, "variance_epsilon", None),
+        "hidden_size": getattr(module, "hidden_size", None),
+        "weight_dtype": str(getattr(getattr(module, "weight", None), "dtype", None)),
+        "forward_method": _callable_info(getattr(module, "_forward_method", None)),
+        "forward_cuda": _callable_info(getattr(module, "forward_cuda", None)),
+        "class_forward_cuda": _callable_info(RMSNorm.forward_cuda),
+        "fused_add_rms_norm": _callable_info(vllm_layernorm.fused_add_rms_norm),
+        "rms_norm_batch_invariant": _callable_info(
+            getattr(vllm_layernorm, "rms_norm_batch_invariant", None)
+        ),
+    }
 
 
 def install_debug_tensor_hooks(model: torch.nn.Module) -> dict[str, Any]:

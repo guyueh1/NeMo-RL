@@ -19,6 +19,7 @@ logits aligned with ``compare.py``'s scatter plot.
 
 import argparse
 import os
+import pprint
 
 # Required so apply_model() can ship our hook-installer closure to the worker
 # process via pickle (the default msgpack encoder rejects functions).
@@ -34,6 +35,7 @@ if _pre_args.batch_invariant:
 
 import torch
 from tensor_capture import (
+    inspect_vllm_layernorm_impl,
     install_debug_tensor_hooks,
     save_debug_tensor_capture_from_env,
 )
@@ -213,6 +215,54 @@ def load_prompts(dataset: str, subset: str, split: str, field: str, n: int, seed
     return prompts
 
 
+def _normalise_token_ids_list(value, lengths=None):
+    if isinstance(value, torch.Tensor):
+        token_ids_rows = value.detach().cpu().to(torch.long)
+        if token_ids_rows.dim() == 1:
+            token_ids_rows = token_ids_rows.unsqueeze(0)
+        if token_ids_rows.dim() != 2:
+            raise ValueError(
+                f"expected 1D or 2D token id tensor, got {tuple(token_ids_rows.shape)}"
+            )
+        if lengths is None:
+            return [
+                [int(token_id) for token_id in row.tolist()] for row in token_ids_rows
+            ]
+        length_values = [int(length) for length in lengths]
+        return [
+            [int(token_id) for token_id in token_ids_rows[i, :length].tolist()]
+            for i, length in enumerate(length_values)
+        ]
+
+    token_ids_list = []
+    for row in value:
+        if isinstance(row, torch.Tensor):
+            row = row.detach().cpu().to(torch.long).tolist()
+        token_ids_list.append([int(token_id) for token_id in row])
+    return token_ids_list
+
+
+def load_token_ids_from_file(path: str, token_ids_key: str):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(payload, dict):
+        if token_ids_key not in payload:
+            raise KeyError(f"{path} does not contain token id key {token_ids_key!r}")
+        lengths = payload.get("seq_lens")
+        if lengths is None:
+            lengths = payload.get("input_lengths")
+        token_ids_list = _normalise_token_ids_list(payload[token_ids_key], lengths)
+        prompts = payload.get("prompts")
+        if not isinstance(prompts, list) or len(prompts) != len(token_ids_list):
+            prompts = [f"{token_ids_key}[{i}]" for i in range(len(token_ids_list))]
+        else:
+            prompts = [str(prompt) for prompt in prompts]
+        return prompts, token_ids_list, payload
+
+    token_ids_list = _normalise_token_ids_list(payload)
+    prompts = [f"{token_ids_key}[{i}]" for i in range(len(token_ids_list))]
+    return prompts, token_ids_list, {"token_ids_list": token_ids_list}
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -239,8 +289,93 @@ def parse_args():
     p.add_argument("--dataset-split", default=DEFAULT_DATASET_SPLIT)
     p.add_argument("--dataset-field", default=DEFAULT_DATASET_FIELD)
     p.add_argument("--dataset-seed", type=int, default=0)
+    p.add_argument(
+        "--token-ids-file",
+        default=None,
+        help=(
+            "Torch .pt file containing token id rows to replay instead of "
+            "loading prompts from --dataset."
+        ),
+    )
+    p.add_argument(
+        "--token-ids-key",
+        default="token_ids_list",
+        help="Payload key to read from --token-ids-file (default: token_ids_list).",
+    )
     p.add_argument("--output", default=None)
     p.add_argument("--batch-invariant", action="store_true")
+    p.add_argument(
+        "--dump-engine-args",
+        action="store_true",
+        help="Print the exact vLLM LLM kwargs and sampling params used.",
+    )
+    p.add_argument(
+        "--engine-args-only",
+        action="store_true",
+        help="With --dump-engine-args, print args and exit before constructing LLM.",
+    )
+    p.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Optional vLLM max_model_len override.",
+    )
+    p.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=None,
+        help="Optional vLLM gpu_memory_utilization override.",
+    )
+    p.add_argument(
+        "--load-format",
+        default=None,
+        help="Optional vLLM load_format override.",
+    )
+    p.add_argument(
+        "--served-model-name",
+        default=None,
+        help="Optional vLLM served_model_name override.",
+    )
+    p.add_argument(
+        "--skip-tokenizer-init",
+        action="store_true",
+        help="Pass skip_tokenizer_init=True to vLLM. Only use with prompt_token_ids.",
+    )
+    p.add_argument(
+        "--enable-prefix-caching",
+        action="store_true",
+        help="Pass enable_prefix_caching=True to vLLM.",
+    )
+    p.add_argument(
+        "--enable-chunked-prefill",
+        action="store_true",
+        help="Pass enable_chunked_prefill=True to vLLM.",
+    )
+    p.add_argument(
+        "--no-enforce-eager",
+        action="store_true",
+        help="Run vLLM without enforce_eager=True, matching NeMo-RL default.",
+    )
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Pass trust_remote_code=True to vLLM.",
+    )
+    p.add_argument(
+        "--logprobs-mode",
+        default=None,
+        help="Optional vLLM logprobs_mode override.",
+    )
+    p.add_argument(
+        "--attention-backend",
+        default=None,
+        help="Optional vLLM attention_backend override.",
+    )
+    p.add_argument(
+        "--enable-log-stats",
+        action="store_true",
+        help="Pass disable_log_stats=False to vLLM.",
+    )
     p.add_argument(
         "--mxfp8",
         action="store_true",
@@ -264,6 +399,11 @@ def parse_args():
         help="Save layer-entry tensors for every decoder layer and "
         "input/output tensors for every module in decoder layer 0.",
     )
+    p.add_argument(
+        "--dump-layernorm-impl",
+        action="store_true",
+        help="Print the runtime vLLM layernorm implementation after model setup.",
+    )
     args = p.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
@@ -281,26 +421,37 @@ def main():
     )
     print(f"[vllm] model:     {args.model}")
     print(f"[vllm] tokenizer: {args.tokenizer}")
-    print(
-        f"[vllm] dataset:   {args.dataset}:{args.dataset_subset}:"
-        f"{args.dataset_split} field={args.dataset_field!r} n={args.num_prompts}"
-    )
+    if args.token_ids_file:
+        print(f"[vllm] token ids: {args.token_ids_file} key={args.token_ids_key!r}")
+    else:
+        print(
+            f"[vllm] dataset:   {args.dataset}:{args.dataset_subset}:"
+            f"{args.dataset_split} field={args.dataset_field!r} n={args.num_prompts}"
+        )
 
     debug_capture_path = args.output + ".debug_tensors.pt"
     if args.capture_debug_tensors:
         os.environ["DEBUG_TENSOR_CAPTURE_PATH"] = debug_capture_path
 
-    prompts = load_prompts(
-        args.dataset,
-        args.dataset_subset,
-        args.dataset_split,
-        args.dataset_field,
-        args.num_prompts,
-        args.dataset_seed,
-    )
-
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    token_ids_list = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
+    token_ids_payload = None
+    if args.token_ids_file:
+        prompts, token_ids_list, token_ids_payload = load_token_ids_from_file(
+            args.token_ids_file,
+            args.token_ids_key,
+        )
+    else:
+        prompts = load_prompts(
+            args.dataset,
+            args.dataset_subset,
+            args.dataset_split,
+            args.dataset_field,
+            args.num_prompts,
+            args.dataset_seed,
+        )
+        token_ids_list = [
+            tokenizer.encode(prompt, add_special_tokens=True) for prompt in prompts
+        ]
     seq_lens = [len(ids) for ids in token_ids_list]
     # Use the full tokenizer length (incl. added/special tokens), since the LM
     # head's logit dim matches this rather than the base vocab.
@@ -314,22 +465,86 @@ def main():
 
     # vLLM auto-detects MXFP8 via the ckpt's `quantization_config`; no extra
     # kwarg is needed. We keep activations in bf16 in both paths.
-    llm = LLM(
-        model=args.model,
-        tokenizer=args.tokenizer,
-        enforce_eager=True,
-        dtype="bfloat16",
-        tensor_parallel_size=1,
-        enable_prefix_caching=False,
-        enable_chunked_prefill=False,
-        max_logprobs=vocab_size,
-        seed=0,
-    )
+    llm_kwargs = {
+        "model": args.model,
+        "tokenizer": args.tokenizer,
+        "enforce_eager": not args.no_enforce_eager,
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 1,
+        "enable_prefix_caching": args.enable_prefix_caching,
+        "enable_chunked_prefill": args.enable_chunked_prefill,
+        "max_logprobs": vocab_size,
+        "seed": 0,
+    }
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
+    if args.gpu_memory_utilization is not None:
+        llm_kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
+    if args.load_format is not None:
+        llm_kwargs["load_format"] = args.load_format
+    if args.served_model_name is not None:
+        llm_kwargs["served_model_name"] = args.served_model_name
+    if args.skip_tokenizer_init:
+        llm_kwargs["skip_tokenizer_init"] = True
+    if args.trust_remote_code:
+        llm_kwargs["trust_remote_code"] = True
+    if args.logprobs_mode is not None:
+        llm_kwargs["logprobs_mode"] = args.logprobs_mode
+    if args.attention_backend is not None:
+        llm_kwargs["attention_backend"] = args.attention_backend
+    if args.enable_log_stats:
+        llm_kwargs["disable_log_stats"] = False
+
+    if args.dump_engine_args:
+        print(
+            "[vllm-engine-args] standalone_llm\n"
+            f"{pprint.pformat(llm_kwargs, sort_dicts=True)}",
+            flush=True,
+        )
+
+    sampling_kwargs = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 1,
+        "prompt_logprobs": None,
+        "logprobs": vocab_size,
+        "seed": 0,
+    }
+    if args.dump_engine_args:
+        print(
+            "[vllm-sampling-args] standalone_generate\n"
+            f"{pprint.pformat(sampling_kwargs, sort_dicts=True)}",
+            flush=True,
+        )
+    if args.engine_args_only:
+        return
+
+    llm = LLM(**llm_kwargs)
+
+    if args.dump_layernorm_impl:
+        before_info = unwrap_apply_model_result(
+            llm.apply_model(inspect_vllm_layernorm_impl)
+        )
+        print(
+            "[vllm-layernorm-impl] standalone_before_patch\n"
+            f"{pprint.pformat(before_info, sort_dicts=True)}",
+            flush=True,
+        )
 
     if args.batch_invariant:
         # Correctness fix: route the fused-add RMSNorm through the BI Triton
         # kernel; otherwise the cub::BlockReduce/rsqrtf path runs and drifts.
         llm.apply_model(install_rmsnorm_bi_residual_patch)
+
+    if args.dump_layernorm_impl:
+        after_info = unwrap_apply_model_result(
+            llm.apply_model(inspect_vllm_layernorm_impl)
+        )
+        print(
+            "[vllm-layernorm-impl] standalone_after_patch\n"
+            f"{pprint.pformat(after_info, sort_dicts=True)}",
+            flush=True,
+        )
 
     if args.mxfp8_bi_emulation:
         if not (args.mxfp8 and args.batch_invariant):
@@ -344,14 +559,7 @@ def main():
         )
         print(f"[vllm] debug tensor hooks installed: {hook_info}")
 
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=1,
-        prompt_logprobs=None,
-        logprobs=vocab_size,
-        seed=0,
-    )
+    sampling_params = SamplingParams(**sampling_kwargs)
     outputs = llm.generate(
         [{"prompt_token_ids": ids} for ids in token_ids_list],
         sampling_params=sampling_params,
@@ -385,6 +593,20 @@ def main():
         "seq_lens": seq_lens,
         "next_token_logprobs": next_token_logprobs,
     }
+    if token_ids_payload is not None:
+        payload["token_ids_source_file"] = args.token_ids_file
+        payload["token_ids_source_key"] = args.token_ids_key
+        for key in (
+            "offline_target_token_ids",
+            "offline_generation_logprobs",
+            "offline_metadata",
+            "sample_rows",
+            "sample_prompt_token_ids_list",
+            "sample_response_token_ids_list",
+            "sample_full_token_ids_list",
+        ):
+            if key in token_ids_payload:
+                payload[key] = token_ids_payload[key]
     if args.capture_debug_tensors:
         save_info = unwrap_apply_model_result(
             llm.apply_model(save_debug_tensor_capture_from_env)

@@ -31,7 +31,7 @@ from nemo_rl.distributed.batched_data_dict import (
     SlicedDataDict,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -236,9 +236,25 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             worker_kwargs["tokenizer"] = tokenizer
             worker_kwargs["processor"] = processor
 
+        worker_py_executable = None
+        if megatron_enable:
+            megatron_cfg = config["megatron_cfg"]
+            needs_vllm_in_worker = any(
+                bool(megatron_cfg.get(key, False))
+                for key in (
+                    "match_vllm_kernels",
+                    "match_vllm_mxfp8_matmul",
+                    "use_bi_mxfp8_matmul",
+                    "use_bi_mxfp8_matmul_qdq",
+                )
+            )
+            if needs_vllm_in_worker:
+                worker_py_executable = PY_EXECUTABLES.MCORE_VLLM
+
         worker_builder = RayWorkerBuilder(
             worker_builder_cls_fqn,
             config,
+            py_executable=worker_py_executable,
             **worker_kwargs,
         )
 

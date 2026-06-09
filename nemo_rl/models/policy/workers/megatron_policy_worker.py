@@ -204,19 +204,27 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Install vLLM kernel-matching monkey-patches so Megatron's forward
         # numerics match vLLM bit-for-bit. Runs after enable_batch_invariant_mode
         # (inside setup_model_and_optimizer) but before any forward pass.
-        # Two independent knobs: BF16 patches (RMSNorm/RoPE/SwiGLU/SDPA) and
-        # MXFP8-specific patches (compact scales + dequant-for-BI-GEMM).
+        # Three independent knobs: BF16 patches (RMSNorm/RoPE/SwiGLU/SDPA),
+        # MXFP8 QDQ patches (compact scales + dequant-for-BI-GEMM), and the
+        # native MXFP8 BI matmul patch.
         megatron_cfg_dict = config["megatron_cfg"]
         match_vllm_kernels = megatron_cfg_dict.get("match_vllm_kernels")
-        match_vllm_mxfp8_matmul = megatron_cfg_dict.get("match_vllm_mxfp8_matmul")
+        use_bi_mxfp8_matmul_qdq = megatron_cfg_dict.get("use_bi_mxfp8_matmul_qdq")
+        use_bi_mxfp8_matmul = megatron_cfg_dict.get("use_bi_mxfp8_matmul")
 
-        if match_vllm_kernels or match_vllm_mxfp8_matmul:
+        if use_bi_mxfp8_matmul_qdq and use_bi_mxfp8_matmul:
+            raise ValueError(
+                "Set only one of policy.megatron_cfg.use_bi_mxfp8_matmul_qdq=True "
+                "or policy.megatron_cfg.use_bi_mxfp8_matmul=True."
+            )
+
+        if match_vllm_kernels or use_bi_mxfp8_matmul_qdq or use_bi_mxfp8_matmul:
             if not megatron_cfg_dict.get("batch_invariant_mode"):
                 raise ValueError(
                     "policy.megatron_cfg.match_vllm_kernels and "
-                    "policy.megatron_cfg.match_vllm_mxfp8_matmul require "
+                    "policy.megatron_cfg.use_bi_mxfp8_matmul_qdq/use_bi_mxfp8_matmul require "
                     "policy.megatron_cfg.batch_invariant_mode=True; the "
-                    "RMSNorm and MXFP8-dequant patches no-op without "
+                    "RMSNorm and MXFP8 patches no-op without "
                     "batch-invariant mode."
                 )
 
@@ -234,16 +242,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             and fp8_cfg.get("fp8_recipe") == "mxfp8"
         )
 
-        if match_vllm_mxfp8_matmul:
+        if use_bi_mxfp8_matmul_qdq or use_bi_mxfp8_matmul:
             if not mxfp8_active:
                 raise ValueError(
-                    "policy.megatron_cfg.match_vllm_mxfp8_matmul=True requires "
+                    "policy.megatron_cfg.use_bi_mxfp8_matmul_qdq=True or "
+                    "policy.megatron_cfg.use_bi_mxfp8_matmul=True requires "
                     "policy.megatron_cfg.fp8_cfg.enabled=True with "
                     'fp8_cfg.fp8_recipe="mxfp8".'
                 )
+
+        if use_bi_mxfp8_matmul_qdq:
             if not match_vllm_kernels:
                 raise ValueError(
-                    "policy.megatron_cfg.match_vllm_mxfp8_matmul=True also "
+                    "policy.megatron_cfg.use_bi_mxfp8_matmul_qdq=True also "
                     "requires policy.megatron_cfg.match_vllm_kernels=True; "
                     "without the BF16 patches the per-layer inputs to the "
                     "MXFP8 GEMMs already diverge across engines, so matching "
@@ -251,10 +262,16 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 )
 
             from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
-                install_match_vllm_mxfp8_matmul,
+                install_bi_mxfp8_matmul_qdq,
             )
 
-            install_match_vllm_mxfp8_matmul()
+            install_bi_mxfp8_matmul_qdq()
+        elif use_bi_mxfp8_matmul:
+            from nemo_rl.models.policy.megatron.vllm_kernel_patches import (
+                install_bi_mxfp8_matmul,
+            )
+
+            install_bi_mxfp8_matmul()
         elif mxfp8_active and megatron_cfg_dict.get("batch_invariant_mode"):
             # Megatron's BI general_gemm patch reads `A.is_cuda` on every call,
             # but TE's MXFP8TensorStorage does not expose `is_cuda`, so any

@@ -59,6 +59,22 @@ def parse_args():
         help="Device used to normalize Megatron logits before "
         "comparing against vLLM logprobs.",
     )
+    p.add_argument(
+        "--target-token-ids-file",
+        default=None,
+        help=(
+            "Optional torch .pt token dump containing the target token id for "
+            "each compared prompt prefix."
+        ),
+    )
+    p.add_argument(
+        "--target-token-ids-key",
+        default="offline_target_token_ids",
+        help=(
+            "Payload key to read from --target-token-ids-file "
+            "(default: offline_target_token_ids)."
+        ),
+    )
     args = p.parse_args()
     suffix = ""
     if args.mxfp8:
@@ -71,6 +87,24 @@ def parse_args():
     if args.plot is None:
         args.plot = os.path.join(DEFAULT_DIR, f"compare_logits_scatter{suffix}.png")
     return args
+
+
+def load_target_token_ids(path, key):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(payload, dict):
+        if key not in payload:
+            raise KeyError(f"{path} does not contain target token key {key!r}")
+        value = payload[key]
+        metadata = payload.get("offline_metadata", [])
+    else:
+        value = payload
+        metadata = []
+
+    if isinstance(value, torch.Tensor):
+        target_token_ids = [int(token_id) for token_id in value.flatten().tolist()]
+    else:
+        target_token_ids = [int(token_id) for token_id in value]
+    return target_token_ids, metadata
 
 
 def diff_stats(a, b):
@@ -663,6 +697,62 @@ def main():
     print("\nAggregate (all prompts, all vocab):")
     for k, val in diff_stats(v_logprobs, m_logprobs).items():
         print(f"  {k}: {val}")
+
+    if args.target_token_ids_file:
+        target_token_ids, target_metadata = load_target_token_ids(
+            args.target_token_ids_file,
+            args.target_token_ids_key,
+        )
+        target_count = min(n, len(target_token_ids))
+        if target_count < n:
+            print(
+                "[warn] fewer target token ids than compared rows: "
+                f"targets={len(target_token_ids)} rows={n}; using {target_count}"
+            )
+        selected_rows = torch.arange(target_count)
+        selected_targets = torch.tensor(
+            target_token_ids[:target_count], dtype=torch.long
+        )
+        v_selected = v_logprobs[selected_rows, selected_targets]
+        m_selected = m_logprobs[selected_rows, selected_targets]
+        selected_diff = m_selected - v_selected
+        selected_abs = selected_diff.abs()
+        selected_rel = selected_abs / torch.maximum(
+            torch.maximum(v_selected.abs(), m_selected.abs()),
+            torch.full_like(selected_abs, 1e-12),
+        )
+
+        print("\nSelected target-token logprobs:")
+        print(f"  target file: {args.target_token_ids_file}")
+        print(f"  n: {target_count}")
+        print(f"  mean_abs_diff: {float(selected_abs.mean()):.8e}")
+        print(f"  max_abs_diff: {float(selected_abs.max()):.8e}")
+        print(f"  mean_rel_diff: {float(selected_rel.mean()):.8e}")
+        print(f"  max_rel_diff: {float(selected_rel.max()):.8e}")
+        print(f"  mean_signed_diff: {float(selected_diff.mean()):.8e}")
+        print("  worst selected-token diffs:")
+        worst_count = min(10, target_count)
+        top_abs, top_indices = torch.topk(selected_abs, worst_count)
+        for rank, (abs_value, index) in enumerate(
+            zip(top_abs.tolist(), top_indices.tolist()),
+            start=1,
+        ):
+            meta = (
+                target_metadata[index]
+                if isinstance(target_metadata, list) and index < len(target_metadata)
+                else {}
+            )
+            print(
+                "    "
+                f"#{rank} row={index} "
+                f"sample={meta.get('sample_idx', '?')} "
+                f"pos={meta.get('position', '?')} "
+                f"token={int(selected_targets[index].item())} "
+                f"vllm={float(v_selected[index]):.8e} "
+                f"megatron={float(m_selected[index]):.8e} "
+                f"abs={float(abs_value):.8e} "
+                f"rel={float(selected_rel[index]):.8e}"
+            )
 
     plot_scatter(v_logprobs, m_logprobs, args.plot, args.max_points)
     print(f"\nscatter plot -> {args.plot}")

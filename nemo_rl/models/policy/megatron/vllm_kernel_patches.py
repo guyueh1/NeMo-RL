@@ -27,9 +27,8 @@ All six patches are class-level / module-level monkey-patches: they take
 effect for every layer of every model from the moment they're applied,
 without any per-layer instrumentation.
 
-The four BF16-only patches are safe to apply unconditionally; the two
-MXFP8-only patches are gated on ``mxfp8=True`` in
-``install_match_vllm_kernels``.
+The four BF16-only patches are safe to apply unconditionally; MXFP8-specific
+patches are gated by the policy Megatron MXFP8 BI config flags.
 """
 
 from __future__ import annotations
@@ -877,6 +876,170 @@ def install_mxfp8_dequant_for_bi_gemm() -> None:
             setattr(mod, attr, _wrapper)
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _is_mxfp8_operand(t) -> bool:
+    return (
+        not isinstance(t, torch.Tensor)
+        and getattr(t, "_rowwise_data", None) is not None
+        and getattr(t, "_rowwise_scale_inv", None) is not None
+    )
+
+
+def _swizzle_mxfp8_scale(scale_2d: torch.Tensor, *, m: int, k: int) -> torch.Tensor:
+    scale_cols = k // 32
+    num_m_tiles = _ceil_div(m, 128)
+    num_k_tiles = _ceil_div(scale_cols, 4)
+    padded = torch.zeros(
+        (num_m_tiles * 128, num_k_tiles * 4),
+        dtype=scale_2d.dtype,
+        device=scale_2d.device,
+    )
+    padded[:m, :scale_cols] = scale_2d[:m, :scale_cols]
+    return (
+        padded.view(num_m_tiles, 4, 32, num_k_tiles, 4)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .flatten()
+    )
+
+
+def _as_swizzled_mxfp8_scale(
+    scale: torch.Tensor,
+    *,
+    m: int,
+    k: int,
+    is_swizzled: bool,
+) -> torch.Tensor:
+    scale_cols = k // 32
+    swizzled_numel = _ceil_div(m, 128) * _ceil_div(scale_cols, 4) * 512
+    if is_swizzled:
+        if scale.numel() < swizzled_numel:
+            raise RuntimeError(
+                "MXFP8 swizzled scale is too small for native BI matmul: "
+                f"got {scale.numel()}, need {swizzled_numel}."
+            )
+        return scale.flatten()[:swizzled_numel].contiguous()
+    if scale.dim() == 1:
+        scale = scale[: m * scale_cols].view(m, scale_cols)
+    return _swizzle_mxfp8_scale(scale, m=m, k=k)
+
+
+def _mxfp8_operand_from_te_storage(t) -> tuple[torch.Tensor, torch.Tensor]:
+    data = getattr(t, "_rowwise_data")
+    scale = getattr(t, "_rowwise_scale_inv")
+    if data.dtype == torch.uint8:
+        data = data.view(torch.float8_e4m3fn)
+    if data.dim() > 2:
+        data = data.reshape(-1, data.shape[-1])
+    if data.dim() != 2:
+        raise RuntimeError(
+            f"MXFP8 native BI matmul requires 2D data, got {data.shape}."
+        )
+    scale = _as_swizzled_mxfp8_scale(
+        scale,
+        m=data.shape[0],
+        k=data.shape[1],
+        is_swizzled=bool(getattr(t, "_with_gemm_swizzled_scales", False)),
+    )
+    return data.contiguous(), scale
+
+
+def _mxfp8_operand_from_plain_tensor(
+    t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize
+
+    if t.dim() > 2:
+        t = t.reshape(-1, t.shape[-1])
+    if t.dim() != 2:
+        raise RuntimeError(f"MXFP8 native BI matmul requires 2D data, got {t.shape}.")
+    return mxfp8_quantize(t.contiguous())
+
+
+def install_mxfp8_native_for_bi_gemm() -> None:
+    """Route MXFP8 forward GEMMs through the native MXFP8 BI matmul."""
+    import megatron.core.extensions.transformer_engine as meg_te
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
+    import transformer_engine.pytorch.module.linear as te_linear_mod
+    from megatron.core.transformer.custom_layers import (
+        batch_invariant_kernels as bik_mod,
+    )
+
+    if bik_mod._TE_GENERAL_GEMM_ORIG is None:
+        raise RuntimeError(
+            "enable_batch_invariant_mode() must run before "
+            "install_mxfp8_native_for_bi_gemm()"
+        )
+
+    orig_gemm = bik_mod._TE_GENERAL_GEMM_ORIG
+    extract = bik_mod._extract_te_gemm_args
+    native_mxfp8_matmul = bik_mod.mxfp8_matmul_persistent
+    bf16_bi_gemm = bik_mod._te_general_gemm_patched
+
+    def _wrapper(*args, **kwargs):
+        a, b, out_dtype, layout, out_tensor, bias, grad = extract(args, kwargs)
+        if not _is_mxfp8_operand(a) and not _is_mxfp8_operand(b):
+            return bf16_bi_gemm(*args, **kwargs)
+        if grad or layout.upper() != "TN":
+            return orig_gemm(*args, **kwargs)
+
+        extra_output = kwargs.get("extra_output", None)
+        ub = kwargs.get("ub", None)
+        ub_type = kwargs.get("ub_type", None)
+        bulk_overlap = kwargs.get("bulk_overlap", False)
+        if (
+            extra_output is not None
+            or ub is not None
+            or ub_type is not None
+            or bulk_overlap
+        ):
+            raise RuntimeError(
+                "Native MXFP8 batch-invariant GEMM does not support "
+                "Userbuffers/overlap (extra_output/ub/ub_type/bulk_overlap)."
+            )
+
+        if torch.is_grad_enabled():
+            return orig_gemm(*args, **kwargs)
+
+        if _is_mxfp8_operand(a):
+            weight_mxfp8 = _mxfp8_operand_from_te_storage(a)
+        else:
+            weight_mxfp8 = _mxfp8_operand_from_plain_tensor(a)
+
+        if _is_mxfp8_operand(b):
+            leading_shape = getattr(b, "_rowwise_data").shape[:-1]
+            activation_mxfp8 = _mxfp8_operand_from_te_storage(b)
+        else:
+            leading_shape = b.shape[:-1]
+            activation_mxfp8 = _mxfp8_operand_from_plain_tensor(b)
+
+        result_2d = native_mxfp8_matmul(
+            activation_mxfp8,
+            weight_mxfp8,
+            bias=bias,
+            output_dtype=out_dtype or torch.bfloat16,
+        )
+        result = result_2d.reshape(*leading_shape, result_2d.shape[-1])
+
+        if out_tensor is not None:
+            out_tensor.copy_(result)
+            return (out_tensor, None, None, extra_output)
+        return (result, None, None, extra_output)
+
+    for mod, attr in (
+        (te_cpp, "general_gemm"),
+        (te_linear_mod, "general_gemm"),
+        (te_layernorm_linear_mod, "general_gemm"),
+        (meg_te, "general_gemm"),
+    ):
+        if hasattr(mod, attr):
+            setattr(mod, attr, _wrapper)
+
+
 class _SplitNormLinear(torch.nn.Module):
     """Drop-in for TE's fused ``LayerNormColumnParallelLinear``.
 
@@ -960,8 +1123,9 @@ def install_match_vllm_kernels() -> None:
         immediately after ``setup_model_and_optimizer`` returns.
 
     For MXFP8 GEMM matching, separately call
-    :func:`install_match_vllm_mxfp8_matmul` (and ensure the model is
-    running the MXFP8 fp8 recipe).
+    :func:`install_bi_mxfp8_matmul_qdq` or
+    :func:`install_bi_mxfp8_matmul` (and ensure the model is running the
+    MXFP8 fp8 recipe).
     """
     install_vllm_style_rmsnorm()
     install_vllm_style_rmsnom_to_te()
@@ -970,8 +1134,8 @@ def install_match_vllm_kernels() -> None:
     install_vllm_style_sdpa()
 
 
-def install_match_vllm_mxfp8_matmul() -> None:
-    """Install MXFP8-specific patches: compact scales + dequant-for-BI-GEMM.
+def install_bi_mxfp8_matmul_qdq() -> None:
+    """Install MXFP8-specific QDQ patches: compact scales + dequant-for-BI-GEMM.
 
     Installs ``install_mxfp8_compact_scales`` (property override forcing
     MXFP8 tensors to compact-scale layout) and
@@ -992,3 +1156,8 @@ def install_match_vllm_mxfp8_matmul() -> None:
     """
     install_mxfp8_compact_scales()
     install_mxfp8_dequant_for_bi_gemm()
+
+
+def install_bi_mxfp8_matmul() -> None:
+    """Install native MXFP8 batch-invariant GEMM patches."""
+    install_mxfp8_native_for_bi_gemm()

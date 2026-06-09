@@ -868,6 +868,14 @@ class VllmGeneration(GenerationInterface):
         )
         return ray.get(futures)
 
+    def install_mxfp8_bi_matmul_patch(self) -> list[Any]:
+        """Install the native MXFP8 BI matmul patch on vLLM workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "install_mxfp8_bi_matmul_patch",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
     def install_debug_tensor_hooks(self, max_calls_per_module: int = 1) -> list[Any]:
         """Install tensor dump hooks on generation workers."""
         futures = self.worker_group.run_all_workers_single_data(

@@ -623,26 +623,48 @@ def setup(
                 f"{patch_info}",
                 flush=True,
             )
-        if generation_config["vllm_cfg"].get("match_vllm_mxfp8_matmul", None) is True:
+        use_bi_mxfp8_matmul_qdq = (
+            generation_config["vllm_cfg"].get("use_bi_mxfp8_matmul_qdq", None) is True
+        )
+        use_bi_mxfp8_matmul = (
+            generation_config["vllm_cfg"].get("use_bi_mxfp8_matmul", None) is True
+        )
+        if use_bi_mxfp8_matmul_qdq and use_bi_mxfp8_matmul:
+            raise ValueError(
+                "Set only one of "
+                "policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=True "
+                "or policy.generation.vllm_cfg.use_bi_mxfp8_matmul=True."
+            )
+        if use_bi_mxfp8_matmul_qdq or use_bi_mxfp8_matmul:
             if generation_config["vllm_cfg"]["async_engine"]:
                 raise ValueError(
-                    "policy.generation.vllm_cfg.match_vllm_mxfp8_matmul=True "
+                    "policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=True "
+                    "or policy.generation.vllm_cfg.use_bi_mxfp8_matmul=True "
                     "requires policy.generation.vllm_cfg.async_engine=false."
                 )
             if generation_config["vllm_cfg"]["precision"] != "fp8":
                 raise ValueError(
-                    "policy.generation.vllm_cfg.match_vllm_mxfp8_matmul=True "
+                    "policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=True "
+                    "or policy.generation.vllm_cfg.use_bi_mxfp8_matmul=True "
                     "requires policy.generation.vllm_cfg.precision=fp8."
                 )
             if generation_config["vllm_cfg"].get("is_mx", None) is not True:
                 raise ValueError(
-                    "policy.generation.vllm_cfg.match_vllm_mxfp8_matmul=True "
+                    "policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=True "
+                    "or policy.generation.vllm_cfg.use_bi_mxfp8_matmul=True "
                     "requires policy.generation.vllm_cfg.is_mx=true."
                 )
+        if use_bi_mxfp8_matmul_qdq:
             patch_info = pg.install_mxfp8_bi_emulation_patch()
             print(
                 "  ✓ Installed vLLM MXFP8 dequant + BF16 BI matmul patch: "
                 f"{patch_info}",
+                flush=True,
+            )
+        if use_bi_mxfp8_matmul:
+            patch_info = pg.install_mxfp8_bi_matmul_patch()
+            print(
+                f"  ✓ Installed vLLM native MXFP8 BI matmul patch: {patch_info}",
                 flush=True,
             )
         pg.finish_generation()

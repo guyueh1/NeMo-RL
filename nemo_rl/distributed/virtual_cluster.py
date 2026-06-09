@@ -58,6 +58,10 @@ class PY_EXECUTABLES:
     # Use NeMo-RL direct dependencies and Megatron.
     MCORE = f"uv run --locked --extra mcore --directory {git_root}"
 
+    # Use Megatron plus vLLM internals. This is needed for Megatron kernels that
+    # intentionally match vLLM's batch-invariant implementations.
+    MCORE_VLLM = f"uv run --locked --extra mcore --extra vllm --directory {git_root}"
+
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 

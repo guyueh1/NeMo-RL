@@ -37,9 +37,12 @@ class VllmSpecificArgs(TypedDict):
     # comparison scripts. Recommended default: false.
     use_batch_invariant_rmsnorm: NotRequired[bool]
     # Numeric matching mode for MXFP8: route vLLM dense MXFP8 matmuls through
-    # dequant + BF16 batch-invariant matmul, matching Megatron's
-    # match_vllm_mxfp8_matmul path. Recommended default: false.
-    match_vllm_mxfp8_matmul: NotRequired[bool]
+    # dequant + BF16 batch-invariant matmul. Recommended default: false.
+    use_bi_mxfp8_matmul_qdq: NotRequired[bool]
+    # Native MXFP8 batch-invariant matmul mode: route vLLM dense MXFP8 matmuls
+    # through the Triton block-scaled MXFP8 BI matmul. Recommended default:
+    # false.
+    use_bi_mxfp8_matmul: NotRequired[bool]
     precision: NotRequired[str]
     is_mx: NotRequired[bool]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]

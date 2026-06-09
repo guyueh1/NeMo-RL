@@ -22,7 +22,8 @@ import torch
 
 G_PATCH_MARKER_ATTR = "_nemo_rl_batch_invariant_residual_rmsnorm_patch"
 G_ORIGINAL_FORWARD_ATTR = "_nemo_rl_original_forward_cuda"
-G_MXFP8_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_emulation_patch"
+G_MXFP8_QDQ_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_qdq_patch"
+G_MXFP8_NATIVE_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_native_patch"
 G_ORIGINAL_MXFP8_MM_ATTR = "_nemo_rl_original_mm_mxfp8"
 
 
@@ -91,7 +92,7 @@ def install_mxfp8_bi_emulation_patch(model: torch.nn.Module) -> dict[str, Any]:
     ``mm_mxfp8``. Megatron's matching path dequants TE MXFP8 operands to BF16
     and then calls the BF16 batch-invariant persistent matmul. This patch makes
     vLLM generation use the same operation when
-    ``policy.generation.vllm_cfg.match_vllm_mxfp8_matmul=true``.
+    ``policy.generation.vllm_cfg.use_bi_mxfp8_matmul_qdq=true``.
     """
     del model  # The patch is module-level inside the vLLM worker process.
 
@@ -104,7 +105,7 @@ def install_mxfp8_bi_emulation_patch(model: torch.nn.Module) -> dict[str, Any]:
 
     current_mm_mxfp8 = vllm_flashinfer.mm_mxfp8
     already_installed = bool(
-        getattr(current_mm_mxfp8, G_MXFP8_PATCH_MARKER_ATTR, False)
+        getattr(current_mm_mxfp8, G_MXFP8_QDQ_PATCH_MARKER_ATTR, False)
     )
     original_mm_mxfp8 = getattr(
         current_mm_mxfp8,
@@ -148,7 +149,95 @@ def install_mxfp8_bi_emulation_patch(model: torch.nn.Module) -> dict[str, Any]:
             weight_bf16 = dequant_mxfp8_to_bf16(b.t().contiguous(), b_scale_2d)
             return matmul_persistent(a_bf16, weight_bf16.t()).to(out_dtype)
 
-        setattr(_bi_mm_mxfp8, G_MXFP8_PATCH_MARKER_ATTR, True)
+        setattr(_bi_mm_mxfp8, G_MXFP8_QDQ_PATCH_MARKER_ATTR, True)
+        setattr(_bi_mm_mxfp8, G_ORIGINAL_MXFP8_MM_ATTR, original_mm_mxfp8)
+        vllm_flashinfer.mm_mxfp8 = _bi_mm_mxfp8
+
+    return {
+        "already_installed": already_installed,
+        "patched": True,
+    }
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _swizzle_mxfp8_scale(scale_2d: torch.Tensor, *, m: int, k: int) -> torch.Tensor:
+    """Convert compact [M, K / 32] E8M0 scales to the cuBLAS swizzled layout."""
+    block_size = 32
+    scale_cols = k // block_size
+    num_m_tiles = _ceil_div(m, 128)
+    num_k_tiles = _ceil_div(scale_cols, 4)
+    padded = torch.zeros(
+        (num_m_tiles * 128, num_k_tiles * 4),
+        dtype=scale_2d.dtype,
+        device=scale_2d.device,
+    )
+    padded[:m, :scale_cols] = scale_2d[:m, :scale_cols]
+    return (
+        padded.view(num_m_tiles, 4, 32, num_k_tiles, 4)
+        .permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .flatten()
+    )
+
+
+def _as_swizzled_mxfp8_scale(scale: torch.Tensor, *, m: int, k: int) -> torch.Tensor:
+    scale_cols = k // 32
+    swizzled_numel = _ceil_div(m, 128) * _ceil_div(scale_cols, 4) * 512
+    if scale.dim() == 1 and scale.numel() == swizzled_numel:
+        return scale.contiguous()
+    if scale.dim() == 2:
+        return _swizzle_mxfp8_scale(scale, m=m, k=k)
+    if scale.dim() == 1 and scale.numel() == m * scale_cols:
+        return _swizzle_mxfp8_scale(scale.view(m, scale_cols), m=m, k=k)
+    raise RuntimeError(
+        "Unsupported MXFP8 scale layout for native BI matmul: "
+        f"shape={tuple(scale.shape)}, expected swizzled numel={swizzled_numel} "
+        f"or compact shape=({m}, {scale_cols})."
+    )
+
+
+def install_mxfp8_bi_matmul_patch(model: torch.nn.Module) -> dict[str, Any]:
+    """Route vLLM MXFP8 GEMM through native block-scaled BI matmul."""
+    del model  # The patch is module-level inside the vLLM worker process.
+
+    import vllm.utils.flashinfer as vllm_flashinfer
+    from vllm.model_executor.layers.batch_invariant import mxfp8_matmul_persistent
+
+    current_mm_mxfp8 = vllm_flashinfer.mm_mxfp8
+    already_installed = bool(
+        getattr(current_mm_mxfp8, G_MXFP8_NATIVE_PATCH_MARKER_ATTR, False)
+    )
+    original_mm_mxfp8 = getattr(
+        current_mm_mxfp8,
+        G_ORIGINAL_MXFP8_MM_ATTR,
+        current_mm_mxfp8,
+    )
+
+    if not already_installed:
+
+        def _bi_mm_mxfp8(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+            out_dtype: torch.dtype,
+            backend: str = "cutlass",  # noqa: ARG001 - preserves vLLM API.
+        ) -> torch.Tensor:
+            # a: [M, K] activation. b: [K, N] transposed [N, K] weight.
+            m, k = a.shape
+            n = b.shape[1]
+            a_scale_swizzled = _as_swizzled_mxfp8_scale(a_scale, m=m, k=k)
+            b_scale_swizzled = _as_swizzled_mxfp8_scale(b_scale, m=n, k=k)
+            return mxfp8_matmul_persistent(
+                (a, a_scale_swizzled),
+                (b.t().contiguous(), b_scale_swizzled),
+                output_dtype=out_dtype,
+            )
+
+        setattr(_bi_mm_mxfp8, G_MXFP8_NATIVE_PATCH_MARKER_ATTR, True)
         setattr(_bi_mm_mxfp8, G_ORIGINAL_MXFP8_MM_ATTR, original_mm_mxfp8)
         vllm_flashinfer.mm_mxfp8 = _bi_mm_mxfp8
 

@@ -72,6 +72,54 @@ def load_prompts(dataset, subset, split, field, n, seed):
     return prompts
 
 
+def _normalise_token_ids_list(value, lengths=None):
+    if isinstance(value, torch.Tensor):
+        token_ids_rows = value.detach().cpu().to(torch.long)
+        if token_ids_rows.dim() == 1:
+            token_ids_rows = token_ids_rows.unsqueeze(0)
+        if token_ids_rows.dim() != 2:
+            raise ValueError(
+                f"expected 1D or 2D token id tensor, got {tuple(token_ids_rows.shape)}"
+            )
+        if lengths is None:
+            return [
+                [int(token_id) for token_id in row.tolist()] for row in token_ids_rows
+            ]
+        length_values = [int(length) for length in lengths]
+        return [
+            [int(token_id) for token_id in token_ids_rows[i, :length].tolist()]
+            for i, length in enumerate(length_values)
+        ]
+
+    token_ids_list = []
+    for row in value:
+        if isinstance(row, torch.Tensor):
+            row = row.detach().cpu().to(torch.long).tolist()
+        token_ids_list.append([int(token_id) for token_id in row])
+    return token_ids_list
+
+
+def load_token_ids_from_file(path: str, token_ids_key: str):
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(payload, dict):
+        if token_ids_key not in payload:
+            raise KeyError(f"{path} does not contain token id key {token_ids_key!r}")
+        lengths = payload.get("seq_lens")
+        if lengths is None:
+            lengths = payload.get("input_lengths")
+        token_ids_list = _normalise_token_ids_list(payload[token_ids_key], lengths)
+        prompts = payload.get("prompts")
+        if not isinstance(prompts, list) or len(prompts) != len(token_ids_list):
+            prompts = [f"{token_ids_key}[{i}]" for i in range(len(token_ids_list))]
+        else:
+            prompts = [str(prompt) for prompt in prompts]
+        return prompts, token_ids_list, payload
+
+    token_ids_list = _normalise_token_ids_list(payload)
+    prompts = [f"{token_ids_key}[{i}]" for i in range(len(token_ids_list))]
+    return prompts, token_ids_list, {"token_ids_list": token_ids_list}
+
+
 def default_output(
     batch_invariant: bool,
     split_fused: bool,
@@ -852,6 +900,19 @@ def parse_args():
     p.add_argument("--dataset-split", default=DEFAULT_DATASET_SPLIT)
     p.add_argument("--dataset-field", default=DEFAULT_DATASET_FIELD)
     p.add_argument("--dataset-seed", type=int, default=0)
+    p.add_argument(
+        "--token-ids-file",
+        default=None,
+        help=(
+            "Torch .pt file containing token id rows to replay instead of "
+            "loading prompts from --dataset."
+        ),
+    )
+    p.add_argument(
+        "--token-ids-key",
+        default="token_ids_list",
+        help="Payload key to read from --token-ids-file (default: token_ids_list).",
+    )
     p.add_argument("--output", default=None)
     p.add_argument("--batch-invariant", action="store_true")
     p.add_argument(
@@ -1073,21 +1134,34 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    prompts = load_prompts(
-        args.dataset,
-        args.dataset_subset,
-        args.dataset_split,
-        args.dataset_field,
-        args.num_prompts,
-        args.dataset_seed,
-    )
-    token_ids_list = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
+    token_ids_payload = None
+    if args.token_ids_file:
+        prompts, token_ids_list, token_ids_payload = load_token_ids_from_file(
+            args.token_ids_file,
+            args.token_ids_key,
+        )
+    else:
+        prompts = load_prompts(
+            args.dataset,
+            args.dataset_subset,
+            args.dataset_split,
+            args.dataset_field,
+            args.num_prompts,
+            args.dataset_seed,
+        )
+        token_ids_list = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
     seq_lens = [len(ids) for ids in token_ids_list]
-    print_rank_0(
-        f"[megatron] dataset: {args.dataset}:{args.dataset_subset}:"
-        f"{args.dataset_split} field={args.dataset_field!r} "
-        f"n={len(prompts)}"
-    )
+    if args.token_ids_file:
+        print_rank_0(
+            f"[megatron] token ids: {args.token_ids_file} "
+            f"key={args.token_ids_key!r} n={len(prompts)}"
+        )
+    else:
+        print_rank_0(
+            f"[megatron] dataset: {args.dataset}:{args.dataset_subset}:"
+            f"{args.dataset_split} field={args.dataset_field!r} "
+            f"n={len(prompts)}"
+        )
     print_rank_0(
         f"[megatron] seq_len min/mean/max = {min(seq_lens)}/"
         f"{sum(seq_lens) / len(seq_lens):.1f}/{max(seq_lens)}"
@@ -1194,6 +1268,20 @@ def main():
             "seq_lens": seq_lens,
             "last_token_logits": last_token_logits_cpu,
         }
+        if token_ids_payload is not None:
+            payload["token_ids_source_file"] = args.token_ids_file
+            payload["token_ids_source_key"] = args.token_ids_key
+            for key in (
+                "offline_target_token_ids",
+                "offline_generation_logprobs",
+                "offline_metadata",
+                "sample_rows",
+                "sample_prompt_token_ids_list",
+                "sample_response_token_ids_list",
+                "sample_full_token_ids_list",
+            ):
+                if key in token_ids_payload:
+                    payload[key] = token_ids_payload[key]
         payload.update(debug_capture)
         torch.save(payload, args.output)
         print(f"[megatron] saved capture to {args.output}")

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import importlib
 import math
 import os
@@ -210,10 +211,22 @@ class RayWorkerBuilder:
             )
             return worker
 
-    def __init__(self, ray_actor_class_fqn: str, *args, **kwargs):
+    def __init__(
+        self,
+        ray_actor_class_fqn: str,
+        *args,
+        py_executable: Optional[str] = None,
+        **kwargs,
+    ):
         self.ray_actor_class_fqn = ray_actor_class_fqn
         self.args = args
         self.kwargs = kwargs
+        self.py_executable = py_executable
+        if py_executable is None:
+            self.venv_name = ray_actor_class_fqn
+        else:
+            py_exec_hash = hashlib.sha1(py_executable.encode()).hexdigest()[:8]
+            self.venv_name = f"{ray_actor_class_fqn}-{py_exec_hash}"
 
     def create_worker_async(
         self,
@@ -436,7 +449,7 @@ class RayWorkerGroup:
                 env_vars[k] = v
 
         # Get the python environment for the actor
-        actor_python_env = get_actor_python_env(
+        actor_python_env = remote_worker_builder.py_executable or get_actor_python_env(
             remote_worker_builder.ray_actor_class_fqn
         )
         if actor_python_env.startswith("uv"):
@@ -446,7 +459,7 @@ class RayWorkerGroup:
             #  NEMO_RL_VENV_DIR and defaults to $GIT_ROOT/venvs/.
             py_executable = create_local_venv_on_each_node(
                 py_executable=actor_python_env,
-                venv_name=remote_worker_builder.ray_actor_class_fqn,
+                venv_name=remote_worker_builder.venv_name,
             )
         else:
             py_executable = actor_python_env

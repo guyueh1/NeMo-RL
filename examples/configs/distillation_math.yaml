@@ -87,6 +87,12 @@ policy: &POLICY_BASE
 
     megatron_cfg: &MEGATRON_BASE
         enabled: false
+        # Numeric matching mode for MXFP8: route Megatron MXFP8 dense matmuls
+        # through dequant + BF16 batch-invariant matmul.
+        use_bi_mxfp8_matmul_qdq: false
+        # Native MXFP8 batch-invariant mode: route Megatron MXFP8 dense matmuls
+        # through the Triton block-scaled MXFP8 BI matmul in no-grad forwards.
+        use_bi_mxfp8_matmul: false
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
@@ -212,8 +218,11 @@ policy: &POLICY_BASE
             # batch-invariant Triton path used by standalone matching scripts.
             use_batch_invariant_rmsnorm: false
             # Numeric matching mode for MXFP8: route vLLM MXFP8 dense matmuls
-            # through dequant + BF16 batch-invariant matmul, matching Megatron.
-            match_vllm_mxfp8_matmul: false
+            # through dequant + BF16 batch-invariant matmul.
+            use_bi_mxfp8_matmul_qdq: false
+            # Native MXFP8 batch-invariant mode: route vLLM MXFP8 dense matmuls
+            # through the Triton block-scaled MXFP8 BI matmul.
+            use_bi_mxfp8_matmul: false
             use_deep_gemm: False
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0

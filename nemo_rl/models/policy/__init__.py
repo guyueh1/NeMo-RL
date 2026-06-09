@@ -281,12 +281,16 @@ class MegatronConfig(TypedDict):
     # nemo_rl/models/policy/megatron/vllm_kernel_patches.py and
     # my_docs/llama3_8b_numeric_mismatch.md.
     match_vllm_kernels: NotRequired[bool]
-    # When True, additionally install the MXFP8-specific patches (compact
+    # When True, additionally install the MXFP8-specific QDQ patches (compact
     # scales + dequant-for-BI-GEMM). Requires batch_invariant_mode=true,
     # fp8_cfg.enabled=true with fp8_cfg.fp8_recipe="mxfp8", and (typically)
     # match_vllm_kernels=true since the BF16 path feeds the MXFP8 GEMMs.
     # See my_docs/llama3_8b_mxfp8_numeric_mismatch.md.
-    match_vllm_mxfp8_matmul: NotRequired[bool]
+    use_bi_mxfp8_matmul_qdq: NotRequired[bool]
+    # When True, route MXFP8 GEMMs through the native Triton block-scaled
+    # MXFP8 batch-invariant matmul. Requires batch_invariant_mode=true and
+    # fp8_cfg.enabled=true with fp8_cfg.fp8_recipe="mxfp8".
+    use_bi_mxfp8_matmul: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):
