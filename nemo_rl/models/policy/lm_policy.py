@@ -113,7 +113,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
-            env_vars = config["megatron_cfg"].get("env_vars", {})
+            env_vars = dict(config["megatron_cfg"].get("env_vars", {}) or {})
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(
@@ -243,7 +243,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 or config.get("mxfp8_matmul_batch_invariant") is True
             )
             if needs_vllm_in_worker:
-                worker_py_executable = PY_EXECUTABLES.MCORE_VLLM
+                if (
+                    os.environ.get("NEMO_RL_MCORE_VLLM_USE_MCORE_WITH_VLLM_PATH", "0")
+                    == "1"
+                ):
+                    worker_py_executable = PY_EXECUTABLES.MCORE
+                    vllm_site_packages = os.environ.get(
+                        "NEMO_RL_VLLM_WORKER_SITE_PACKAGES",
+                        "/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker/lib/python3.13/site-packages",
+                    )
+                    existing_pythonpath = env_vars.get(
+                        "PYTHONPATH", os.environ.get("PYTHONPATH", "")
+                    )
+                    env_vars["PYTHONPATH"] = (
+                        f"{vllm_site_packages}:{existing_pythonpath}"
+                        if existing_pythonpath
+                        else vllm_site_packages
+                    )
+                elif os.environ.get("NEMO_RL_MCORE_VLLM_SYSTEM", "0") == "1":
+                    worker_py_executable = PY_EXECUTABLES.SYSTEM
+                else:
+                    worker_py_executable = PY_EXECUTABLES.MCORE_VLLM
 
         worker_builder = RayWorkerBuilder(
             worker_builder_cls_fqn,
