@@ -220,11 +220,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 install_true_on_policy_patches,
             )
 
-            install_true_on_policy_patches(
+            installed_patches = install_true_on_policy_patches(
                 bf16_true_on_policy=bf16_true_on_policy,
                 mxfp8_matmul_batch_invariant=mxfp8_matmul_batch_invariant,
                 mxfp8_active=mxfp8_active,
             )
+            print(f"  ✓ Installed Megatron true-on-policy patches: {installed_patches}")
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:

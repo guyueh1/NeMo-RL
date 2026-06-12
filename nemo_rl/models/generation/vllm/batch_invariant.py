@@ -147,6 +147,43 @@ def _get_megatron_style_cos_sin_cache(module, device: torch.device) -> torch.Ten
     return cache
 
 
+def _get_megatron_style_inv_freq(module, device: torch.device) -> torch.Tensor | None:
+    compute_inv_freq = getattr(module, "_compute_inv_freq", None)
+    base = getattr(module, "base", None)
+    inv_freq = None
+    if callable(compute_inv_freq) and base is not None:
+        try:
+            inv_freq = compute_inv_freq(base)
+        except TypeError:
+            inv_freq = compute_inv_freq()
+
+    if inv_freq is None:
+        inv_freq = getattr(module, "inv_freq", None)
+    if inv_freq is None:
+        return None
+    return inv_freq.to(device=device)
+
+
+def _get_megatron_style_freqs_half(
+    *,
+    module,
+    positions: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor | None:
+    inv_freq = _get_megatron_style_inv_freq(module, device)
+    if inv_freq is None:
+        return None
+
+    positions = positions.to(device=device, dtype=inv_freq.dtype)
+    class_name = type(module).__name__
+    if class_name == "LinearScalingRotaryEmbedding" and hasattr(
+        module, "scaling_factor"
+    ):
+        positions = positions / module.scaling_factor
+
+    return torch.outer(positions, inv_freq)
+
+
 def _apply_megatron_style_rope(
     *,
     module,
@@ -160,19 +197,31 @@ def _apply_megatron_style_rope(
     tensor_rot = tensor[..., : module.rotary_dim]
     tensor_pass = tensor[..., module.rotary_dim :]
 
-    cos_sin_cache = _get_megatron_style_cos_sin_cache(module, tensor.device)
-    cos_sin = cos_sin_cache.index_select(0, positions.to(device=tensor.device))
-    cos_half, sin_half = cos_sin.chunk(2, dim=-1)
-
     rotary_interleaved = not module.is_neox_style
-    cos = _megatron_style_duplicate_freqs(
-        cos_half,
-        rotary_interleaved=rotary_interleaved,
-    ).to(tensor_rot.dtype)
-    sin = _megatron_style_duplicate_freqs(
-        sin_half,
-        rotary_interleaved=rotary_interleaved,
-    ).to(tensor_rot.dtype)
+    freqs_half = _get_megatron_style_freqs_half(
+        module=module,
+        positions=positions,
+        device=tensor.device,
+    )
+    if freqs_half is None:
+        cos_sin_cache = _get_megatron_style_cos_sin_cache(module, tensor.device)
+        cos_sin = cos_sin_cache.index_select(0, positions.to(device=tensor.device))
+        cos_half, sin_half = cos_sin.chunk(2, dim=-1)
+        cos = _megatron_style_duplicate_freqs(
+            cos_half,
+            rotary_interleaved=rotary_interleaved,
+        ).to(tensor_rot.dtype)
+        sin = _megatron_style_duplicate_freqs(
+            sin_half,
+            rotary_interleaved=rotary_interleaved,
+        ).to(tensor_rot.dtype)
+    else:
+        freqs = _megatron_style_duplicate_freqs(
+            freqs_half,
+            rotary_interleaved=rotary_interleaved,
+        )
+        cos = torch.cos(freqs).to(tensor_rot.dtype)
+        sin = torch.sin(freqs).to(tensor_rot.dtype)
     cos = cos.unsqueeze(-2)
     sin = sin.unsqueeze(-2)
 

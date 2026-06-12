@@ -34,12 +34,19 @@ MXFP8-specific patches are gated by ``policy.mxfp8_matmul_batch_invariant`` and
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from types import ModuleType
+from typing import Any
 
 import torch
 
 from nemo_rl.models.true_on_policy import get_mxfp8_matmul_bi_backend
 
 G_VLLM_STYLE_SDPA_SEQ_LENS: list[int] | None = None
+_TE_RMSNORM_CLASS_ORIG_FWD: dict[type, Callable[..., Any]] = {}
+_TE_RMSNORM_FUNC_ORIGS: dict[tuple[str, str], Callable[..., Any]] = {}
+_TE_RMSNORM_FWD_ORIGS: dict[str, Callable[..., Any]] = {}
+_TE_APPLY_NORMALIZATION_ORIGS: dict[str, Callable[..., Any]] = {}
 
 
 def set_vllm_style_sdpa_sequence_lengths(seq_lens: torch.Tensor | None) -> None:
@@ -875,13 +882,294 @@ def split_all_layers_fused_layernorm_linear(model) -> int:
     return total_layers
 
 
-def install_megatron_true_on_policy_patches() -> None:
+def _import_module_if_available(module_name: str) -> ModuleType | None:
+    try:
+        import importlib
+
+        return importlib.import_module(module_name)
+    except ImportError:
+        return None
+
+
+def _te_rmsnorm_from_megatron_unfused(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    zero_centered_gamma: bool,
+) -> torch.Tensor:
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        BatchInvariantRMSNormFn,
+    )
+
+    return BatchInvariantRMSNormFn.apply(x, weight, float(eps), zero_centered_gamma)
+
+
+def _patch_te_rmsnorm_class(rms_cls: type | None) -> bool:
+    if rms_cls is None or rms_cls in _TE_RMSNORM_CLASS_ORIG_FWD:
+        return False
+    if not hasattr(rms_cls, "forward"):
+        return False
+
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+    )
+
+    orig_forward = rms_cls.forward
+
+    def _patched_forward(self, x: torch.Tensor, *args, **kwargs):
+        if not is_batch_invariant_mode_enabled():
+            return orig_forward(self, x, *args, **kwargs)
+
+        weight = getattr(self, "weight", None)
+        if weight is None:
+            return orig_forward(self, x, *args, **kwargs)
+
+        eps = getattr(self, "eps", getattr(self, "epsilon", 1e-5))
+        zero_centered_gamma = bool(getattr(self, "zero_centered_gamma", False))
+        return _te_rmsnorm_from_megatron_unfused(
+            x,
+            weight,
+            float(eps),
+            zero_centered_gamma,
+        )
+
+    _TE_RMSNORM_CLASS_ORIG_FWD[rms_cls] = orig_forward
+    rms_cls.forward = _patched_forward
+    return True
+
+
+def _extract_rmsnorm_args(args: tuple[Any, ...], kwargs: dict[str, Any]):
+    x = kwargs.get("x", args[0] if len(args) > 0 else None)
+    weight = kwargs.get("weight", args[1] if len(args) > 1 else None)
+    eps = kwargs.get("eps", args[2] if len(args) > 2 else 1e-5)
+    zero_centered_gamma = kwargs.get("zero_centered_gamma", False)
+    return x, weight, eps, zero_centered_gamma
+
+
+def _patch_te_rmsnorm_function(module: ModuleType | None, attr: str) -> bool:
+    if module is None or not hasattr(module, attr):
+        return False
+
+    key = (module.__name__, attr)
+    if key in _TE_RMSNORM_FUNC_ORIGS:
+        return False
+
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+    )
+
+    orig_func = getattr(module, attr)
+
+    def _patched(*args, **kwargs):
+        if not is_batch_invariant_mode_enabled():
+            return orig_func(*args, **kwargs)
+
+        x, weight, eps, zero_centered_gamma = _extract_rmsnorm_args(args, kwargs)
+        if x is None or weight is None:
+            return orig_func(*args, **kwargs)
+
+        return _te_rmsnorm_from_megatron_unfused(
+            x,
+            weight,
+            float(eps),
+            bool(zero_centered_gamma),
+        )
+
+    _TE_RMSNORM_FUNC_ORIGS[key] = orig_func
+    setattr(module, attr, _patched)
+    return True
+
+
+def _patch_te_rmsnorm_fwd(module: ModuleType | None) -> bool:
+    if module is None or not hasattr(module, "rmsnorm_fwd"):
+        return False
+
+    key = f"{module.__name__}.rmsnorm_fwd"
+    if key in _TE_RMSNORM_FWD_ORIGS:
+        return False
+
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+        mean_dim,
+    )
+
+    orig_func = getattr(module, "rmsnorm_fwd")
+
+    def _patched(*args, **kwargs):
+        if not is_batch_invariant_mode_enabled():
+            return orig_func(*args, **kwargs)
+
+        x = kwargs.get(
+            "inputmat", kwargs.get("input", args[0] if len(args) > 0 else None)
+        )
+        weight = kwargs.get(
+            "ln_weight", kwargs.get("weight", args[1] if len(args) > 1 else None)
+        )
+        eps = kwargs.get("eps", args[2] if len(args) > 2 else 1e-5)
+        ln_out = kwargs.get("ln_out", args[3] if len(args) > 3 else None)
+        output_quantizer = kwargs.get(
+            "output_quantizer",
+            args[4] if len(args) > 4 else None,
+        )
+        zero_centered_gamma = kwargs.get(
+            "zero_centered_gamma",
+            args[7] if len(args) > 7 else False,
+        )
+        if x is None or weight is None or ln_out is not None:
+            return orig_func(*args, **kwargs)
+
+        out = _te_rmsnorm_from_megatron_unfused(
+            x,
+            weight,
+            float(eps),
+            bool(zero_centered_gamma),
+        )
+        rsigma = torch.rsqrt(
+            mean_dim(x.float() * x.float(), dim=-1, keepdim=True) + float(eps)
+        )
+        if output_quantizer is not None:
+            out = output_quantizer(out)
+        return out, None, rsigma
+
+    _TE_RMSNORM_FWD_ORIGS[key] = orig_func
+    setattr(module, "rmsnorm_fwd", _patched)
+    return True
+
+
+def _patch_te_apply_normalization(module: ModuleType | None) -> bool:
+    if module is None or not hasattr(module, "apply_normalization"):
+        return False
+
+    key = f"{module.__name__}.apply_normalization"
+    if key in _TE_APPLY_NORMALIZATION_ORIGS:
+        return False
+
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+        mean_dim,
+    )
+
+    orig_func = getattr(module, "apply_normalization")
+
+    def _patched(
+        inputmat: torch.Tensor,
+        ln_out: torch.Tensor | None,
+        ln_weight: torch.Tensor,
+        ln_bias: torch.Tensor | None,
+        eps: float,
+        output_quantizer,
+        output_dtype,
+        normalization: str,
+        fwd_ln_sm_margin: int,
+        zero_centered_gamma: bool,
+    ):
+        if (
+            not is_batch_invariant_mode_enabled()
+            or normalization != "RMSNorm"
+            or ln_bias is not None
+            or ln_out is not None
+        ):
+            return orig_func(
+                inputmat,
+                ln_out,
+                ln_weight,
+                ln_bias,
+                eps,
+                output_quantizer,
+                output_dtype,
+                normalization,
+                fwd_ln_sm_margin,
+                zero_centered_gamma,
+            )
+
+        out = _te_rmsnorm_from_megatron_unfused(
+            inputmat,
+            ln_weight,
+            float(eps),
+            bool(zero_centered_gamma),
+        )
+        if isinstance(output_dtype, torch.dtype) and out.dtype != output_dtype:
+            out = out.to(output_dtype)
+        rsigma = torch.rsqrt(
+            mean_dim(inputmat.float() * inputmat.float(), dim=-1, keepdim=True)
+            + float(eps)
+        )
+        if output_quantizer is not None:
+            out = output_quantizer(out)
+        return out, None, rsigma
+
+    _TE_APPLY_NORMALIZATION_ORIGS[key] = orig_func
+    setattr(module, "apply_normalization", _patched)
+    return True
+
+
+def install_megatron_unfused_rmsnorm_to_te() -> int:
+    """Route TE RMSNorm entry points through Megatron's unfused BI RMSNorm.
+
+    Megatron's ``enable_batch_invariant_mode`` patches the common TE
+    ``RMSNorm`` class and a few module-level helpers, but fused TE graph paths
+    can use ``te.pytorch.ops.RMSNorm`` or helper symbols imported in
+    ``layernorm_linear``. Patch those entry points directly without unfusing
+    LayerNormLinear modules.
+    """
+    te = _import_module_if_available("transformer_engine.pytorch")
+    tex = _import_module_if_available("transformer_engine_torch")
+    te_layernorm_mod = _import_module_if_available(
+        "transformer_engine.pytorch.module.layernorm"
+    )
+    te_common_mod = _import_module_if_available(
+        "transformer_engine.pytorch.module._common"
+    )
+    te_layernorm_linear_mod = _import_module_if_available(
+        "transformer_engine.pytorch.module.layernorm_linear"
+    )
+    te_ops_rmsnorm_mod = _import_module_if_available(
+        "transformer_engine.pytorch.ops.basic.rmsnorm"
+    )
+
+    patched = 0
+    rms_cls = getattr(te, "RMSNorm", None) if te is not None else None
+    patched += int(_patch_te_rmsnorm_class(rms_cls))
+
+    te_pytorch = getattr(te, "pytorch", None) if te is not None else None
+    rms_cls = getattr(te_pytorch, "RMSNorm", None) if te_pytorch is not None else None
+    patched += int(_patch_te_rmsnorm_class(rms_cls))
+
+    te_ops = getattr(te, "ops", None) if te is not None else None
+    rms_cls = getattr(te_ops, "RMSNorm", None) if te_ops is not None else None
+    patched += int(_patch_te_rmsnorm_class(rms_cls))
+
+    for module in (te_layernorm_mod, te_layernorm_linear_mod):
+        for attr in ("rmsnorm", "rmsnorm_forward", "rmsnorm_fwd"):
+            patched += int(_patch_te_rmsnorm_function(module, attr))
+
+    for module in (tex, te_ops_rmsnorm_mod):
+        patched += int(_patch_te_rmsnorm_fwd(module))
+
+    for module in (te_common_mod, te_layernorm_linear_mod):
+        patched += int(_patch_te_apply_normalization(module))
+
+    return patched
+
+
+def install_vllm_style_rmsnom_to_te() -> int:
+    """Compatibility wrapper for old debug scripts.
+
+    The historical helper name came from an experiment that routed TE RMSNorm
+    through vLLM's Triton kernel. The production true-on-policy path now uses
+    Megatron's unfused batch-invariant RMSNorm instead.
+    """
+    return install_megatron_unfused_rmsnorm_to_te()
+
+
+def install_megatron_true_on_policy_patches() -> dict[str, int]:
     """Install Megatron-side BF16 true-on-policy patches.
 
-    Megatron keeps its own BI RMSNorm, RoPE, and SwiGLU implementations. The
+    Megatron keeps its own BI RoPE and SwiGLU implementations. The
     corresponding vLLM operations are patched on the generation side to match
-    Megatron. The remaining Megatron-side BF16 patch is attention, which routes
-    TE ``DotProductAttention`` through vLLM's FA2 wrapper.
+    Megatron. Megatron-side BF16 patches route TE attention through vLLM's FA2
+    wrapper and force TE RMSNorm entry points, including fused TE op paths, to
+    use Megatron's unfused batch-invariant RMSNorm implementation.
 
     Pre-conditions:
       - The caller must have set ``policy.bf16_true_on_policy=true`` so
@@ -895,6 +1183,7 @@ def install_megatron_true_on_policy_patches() -> None:
     MXFP8 fp8 recipe).
     """
     install_vllm_style_sdpa()
+    return {"te_rmsnorm_unfused_entrypoints": install_megatron_unfused_rmsnorm_to_te()}
 
 
 def install_bi_mxfp8_matmul_qdq() -> None:
@@ -932,9 +1221,9 @@ def install_true_on_policy_patches(
     bf16_true_on_policy: bool,
     mxfp8_matmul_batch_invariant: bool,
     mxfp8_active: bool,
-) -> dict[str, str]:
+) -> dict[str, str | int]:
     """Install Megatron true-on-policy patches controlled by policy flags."""
-    installed: dict[str, str] = {}
+    installed: dict[str, str | int] = {}
 
     if mxfp8_matmul_batch_invariant and not bf16_true_on_policy:
         raise ValueError(
@@ -944,7 +1233,7 @@ def install_true_on_policy_patches(
         )
 
     if bf16_true_on_policy:
-        install_megatron_true_on_policy_patches()
+        installed.update(install_megatron_true_on_policy_patches())
         installed["bf16_true_on_policy"] = "megatron_true_on_policy_patches"
 
     if mxfp8_matmul_batch_invariant:
