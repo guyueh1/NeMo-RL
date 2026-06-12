@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -147,7 +148,63 @@ def _get_megatron_style_cos_sin_cache(module, device: torch.device) -> torch.Ten
     return cache
 
 
+def _get_megatron_style_inv_freq_from_module_attrs(
+    module,
+    device: torch.device,
+) -> torch.Tensor | None:
+    base = getattr(module, "base", None)
+    rotary_dim = getattr(module, "rotary_dim", None)
+    if base is None or rotary_dim is None:
+        return None
+
+    inv_freq = 1.0 / (
+        float(base)
+        ** (
+            torch.arange(0, int(rotary_dim), 2, dtype=torch.float32, device=device)
+            / int(rotary_dim)
+        )
+    )
+
+    class_name = type(module).__name__
+    is_llama3_rope = class_name == "Llama3RotaryEmbedding" or all(
+        hasattr(module, attr)
+        for attr in (
+            "scaling_factor",
+            "low_freq_factor",
+            "high_freq_factor",
+            "old_context_len",
+        )
+    )
+    if not is_llama3_rope:
+        return inv_freq
+
+    factor = float(getattr(module, "scaling_factor", 8.0))
+    low_freq_factor = float(getattr(module, "low_freq_factor", 1.0))
+    high_freq_factor = float(getattr(module, "high_freq_factor", 4.0))
+    old_context_len = float(getattr(module, "old_context_len", 8192.0))
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    wavelen = 2 * math.pi / inv_freq
+
+    scaled_inv_freq = torch.where(
+        wavelen > low_freq_wavelen, inv_freq / factor, inv_freq
+    )
+    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+        high_freq_factor - low_freq_factor
+    )
+    smoothed_inv_freq = (
+        1 - smooth_factor
+    ) * scaled_inv_freq / factor + smooth_factor * scaled_inv_freq
+    is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+    return torch.where(is_medium_freq, smoothed_inv_freq, scaled_inv_freq)
+
+
 def _get_megatron_style_inv_freq(module, device: torch.device) -> torch.Tensor | None:
+    inv_freq = _get_megatron_style_inv_freq_from_module_attrs(module, device)
+    if inv_freq is not None:
+        return inv_freq
+
     compute_inv_freq = getattr(module, "_compute_inv_freq", None)
     base = getattr(module, "base", None)
     inv_freq = None
@@ -288,8 +345,8 @@ def install_megatron_style_rope_patch(model: torch.nn.Module) -> dict[str, Any]:
 
 
 def install_megatron_style_swiglu_patch(model: torch.nn.Module) -> dict[str, Any]:
-    """Route vLLM ``SiluAndMul`` through Megatron's fused SwiGLU function."""
-    from megatron.core.fusions.fused_bias_swiglu import swiglu
+    """Route vLLM ``SiluAndMul`` through Megatron's unfused SwiGLU path."""
+    import torch.nn.functional as F
     from vllm.model_executor.layers.activation import SiluAndMul
 
     current_forward = SiluAndMul.forward_cuda
@@ -305,7 +362,8 @@ def install_megatron_style_swiglu_patch(model: torch.nn.Module) -> dict[str, Any
     if not already_installed:
 
         def patched_forward_cuda(self, x):
-            return swiglu(x)
+            x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+            return F.silu(x_glu) * x_linear
 
         setattr(patched_forward_cuda, G_MEGATRON_SWIGLU_PATCH_MARKER_ATTR, True)
         setattr(patched_forward_cuda, G_ORIGINAL_FORWARD_ATTR, original_forward)

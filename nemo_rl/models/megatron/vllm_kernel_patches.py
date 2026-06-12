@@ -1026,7 +1026,7 @@ def _patch_te_rmsnorm_fwd(module: ModuleType | None) -> bool:
             "zero_centered_gamma",
             args[7] if len(args) > 7 else False,
         )
-        if x is None or weight is None or ln_out is not None:
+        if x is None or weight is None:
             return orig_func(*args, **kwargs)
 
         out = _te_rmsnorm_from_megatron_unfused(
@@ -1035,11 +1035,12 @@ def _patch_te_rmsnorm_fwd(module: ModuleType | None) -> bool:
             float(eps),
             bool(zero_centered_gamma),
         )
-        rsigma = torch.rsqrt(
-            mean_dim(x.float() * x.float(), dim=-1, keepdim=True) + float(eps)
-        )
+        rsigma = torch.rsqrt(mean_dim(x.float() * x.float(), dim=-1) + float(eps))
         if output_quantizer is not None:
             out = output_quantizer(out)
+        if ln_out is not None:
+            ln_out.copy_(out)
+            out = ln_out
         return out, None, rsigma
 
     _TE_RMSNORM_FWD_ORIGS[key] = orig_func
@@ -1078,7 +1079,6 @@ def _patch_te_apply_normalization(module: ModuleType | None) -> bool:
             not is_batch_invariant_mode_enabled()
             or normalization != "RMSNorm"
             or ln_bias is not None
-            or ln_out is not None
         ):
             return orig_func(
                 inputmat,
@@ -1102,11 +1102,13 @@ def _patch_te_apply_normalization(module: ModuleType | None) -> bool:
         if isinstance(output_dtype, torch.dtype) and out.dtype != output_dtype:
             out = out.to(output_dtype)
         rsigma = torch.rsqrt(
-            mean_dim(inputmat.float() * inputmat.float(), dim=-1, keepdim=True)
-            + float(eps)
+            mean_dim(inputmat.float() * inputmat.float(), dim=-1) + float(eps)
         )
         if output_quantizer is not None:
             out = output_quantizer(out)
+        if ln_out is not None:
+            ln_out.copy_(out)
+            out = ln_out
         return out, None, rsigma
 
     _TE_APPLY_NORMALIZATION_ORIGS[key] = orig_func

@@ -47,6 +47,9 @@ def _compute_distributed_log_softmax(
         torch.Tensor: Log softmax output with the same shape as input, but values represent
             log probabilities normalized across the full vocabulary dimension.
     """
+    if torch.distributed.get_world_size(group) == 1:
+        return vocab_parallel_logits.log_softmax(dim=-1, dtype=torch.float32)
+
     logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
     torch.distributed.all_reduce(
         logits_max,

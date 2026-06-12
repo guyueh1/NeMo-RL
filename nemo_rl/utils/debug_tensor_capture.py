@@ -158,7 +158,23 @@ def _new_capture(num_layers: int, max_calls_per_module: int) -> dict[str, Any]:
         "first_layer_outputs": {},
         "num_layers": num_layers,
         "max_calls_per_module": max_calls_per_module,
+        "extra_module_layer_idx": -1,
     }
+
+
+def _is_extra_capture_module_name(name: str) -> bool:
+    """Return whether ``name`` is a model-level module worth capturing."""
+    target_suffixes = (
+        "decoder.final_layernorm",
+        "final_layernorm",
+        "logits_processor",
+        "lm_head",
+        "model.norm",
+        "output_layer",
+    )
+    return any(
+        name == suffix or name.endswith(f".{suffix}") for suffix in target_suffixes
+    )
 
 
 def remove_debug_tensor_hooks(model: torch.nn.Module) -> dict[str, Any]:
@@ -279,11 +295,32 @@ def install_debug_tensor_hooks(
             )
         )
 
+    extra_layer_idx = int(capture["extra_module_layer_idx"])
+    hooked_extra_modules: set[int] = set()
+    for root in _iter_model_roots(model):
+        for module_name, module in root.named_modules():
+            if id(module) in hooked_extra_modules:
+                continue
+            if not _is_extra_capture_module_name(module_name):
+                continue
+            hooked_extra_modules.add(id(module))
+            handles.append(
+                module.register_forward_pre_hook(
+                    make_pre_hook(extra_layer_idx, module_name), with_kwargs=True
+                )
+            )
+            handles.append(
+                module.register_forward_hook(
+                    make_post_hook(extra_layer_idx, module_name), with_kwargs=True
+                )
+            )
+
     setattr(model, G_CAPTURE_ATTR, capture)
     setattr(model, G_HANDLES_ATTR, handles)
     return {
         "num_layers": len(layers),
         "num_hooks": len(handles),
+        "num_extra_modules": len(hooked_extra_modules),
         "max_calls_per_module": max_calls_per_module,
     }
 
