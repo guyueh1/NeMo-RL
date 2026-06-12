@@ -22,10 +22,10 @@ cross-engine numerical-matching effort (see
 run can install the same patches inside ``MegatronPolicyWorker.__init__``.
 
 ``policy.bf16_true_on_policy`` enables Megatron-Core batch-invariant mode before
-this module is called. The remaining BF16 Megatron-side patch here is the SDPA
-path, which still routes TE attention through vLLM's FA2 wrapper. RMSNorm, RoPE,
-and SwiGLU parity are handled in the opposite direction by patching vLLM to
-match Megatron.
+this module is called. The BF16 Megatron-side patches here route TE RMSNorm
+entry points through Megatron's batch-invariant RMSNorm and route TE attention
+through vLLM's FA2 wrapper. RoPE and SwiGLU parity are handled in the opposite
+direction by patching vLLM to match Megatron.
 
 MXFP8-specific patches are gated by ``policy.mxfp8_matmul_batch_invariant`` and
 ``NEMO_RL_MXFP8_MATMUL_BI_BACKEND``.
@@ -43,6 +43,7 @@ import torch
 from nemo_rl.models.true_on_policy import get_mxfp8_matmul_bi_backend
 
 G_VLLM_STYLE_SDPA_SEQ_LENS: list[int] | None = None
+G_VLLM_STYLE_SDPA_PATCH_ATTR = "_nemo_rl_vllm_style_sdpa_patch"
 _TE_RMSNORM_CLASS_ORIG_FWD: dict[type, Callable[..., Any]] = {}
 _TE_RMSNORM_FUNC_ORIGS: dict[tuple[str, str], Callable[..., Any]] = {}
 _TE_RMSNORM_FWD_ORIGS: dict[str, Callable[..., Any]] = {}
@@ -67,7 +68,7 @@ def set_vllm_style_sdpa_sequence_lengths(seq_lens: torch.Tensor | None) -> None:
 
 def install_vllm_style_sdpa(
     *, paged_kv: bool = True, paged_block_size: int = 16
-) -> None:
+) -> dict[str, bool | str]:
     """Route TE's ``DotProductAttention`` through vLLM's FA2 kernel.
 
     On Blackwell, vLLM under ``VLLM_BATCH_INVARIANT=1`` rejects FA4 (per
@@ -93,6 +94,14 @@ def install_vllm_style_sdpa(
         flash_attn_varlen_func,
         reshape_and_cache_flash,
     )
+
+    already_installed = bool(
+        getattr(
+            dpa_mod.DotProductAttention.forward, G_VLLM_STYLE_SDPA_PATCH_ATTR, False
+        )
+    )
+    if already_installed:
+        return {"patched": False, "already_installed": True, "backend": "vllm_fa2"}
 
     def _global_seq_lens(batch_size: int, max_seqlen: int) -> list[int] | None:
         if G_VLLM_STYLE_SDPA_SEQ_LENS is None:
@@ -441,7 +450,9 @@ def install_vllm_style_sdpa(
         else:
             raise NotImplementedError(f"qkv_format={fmt!r} not supported")
 
+    setattr(_vllm_fa2_forward, G_VLLM_STYLE_SDPA_PATCH_ATTR, True)
     dpa_mod.DotProductAttention.forward = _vllm_fa2_forward
+    return {"patched": True, "already_installed": False, "backend": "vllm_fa2"}
 
 
 def install_mxfp8_compact_scales() -> None:
@@ -1152,6 +1163,11 @@ def install_megatron_unfused_rmsnorm_to_te() -> int:
     return patched
 
 
+def install_te_batch_invariant_rmsnorm_patch() -> int:
+    """Install Megatron's batch-invariant RMSNorm implementation into TE paths."""
+    return install_megatron_unfused_rmsnorm_to_te()
+
+
 def install_vllm_style_rmsnom_to_te() -> int:
     """Compatibility wrapper for old debug scripts.
 
@@ -1162,7 +1178,7 @@ def install_vllm_style_rmsnom_to_te() -> int:
     return install_megatron_unfused_rmsnorm_to_te()
 
 
-def install_megatron_true_on_policy_patches() -> dict[str, int]:
+def install_megatron_true_on_policy_patches() -> dict[str, Any]:
     """Install Megatron-side BF16 true-on-policy patches.
 
     Megatron keeps its own BI RoPE and SwiGLU implementations. The
@@ -1182,8 +1198,12 @@ def install_megatron_true_on_policy_patches() -> dict[str, int]:
     :func:`install_bi_mxfp8_matmul` (and ensure the model is running the
     MXFP8 fp8 recipe).
     """
-    install_vllm_style_sdpa()
-    return {"te_rmsnorm_unfused_entrypoints": install_megatron_unfused_rmsnorm_to_te()}
+    return {
+        "vllm_style_sdpa": install_vllm_style_sdpa(),
+        "te_batch_invariant_rmsnorm_entrypoints": (
+            install_te_batch_invariant_rmsnorm_patch()
+        ),
+    }
 
 
 def install_bi_mxfp8_matmul_qdq() -> None:
@@ -1221,9 +1241,9 @@ def install_true_on_policy_patches(
     bf16_true_on_policy: bool,
     mxfp8_matmul_batch_invariant: bool,
     mxfp8_active: bool,
-) -> dict[str, str | int]:
+) -> dict[str, Any]:
     """Install Megatron true-on-policy patches controlled by policy flags."""
-    installed: dict[str, str | int] = {}
+    installed: dict[str, Any] = {}
 
     if mxfp8_matmul_batch_invariant and not bf16_true_on_policy:
         raise ValueError(
