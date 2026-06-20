@@ -14,6 +14,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from math import gcd, lcm
 from typing import Any, Iterator, Optional, Tuple
 
 import torch
@@ -156,6 +157,7 @@ def get_microbatch_iterator(
     pad_packed_seq_to_multiple_of = 1
 
     _, seq_dim_size = get_and_validate_seqlen(data)
+    padded_seq_length = seq_dim_size
 
     # Auto-detect seq_length_key if not provided
     if seq_length_key is None and cfg["sequence_packing"]["enabled"]:
@@ -164,6 +166,12 @@ def get_microbatch_iterator(
     if cfg["dynamic_batching"]["enabled"]:
         raw_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
         data_iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+        pad_full_seq_to = _get_unpacked_sequence_length_for_megatron(
+            cfg.get("megatron_cfg", {}),
+            1,
+            seq_dim_size,
+        )
+        padded_seq_length = pad_full_seq_to
     elif cfg["sequence_packing"]["enabled"]:
         raw_iterator = data.make_microbatch_iterator_for_packable_sequences()
         data_iterator_len, pack_seq_dim_size = (
@@ -178,10 +186,18 @@ def get_microbatch_iterator(
             cfg["make_sequence_length_divisible_by"],
             pack_seq_dim_size,
         )
+        if pad_full_seq_to is not None:
+            padded_seq_length = pad_full_seq_to
         micro_batch_size = 1
     else:
         raw_iterator = data.make_microbatch_iterator(mbs)
         data_iterator_len = data.size // mbs
+        pad_full_seq_to = _get_unpacked_sequence_length_for_megatron(
+            cfg.get("megatron_cfg", {}),
+            micro_batch_size,
+            seq_dim_size,
+        )
+        padded_seq_length = pad_full_seq_to
 
     # Wrap the raw iterator with processing
     processed_iterator = make_processed_microbatch_iterator(
@@ -193,9 +209,6 @@ def get_microbatch_iterator(
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
     )
-
-    # Compute padded sequence length for pipeline parallelism
-    padded_seq_length = pad_full_seq_to if pad_full_seq_to is not None else seq_dim_size
 
     return (
         processed_iterator,
@@ -270,6 +283,12 @@ def process_microbatch(
             position_ids = None
             attention_mask = None
         else:
+            if pad_full_seq_to is not None:
+                pad_len = pad_full_seq_to - input_ids.shape[1]
+                if pad_len > 0:
+                    input_ids = torch.nn.functional.pad(
+                        input_ids, (0, pad_len), value=0
+                    )
             input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
@@ -531,6 +550,58 @@ def _pack_sequences_for_megatron(
     )
 
 
+def _get_sequence_shard_factor_for_megatron(megatron_cfg: dict) -> int:
+    """Return sequence divisibility needed before CP and TP+SP sharding."""
+    tp_size = megatron_cfg.get("tensor_model_parallel_size", 1)
+    sp = megatron_cfg.get("sequence_parallel", False)
+    cp_size = megatron_cfg.get("context_parallel_size", 1)
+
+    shard_factor = 1
+    if cp_size > 1:
+        shard_factor *= cp_size * 2
+    if tp_size > 1 and sp:
+        shard_factor *= tp_size
+    return shard_factor
+
+
+def _get_token_divisor_for_megatron(megatron_cfg: dict) -> int:
+    """Return recipe-dependent token divisibility for a rank-local token matrix."""
+    fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
+    use_fp8 = fp8_cfg.get("enabled", False)
+
+    divisor = 1
+    if use_fp8:
+        if fp8_cfg.get("fp8_recipe") == "blockwise":
+            divisor = max(divisor, 128)
+        elif fp8_cfg.get("fp8_recipe") == "mxfp8":
+            divisor = max(divisor, 32)
+        else:
+            divisor = max(divisor, 16)
+    if (
+        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    ):
+        divisor = max(divisor, 128)
+    return divisor
+
+
+def _get_unpacked_sequence_length_for_megatron(
+    megatron_cfg: dict,
+    micro_batch_size: int,
+    seq_len: int,
+) -> int:
+    """Pad unpacked sequence length so rank-local tokens meet kernel divisibility."""
+    shard_factor = _get_sequence_shard_factor_for_megatron(megatron_cfg)
+    token_divisor = _get_token_divisor_for_megatron(megatron_cfg)
+    if token_divisor == 1:
+        return _round_up_to_multiple(seq_len, shard_factor)
+
+    token_multiple = token_divisor * shard_factor
+    seq_multiple_for_tokens = token_multiple // gcd(micro_batch_size, token_multiple)
+    seq_multiple = lcm(shard_factor, seq_multiple_for_tokens)
+    return _round_up_to_multiple(seq_len, seq_multiple)
+
+
 def _get_pack_sequence_parameters_for_megatron(
     megatron_cfg: dict,
     pad_individual_seqs_to_multiple_of: int,
@@ -553,15 +624,9 @@ def _get_pack_sequence_parameters_for_megatron(
     sp = megatron_cfg["sequence_parallel"]
     pp_size = megatron_cfg["pipeline_model_parallel_size"]
     cp_size = megatron_cfg["context_parallel_size"]
-    fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
-    use_fp8 = fp8_cfg.get("enabled", False)
 
     # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
-    minimum_pad_factor = 1
-    if cp_size > 1:
-        minimum_pad_factor *= cp_size * 2
-    if tp_size > 1 and sp:
-        minimum_pad_factor *= tp_size
+    minimum_pad_factor = _get_sequence_shard_factor_for_megatron(megatron_cfg)
     assert pad_individual_seqs_to_multiple_of % minimum_pad_factor == 0, (
         f"make_sequence_length_divisible_by ({pad_individual_seqs_to_multiple_of}) is not a multiple of minimum_pad_factor ({minimum_pad_factor}).\n"
         f"Please set policy.make_sequence_length_divisible_by to a multiple of {minimum_pad_factor}.\n"
@@ -578,19 +643,7 @@ def _get_pack_sequence_parameters_for_megatron(
     #   HybridEP+flex : 128  (MAX_NUM_OF_TOKENS_PER_RANK must be divisible by
     #                         NUM_OF_TOKENS_PER_CHUNK=128 in deep_ep JIT kernels)
     # When multiple constraints apply, take the max (128 is a multiple of 32/16).
-    divisor = 1
-    if use_fp8:
-        if fp8_cfg["fp8_recipe"] == "blockwise":
-            divisor = max(divisor, 128)
-        elif fp8_cfg["fp8_recipe"] == "mxfp8":
-            divisor = max(divisor, 32)
-        else:
-            divisor = max(divisor, 16)
-    if (
-        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
-        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
-    ):
-        divisor = max(divisor, 128)
+    divisor = _get_token_divisor_for_megatron(megatron_cfg)
     if divisor > 1:
         pad_packed_seq_to_multiple_of = divisor
         if cp_size > 1:

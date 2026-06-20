@@ -181,6 +181,38 @@ class TestProcessMicrobatch:
         # Verify get_ltor_masks_and_position_ids was called
         mock_get_masks.assert_called_once()
 
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_no_packing_pads_full_sequence(self, mock_get_masks):
+        """Test non-packed microbatch padding for Megatron input tensors."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_attention_mask = torch.ones(2, 16)
+        mock_position_ids = torch.arange(16).unsqueeze(0).expand(2, -1)
+        mock_get_masks.return_value = (mock_attention_mask, None, mock_position_ids)
+
+        data_dict = MagicMock()
+        input_ids = torch.tensor(
+            [[1, 2, 3, 4, 5, 0, 0, 0, 0, 0], [6, 7, 8, 9, 10, 11, 12, 0, 0, 0]]
+        )
+        data_dict.__getitem__ = MagicMock(return_value=input_ids)
+
+        result = process_microbatch(
+            data_dict,
+            pack_sequences=False,
+            pad_full_seq_to=16,
+            straggler_timer=MagicMock(),
+        )
+
+        assert result.input_ids.shape == (2, 16)
+        assert torch.equal(result.input_ids[:, :10], input_ids)
+        assert torch.equal(
+            result.input_ids[:, 10:], torch.zeros(2, 6, dtype=torch.long)
+        )
+        assert torch.equal(result.input_ids_cp_sharded, result.input_ids)
+        assert torch.equal(data_dict["input_ids"], input_ids)
+        mock_get_masks.assert_called_once()
+        assert mock_get_masks.call_args.kwargs["data"].shape == (2, 16)
+
     @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
     @patch(
         "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
@@ -481,6 +513,64 @@ class TestGetMicrobatchIterator:
         assert micro_batch_size == mbs
         assert data_iterator_len == 16 // mbs
         assert seq_dim_size == 64
+        assert padded_seq_length == 64
+
+    @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
+    @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
+    def test_get_microbatch_iterator_regular_mxfp8_pads_tokens_per_rank(
+        self, mock_make_iterator, mock_get_and_validate_seqlen
+    ):
+        """Test MXFP8 non-packed batches pad rank-local tokens to a multiple of 32."""
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        mock_get_and_validate_seqlen.return_value = (1, 65)
+        mock_iterator = iter([MagicMock()])
+        mock_make_iterator.return_value = mock_iterator
+
+        mock_data = MagicMock()
+        mock_data.size = 16
+        mock_data.make_microbatch_iterator.return_value = iter([])
+
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8_recipe": "mxfp8",
+                },
+            },
+        }
+
+        mbs = 4
+
+        (
+            iterator,
+            data_iterator_len,
+            micro_batch_size,
+            seq_dim_size,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data=mock_data,
+            cfg=cfg,
+            mbs=mbs,
+            straggler_timer=MagicMock(),
+        )
+
+        mock_data.make_microbatch_iterator.assert_called_once_with(mbs)
+
+        assert micro_batch_size == mbs
+        assert data_iterator_len == 16 // mbs
+        assert seq_dim_size == 65
+        assert padded_seq_length == 72
+        assert (padded_seq_length * mbs) % 32 == 0
+
+        call_kwargs = mock_make_iterator.call_args[1]
+        assert call_kwargs["pad_full_seq_to"] == 72
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
