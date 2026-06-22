@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,6 +67,20 @@ class VllmInternalWorkerExtension:
             self.model_runner.model,
             bf16_true_on_policy=bf16_true_on_policy,
             mxfp8_matmul_batch_invariant=mxfp8_matmul_batch_invariant,
+        )
+
+    def install_true_on_policy_patch_components(
+        self,
+        components: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Install selected BF16 true-on-policy patches on vLLM."""
+        from nemo_rl.models.generation.vllm.batch_invariant import (
+            install_true_on_policy_patch_components,
+        )
+
+        return install_true_on_policy_patch_components(
+            self.model_runner.model,
+            components=components,
         )
 
     def install_batch_invariant_rmsnorm_patch(self) -> dict[str, Any]:

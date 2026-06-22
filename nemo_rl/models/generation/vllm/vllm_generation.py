@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -153,6 +153,7 @@ class VllmGeneration(GenerationInterface):
         env_vars = {}
         if self.bf16_true_on_policy:
             env_vars["VLLM_BATCH_INVARIANT"] = "1"
+            env_vars["NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES"] = "1"
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:

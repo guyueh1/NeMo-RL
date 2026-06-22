@@ -28,6 +28,21 @@ use vLLM FA2. It requires sync vLLM
 (`policy.generation.vllm_cfg.async_engine=false`). For vLLM tensor hooks, force
 eager mode.
 
+For BF16 true-on-policy rollout speed, prefer vLLM CUDA graph-only mode rather
+than compiled vLLM. In the GRPO path this should be auto-configured when
+`policy.bf16_true_on_policy=true` and `enforce_eager=true` is not explicitly
+set:
+
+```bash
+++policy.generation.vllm_kwargs.compilation_config.mode=0
+++policy.generation.vllm_kwargs.compilation_config.cudagraph_mode=FULL_DECODE_ONLY
+++policy.generation.vllm_kwargs.compilation_config.splitting_ops=[]
+```
+
+This disables torch/vLLM compilation while keeping decode CUDA graph capture.
+True-on-policy vLLM class patches must be installed before vLLM engine
+construction because CUDA graphs are captured during engine init.
+
 `policy.mxfp8_matmul_batch_invariant` requires `bf16_true_on_policy=true`,
 vLLM `precision=fp8`, `is_mx=true`, and Megatron `fp8_cfg.enabled=true` with
 `fp8_recipe=mxfp8`. Select the MXFP8 backend with
@@ -138,6 +153,39 @@ cache profile can leave memory fragmented for a following Megatron process.
   both engines must quantize/dequantize weights and activations equivalently.
 - Final logits can mislead. For padded MXFP8 runs, compare real token positions
   and per-layer residual streams before trusting last-position logits.
+- vLLM compiled mode can change BF16 generation/prompt logprobs relative to
+  vLLM eager even when generated token ids match. In the Llama3.1 8B BF16
+  investigation, compiled-with-CUDA-graph and compiled-without-CUDA-graph
+  drifted identically from eager, and the drift also reproduced without NeMo
+  patches. Treat this as a vLLM compiled numeric path difference, not a CUDA
+  graph replay issue.
+- Policy-rescoring generated tokens with the training policy can make a final
+  comparison exact, but it is not a raw vLLM on-policyness fix. Do not use it
+  to claim true-on-policy generation logprobs.
+
+## vLLM Compile/CUDA Graph Triage
+
+Use `tools/model_diagnostics/6.vllm_compile_logprob_drift.py` to isolate vLLM
+eager-vs-candidate drift on fixed eager-generated token ids. Run both patched
+and `--no-install-nemo-patches` variants before blaming NeMo patches.
+
+Interpretation:
+
+- Eager decode-vs-prefill exact, compiled candidates drift, and token ids match:
+  compiled vLLM changed the numeric path.
+- Compiled candidates drift the same with `cudagraph_mode=NONE`: CUDA graph
+  replay is not the direct cause.
+- Graph-only candidate (`mode=0`, `cudagraph_mode=FULL_DECODE_ONLY`,
+  `splitting_ops=[]`) exact versus eager: use graph-only mode for speed.
+- Full NeMo-RL graph-only run drifts but the micro is exact: check whether
+  true-on-policy class patches were installed before vLLM engine construction
+  and CUDA graph capture.
+
+For final validation, run `run_logprob_comparison.py` with
+`--vllm-prefill-check-first-batch`. A good BF16 graph-only run should log
+`CompilationMode.NONE`, `CUDAGraphMode.FULL_DECODE_ONLY`, disabled Inductor
+compilation, completed graph capture, and `mean_abs=0`, `max_abs=0` for both
+the vLLM prefill check and generation-vs-training comparison.
 
 ## Retained Scripts
 
@@ -157,6 +205,9 @@ cache profile can leave memory fragmented for a following Megatron process.
   LayerNormLinear diagnostic.
 - `my_script/convert_hf_bf16_ckpt_to_mxfp8.py`: one-time HF BF16 to MXFP8
   checkpoint conversion for vLLM capture.
+- `tools/model_diagnostics/6.vllm_compile_logprob_drift.py`: vLLM-only
+  eager-vs-compiled/CUDA-graph drift reproducer on fixed eager-generated token
+  ids.
 
 Generated `.pt`, `.json`, `.png`, logs, and `__pycache__` files should stay out
 of the repo unless the user explicitly asks to preserve a specific artifact.

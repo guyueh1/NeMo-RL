@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,6 +45,30 @@ def _dump_debug_vllm_kwargs(label: str, kwargs: dict[str, Any]) -> None:
     print(
         f"[vllm-engine-args] {label} pid={os.getpid()}\n"
         f"{pprint.pformat(kwargs, sort_dicts=True)}",
+        flush=True,
+    )
+
+
+def _maybe_install_preinit_true_on_policy_patches() -> None:
+    if os.environ.get("NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES") != "1":
+        return
+
+    from nemo_rl.models.generation.vllm.batch_invariant import (
+        install_true_on_policy_patches,
+    )
+
+    # vLLM CustomOp instances bind forward methods during module construction,
+    # and CUDA graphs are captured during engine init. Install class-level BF16
+    # true-on-policy patches before LLM construction so captured graphs see the
+    # patched implementations. The later collective install still rebinds
+    # constructed modules and handles any MXFP8-specific patches.
+    patch_info = install_true_on_policy_patches(
+        torch.nn.Module(),
+        bf16_true_on_policy=True,
+        mxfp8_matmul_batch_invariant=False,
+    )
+    print(
+        f"  ✓ Pre-installed vLLM true-on-policy class patches: {patch_info}",
         flush=True,
     )
 
@@ -443,6 +467,7 @@ class BaseVllmGenerationWorker:
                 "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
+        _maybe_install_preinit_true_on_policy_patches()
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
 
         # Calculate total parallel size (TP * PP)

@@ -401,6 +401,59 @@ def _print_step_summary(
             )
 
 
+def _latest_timer_seconds(timer: Timer, label: str) -> float | None:
+    try:
+        return timer.get_latest_elapsed(label)
+    except (KeyError, IndexError):
+        return None
+
+
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.2f}s"
+
+
+def _print_timing_summary(
+    *,
+    step: int,
+    timer: Timer,
+    rollout_metrics: dict[str, Any],
+    batch_size: int,
+    master_config: MasterConfig,
+) -> None:
+    rollout_seconds = _latest_timer_seconds(timer, "rollout_generation")
+    total_generated_tokens = (
+        float(rollout_metrics.get("mean_gen_tokens_per_sample", 0.0)) * batch_size
+    )
+    if rollout_seconds is not None and rollout_seconds > 0.0:
+        rollout_tokens_per_second = total_generated_tokens / rollout_seconds
+    else:
+        rollout_tokens_per_second = 0.0
+
+    num_gpus = int(master_config.cluster["num_nodes"]) * int(
+        master_config.cluster["gpus_per_node"]
+    )
+    rollout_tokens_per_second_per_gpu = (
+        rollout_tokens_per_second / num_gpus if num_gpus > 0 else 0.0
+    )
+
+    print(
+        "[logprob-comparison-timing] "
+        f"step={step} "
+        f"prepare={_format_seconds(_latest_timer_seconds(timer, 'prepare_for_generation/total'))} "
+        f"rollout={_format_seconds(rollout_seconds)} "
+        f"vllm_prefill_check={_format_seconds(_latest_timer_seconds(timer, 'vllm_prefill_check'))} "
+        f"logprob_data={_format_seconds(_latest_timer_seconds(timer, 'logprob_data_processing'))} "
+        f"logprob_prep={_format_seconds(_latest_timer_seconds(timer, 'logprob_inference_prep'))} "
+        f"policy_logprobs={_format_seconds(_latest_timer_seconds(timer, 'policy_logprobs'))} "
+        f"gen_tokens={total_generated_tokens:.0f} "
+        f"gen_tokens_per_sec={rollout_tokens_per_second:.2f} "
+        f"gen_tokens_per_sec_per_gpu={rollout_tokens_per_second_per_gpu:.2f}",
+        flush=True,
+    )
+
+
 def _print_vllm_prefill_check_summary(
     *,
     step: int,
@@ -924,32 +977,36 @@ def run_logprob_comparison(
                         label="generation",
                         method_name="clear_debug_tensor_capture",
                     )
-                repeated_batch, rollout_metrics = _run_rollout(
-                    policy_generation=policy_generation,
-                    repeated_batch=repeated_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    master_config=master_config,
-                )
+                with timer.time("rollout_generation"):
+                    repeated_batch, rollout_metrics = _run_rollout(
+                        policy_generation=policy_generation,
+                        repeated_batch=repeated_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=task_to_env,
+                        master_config=master_config,
+                    )
                 if vllm_prefill_check_first_batch and not vllm_prefill_check_done:
                     print(
                         "▶ Running vLLM whole-prefill logprob check...",
                         flush=True,
                     )
-                    (
-                        vllm_check_logprob_data,
-                        vllm_check_generation_logprobs,
-                        vllm_check_token_mask,
-                        vllm_check_input_ids,
-                    ) = _build_logprob_data(repeated_batch, tokenizer, master_config)
-                    vllm_prefill_metrics = _run_vllm_prefill_logprob_check(
-                        policy_generation=policy_generation,
-                        logprob_data=vllm_check_logprob_data,
-                        generation_logprobs=vllm_check_generation_logprobs,
-                        token_mask=vllm_check_token_mask,
-                        input_ids=vllm_check_input_ids,
-                        top_k=top_k,
-                    )
+                    with timer.time("vllm_prefill_check"):
+                        (
+                            vllm_check_logprob_data,
+                            vllm_check_generation_logprobs,
+                            vllm_check_token_mask,
+                            vllm_check_input_ids,
+                        ) = _build_logprob_data(
+                            repeated_batch, tokenizer, master_config
+                        )
+                        vllm_prefill_metrics = _run_vllm_prefill_logprob_check(
+                            policy_generation=policy_generation,
+                            logprob_data=vllm_check_logprob_data,
+                            generation_logprobs=vllm_check_generation_logprobs,
+                            token_mask=vllm_check_token_mask,
+                            input_ids=vllm_check_input_ids,
+                            top_k=top_k,
+                        )
                     _print_vllm_prefill_check_summary(
                         step=step,
                         comparison_metrics=vllm_prefill_metrics,
@@ -1036,6 +1093,13 @@ def run_logprob_comparison(
                 max_num_steps=max_num_steps,
                 comparison_metrics=comparison_metrics,
                 rollout_metrics=rollout_metrics,
+            )
+            _print_timing_summary(
+                step=step,
+                timer=timer,
+                rollout_metrics=rollout_metrics,
+                batch_size=repeated_batch.size,
+                master_config=master_config,
             )
             if dump_current_step:
                 assert tensor_dump_dir is not None

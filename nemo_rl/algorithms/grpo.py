@@ -727,11 +727,31 @@ def setup(
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
         if bf16_true_on_policy:
-            if not generation_config["vllm_cfg"].get("enforce_eager", False):
-                generation_config["vllm_cfg"]["enforce_eager"] = True
+            if generation_config["vllm_cfg"].get("enforce_eager", False):
                 print(
-                    "  ✓ Auto-enabled policy.generation.vllm_cfg.enforce_eager "
-                    "for policy.bf16_true_on_policy",
+                    "  ✓ Using vLLM eager mode for policy.bf16_true_on_policy "
+                    "because policy.generation.vllm_cfg.enforce_eager=true",
+                    flush=True,
+                )
+            else:
+                vllm_kwargs = generation_config["vllm_kwargs"]
+                compilation_config = vllm_kwargs.get("compilation_config", None)
+                if compilation_config is None:
+                    compilation_config = {}
+                    vllm_kwargs["compilation_config"] = compilation_config
+                elif not isinstance(compilation_config, dict):
+                    raise TypeError(
+                        "policy.generation.vllm_kwargs.compilation_config must "
+                        f"be a dict when policy.bf16_true_on_policy=true, got {type(compilation_config)}."
+                    )
+
+                compilation_config["mode"] = 0
+                compilation_config["cudagraph_mode"] = "FULL_DECODE_ONLY"
+                compilation_config["splitting_ops"] = []
+                print(
+                    "  ✓ Configured vLLM CUDA graph-only mode for "
+                    "policy.bf16_true_on_policy "
+                    "(torch compile disabled, decode CUDA graphs enabled)",
                     flush=True,
                 )
         if generation_config["vllm_cfg"]["precision"] == "fp8":

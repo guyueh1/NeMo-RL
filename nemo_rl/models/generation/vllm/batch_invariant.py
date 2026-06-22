@@ -31,6 +31,10 @@ G_MEGATRON_ROPE_CACHE_ATTR = "_nemo_rl_megatron_style_cos_sin_cache"
 G_MXFP8_QDQ_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_qdq_patch"
 G_MXFP8_NATIVE_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_native_patch"
 G_ORIGINAL_MXFP8_MM_ATTR = "_nemo_rl_original_mm_mxfp8"
+G_TRUE_ON_POLICY_BF16_PATCH_COMPONENTS = ("rmsnorm", "rope", "swiglu")
+G_TRUE_ON_POLICY_BF16_PATCH_COMPONENT_SET = frozenset(
+    G_TRUE_ON_POLICY_BF16_PATCH_COMPONENTS
+)
 
 
 def _rebind_custom_op_forward_methods(
@@ -541,6 +545,32 @@ def install_mxfp8_bi_matmul_patch(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+def install_true_on_policy_patch_components(
+    model: torch.nn.Module,
+    components: tuple[str, ...],
+) -> dict[str, Any]:
+    """Install selected BF16 true-on-policy vLLM patches for diagnostics."""
+    requested_components = set(components)
+    unknown_components = (
+        requested_components - G_TRUE_ON_POLICY_BF16_PATCH_COMPONENT_SET
+    )
+    if unknown_components:
+        raise ValueError(
+            "Unknown vLLM true-on-policy patch components: "
+            f"{sorted(unknown_components)}. Expected subset of "
+            f"{list(G_TRUE_ON_POLICY_BF16_PATCH_COMPONENTS)}."
+        )
+
+    results: dict[str, Any] = {}
+    if "rmsnorm" in requested_components:
+        results["megatron_style_rmsnorm"] = install_megatron_style_rmsnorm_patch(model)
+    if "rope" in requested_components:
+        results["megatron_style_rope"] = install_megatron_style_rope_patch(model)
+    if "swiglu" in requested_components:
+        results["megatron_style_swiglu"] = install_megatron_style_swiglu_patch(model)
+    return results
+
+
 def install_true_on_policy_patches(
     model: torch.nn.Module,
     *,
@@ -558,9 +588,12 @@ def install_true_on_policy_patches(
         )
 
     if bf16_true_on_policy:
-        results["megatron_style_rmsnorm"] = install_megatron_style_rmsnorm_patch(model)
-        results["megatron_style_rope"] = install_megatron_style_rope_patch(model)
-        results["megatron_style_swiglu"] = install_megatron_style_swiglu_patch(model)
+        results.update(
+            install_true_on_policy_patch_components(
+                model,
+                G_TRUE_ON_POLICY_BF16_PATCH_COMPONENTS,
+            )
+        )
 
     if mxfp8_matmul_batch_invariant:
         backend = get_mxfp8_matmul_bi_backend()
