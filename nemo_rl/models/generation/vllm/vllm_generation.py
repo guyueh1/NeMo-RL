@@ -52,11 +52,13 @@ class VllmGeneration(GenerationInterface):
         name_prefix: str = "vllm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
         bf16_true_on_policy: bool = False,
+        mxfp8_matmul_batch_invariant: bool = False,
     ):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
         self.bf16_true_on_policy = bf16_true_on_policy
+        self.mxfp8_matmul_batch_invariant = mxfp8_matmul_batch_invariant
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -154,6 +156,8 @@ class VllmGeneration(GenerationInterface):
         if self.bf16_true_on_policy:
             env_vars["VLLM_BATCH_INVARIANT"] = "1"
             env_vars["NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES"] = "1"
+            if self.mxfp8_matmul_batch_invariant:
+                env_vars["NEMO_RL_VLLM_PREINIT_MXFP8_MATMUL_PATCH"] = "1"
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:

@@ -18,7 +18,7 @@ Use the policy-level flags, not the old per-engine patch flags:
 ```bash
 ++policy.bf16_true_on_policy=true
 ++policy.mxfp8_matmul_batch_invariant=true
-NEMO_RL_MXFP8_MATMUL_BI_BACKEND=native  # or qdq
+NEMO_RL_MXFP8_MATMUL_BI_BACKEND=qdq  # default; use native for kernel debugging
 ```
 
 `policy.bf16_true_on_policy` turns on Megatron BI mode, vLLM
@@ -46,9 +46,11 @@ construction because CUDA graphs are captured during engine init.
 `policy.mxfp8_matmul_batch_invariant` requires `bf16_true_on_policy=true`,
 vLLM `precision=fp8`, `is_mx=true`, and Megatron `fp8_cfg.enabled=true` with
 `fp8_recipe=mxfp8`. Select the MXFP8 backend with
-`NEMO_RL_MXFP8_MATMUL_BI_BACKEND`: `native` uses NeMo-RL's native FP8 BI
-kernel runtime patch; `qdq` dequants MXFP8 operands and reuses the BF16 BI
-matmul.
+`NEMO_RL_MXFP8_MATMUL_BI_BACKEND`: `qdq` dequants MXFP8 operands and reuses
+the BF16 BI matmul; `native` uses NeMo-RL's native FP8 BI kernel runtime patch.
+QDQ is the default for GRPO true-on-policy validation because it preserved exact
+vLLM prefill and generation-vs-training parity while the native backend still
+needs kernel debugging.
 
 ## Main Workflow
 

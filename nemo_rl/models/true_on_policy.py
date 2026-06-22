@@ -22,7 +22,7 @@ from typing import Literal
 MXFP8MatmulBIBackend = Literal["native", "qdq"]
 
 G_MXFP8_MATMUL_BI_BACKEND_ENV = "NEMO_RL_MXFP8_MATMUL_BI_BACKEND"
-G_DEFAULT_MXFP8_MATMUL_BI_BACKEND: MXFP8MatmulBIBackend = "native"
+G_DEFAULT_MXFP8_MATMUL_BI_BACKEND: MXFP8MatmulBIBackend = "qdq"
 
 
 def get_mxfp8_matmul_bi_backend() -> MXFP8MatmulBIBackend:

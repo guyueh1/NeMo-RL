@@ -630,6 +630,7 @@ def setup(
             cluster=inference_cluster,
             config=generation_config,
             bf16_true_on_policy=bf16_true_on_policy,
+            mxfp8_matmul_batch_invariant=mxfp8_matmul_batch_invariant,
         )
         if bf16_true_on_policy or mxfp8_matmul_batch_invariant:
             patch_info = pg.install_true_on_policy_patches(

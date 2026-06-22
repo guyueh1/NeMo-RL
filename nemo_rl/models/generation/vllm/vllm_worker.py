@@ -52,6 +52,9 @@ def _dump_debug_vllm_kwargs(label: str, kwargs: dict[str, Any]) -> None:
 def _maybe_install_preinit_true_on_policy_patches() -> None:
     if os.environ.get("NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES") != "1":
         return
+    preinit_mxfp8_matmul = (
+        os.environ.get("NEMO_RL_VLLM_PREINIT_MXFP8_MATMUL_PATCH") == "1"
+    )
 
     from nemo_rl.models.generation.vllm.batch_invariant import (
         install_true_on_policy_patches,
@@ -60,12 +63,14 @@ def _maybe_install_preinit_true_on_policy_patches() -> None:
     # vLLM CustomOp instances bind forward methods during module construction,
     # and CUDA graphs are captured during engine init. Install class-level BF16
     # true-on-policy patches before LLM construction so captured graphs see the
-    # patched implementations. The later collective install still rebinds
-    # constructed modules and handles any MXFP8-specific patches.
+    # patched implementations. The module-level MXFP8 matmul patch also needs
+    # to be present before graph capture when MXFP8 true-on-policy is enabled.
+    # The later collective install still rebinds constructed modules and
+    # confirms the module-level patches are installed.
     patch_info = install_true_on_policy_patches(
         torch.nn.Module(),
         bf16_true_on_policy=True,
-        mxfp8_matmul_batch_invariant=False,
+        mxfp8_matmul_batch_invariant=preinit_mxfp8_matmul,
     )
     print(
         f"  ✓ Pre-installed vLLM true-on-policy class patches: {patch_info}",
