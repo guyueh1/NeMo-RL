@@ -1,4 +1,5 @@
 from nemo_rl.models.megatron import vllm_kernel_patches
+from nemo_rl.models.true_on_policy import G_MXFP8_MATMUL_BI_BACKEND_ENV
 
 
 def test_bf16_true_on_policy_installs_megatron_sdpa_and_te_rmsnorm(monkeypatch):
@@ -38,4 +39,37 @@ def test_bf16_true_on_policy_installs_megatron_sdpa_and_te_rmsnorm(monkeypatch):
         },
         "te_batch_invariant_rmsnorm_entrypoints": 6,
         "bf16_true_on_policy": "megatron_true_on_policy_patches",
+    }
+
+
+def test_mxfp8_cublas_backend_uses_te_passthrough(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        vllm_kernel_patches,
+        "install_megatron_true_on_policy_patches",
+        lambda: {},
+    )
+    monkeypatch.setattr(
+        vllm_kernel_patches,
+        "install_bi_mxfp8_matmul_cublas",
+        lambda: calls.append("cublas"),
+    )
+    monkeypatch.setattr(
+        vllm_kernel_patches,
+        "install_bi_mxfp8_matmul",
+        lambda: calls.append("native"),
+    )
+    monkeypatch.setenv(G_MXFP8_MATMUL_BI_BACKEND_ENV, "cublas")
+
+    result = vllm_kernel_patches.install_true_on_policy_patches(
+        bf16_true_on_policy=True,
+        mxfp8_matmul_batch_invariant=True,
+        mxfp8_active=True,
+    )
+
+    assert calls == ["cublas"]
+    assert result == {
+        "bf16_true_on_policy": "megatron_true_on_policy_patches",
+        "mxfp8_matmul_batch_invariant": "cublas",
     }

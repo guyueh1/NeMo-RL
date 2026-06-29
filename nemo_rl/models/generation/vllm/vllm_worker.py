@@ -745,6 +745,21 @@ class BaseVllmGenerationWorker:
         )
         return cast(list[dict[str, Any]], results)
 
+    def install_mxfp8_bi_cublas_patch(self) -> list[dict[str, Any]]:
+        """Install the cuBLAS MXFP8 matmul patch."""
+        if self.llm is None:
+            return []
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "cuBLAS MXFP8 matmul patch is currently supported only with "
+                "sync vLLM. Set policy.generation.vllm_cfg.async_engine=false."
+            )
+        results = self.llm.collective_rpc(
+            "install_mxfp8_bi_cublas_patch",
+            args=tuple(),
+        )
+        return cast(list[dict[str, Any]], results)
+
     def install_debug_tensor_hooks(
         self, max_calls_per_module: int = 1
     ) -> list[dict[str, Any]]:

@@ -107,6 +107,14 @@ class VllmInternalWorkerExtension:
 
         return install_mxfp8_bi_matmul_patch(self.model_runner.model)
 
+    def install_mxfp8_bi_cublas_patch(self) -> dict[str, Any]:
+        """Install the cuBLAS MXFP8 matmul patch on vLLM."""
+        from nemo_rl.models.generation.vllm.batch_invariant import (
+            install_mxfp8_bi_cublas_patch,
+        )
+
+        return install_mxfp8_bi_cublas_patch(self.model_runner.model)
+
     def install_debug_tensor_hooks(
         self, max_calls_per_module: int = 1
     ) -> dict[str, Any]:

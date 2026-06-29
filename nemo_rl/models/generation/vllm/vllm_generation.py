@@ -14,6 +14,7 @@
 
 import asyncio
 import os
+import sys
 import warnings
 from collections import defaultdict
 from typing import (
@@ -29,7 +30,7 @@ from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -42,6 +43,30 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.models.true_on_policy import (
+    G_TE_SITE_PACKAGES_ENV,
+    get_mxfp8_matmul_bi_backend,
+)
+from nemo_rl.utils.venvs import create_local_venv_on_each_node
+
+G_MXFP8_CUBLAS_TE_VENV_NAME = "nemo_rl.mxfp8_cublas_te"
+G_VLLM_TRUE_ON_POLICY_FORWARDED_ENV_VARS = (
+    "NEMO_RL_VLLM_TRUE_ON_POLICY_PATCH_COMPONENTS",
+    "NEMO_RL_MXFP8_MATMUL_BI_BACKEND",
+    "NEMO_RL_TE_CUBLAS_WORKSPACE_SIZE_BYTES",
+    G_TE_SITE_PACKAGES_ENV,
+    "CUBLAS_WORKSPACE_CONFIG",
+    "CUBLASLT_WORKSPACE_SIZE",
+    "VLLM_BATCH_INVARIANT",
+    "NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES",
+    "NEMO_RL_VLLM_PREINIT_MXFP8_MATMUL_PATCH",
+)
+
+
+def _site_packages_for_python(python_executable: str) -> str:
+    venv_path = os.path.dirname(os.path.dirname(os.path.normpath(python_executable)))
+    python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    return os.path.join(venv_path, "lib", python_version, "site-packages")
 
 
 class VllmGeneration(GenerationInterface):
@@ -149,15 +174,47 @@ class VllmGeneration(GenerationInterface):
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
-        worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
+        top_components = os.environ.get("NEMO_RL_VLLM_TRUE_ON_POLICY_PATCH_COMPONENTS")
+        if top_components is not None:
+            env_vars["NEMO_RL_VLLM_TRUE_ON_POLICY_PATCH_COMPONENTS"] = top_components
+        for env_name in (
+            "NEMO_RL_MXFP8_MATMUL_BI_BACKEND",
+            "NEMO_RL_TE_CUBLAS_WORKSPACE_SIZE_BYTES",
+            G_TE_SITE_PACKAGES_ENV,
+            "CUBLAS_WORKSPACE_CONFIG",
+            "CUBLASLT_WORKSPACE_SIZE",
+        ):
+            env_value = os.environ.get(env_name)
+            if env_value is not None:
+                env_vars[env_name] = env_value
         if self.bf16_true_on_policy:
             env_vars["VLLM_BATCH_INVARIANT"] = "1"
             env_vars["NEMO_RL_VLLM_PREINIT_TRUE_ON_POLICY_PATCHES"] = "1"
             if self.mxfp8_matmul_batch_invariant:
                 env_vars["NEMO_RL_VLLM_PREINIT_MXFP8_MATMUL_PATCH"] = "1"
+        if (
+            self.mxfp8_matmul_batch_invariant
+            and get_mxfp8_matmul_bi_backend() == "cublas"
+            and G_TE_SITE_PACKAGES_ENV not in env_vars
+        ):
+            te_python = create_local_venv_on_each_node(
+                py_executable=PY_EXECUTABLES.MCORE,
+                venv_name=G_MXFP8_CUBLAS_TE_VENV_NAME,
+            )
+            env_vars[G_TE_SITE_PACKAGES_ENV] = _site_packages_for_python(te_python)
+            print(
+                "  ✓ Prepared Transformer Engine import path for vLLM "
+                f"MXFP8 cuBLAS backend: {env_vars[G_TE_SITE_PACKAGES_ENV]}",
+                flush=True,
+            )
+        worker_builder = RayWorkerBuilder(
+            worker_cls,
+            config,
+            extra_env_vars=list(G_VLLM_TRUE_ON_POLICY_FORWARDED_ENV_VARS),
+        )
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
@@ -894,6 +951,14 @@ class VllmGeneration(GenerationInterface):
         """Install the native MXFP8 BI matmul patch on vLLM workers."""
         futures = self.worker_group.run_all_workers_single_data(
             "install_mxfp8_bi_matmul_patch",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return ray.get(futures)
+
+    def install_mxfp8_bi_cublas_patch(self) -> list[Any]:
+        """Install the cuBLAS MXFP8 matmul patch on vLLM workers."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "install_mxfp8_bi_cublas_patch",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         return ray.get(futures)

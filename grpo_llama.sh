@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-NUM_NODES=${NUM_NODES:-2}
+NUM_NODES=${NUM_NODES:-16}
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 export GPUS_PER_NODE
 PRECISION=${PRECISION:-"fp8"}
@@ -45,7 +45,9 @@ fi
 TRUE_ON_POLICY_ARGS="policy.bf16_true_on_policy=${BF16_TRUE_ON_POLICY} policy.mxfp8_matmul_batch_invariant=${MXFP8_MATMUL_BATCH_INVARIANT}"
 
 WANDB_PROJECT=${WANDB_PROJECT:-"guyueh-nemo-rl-mxfp8-lp"}
-JOB_NAME=grpo-llama-nodes-${NUM_NODES}-gpus-${GPUS_PER_NODE}-precision-${PRECISION}-true-on-policy-${BF16_TRUE_ON_POLICY}-mxfp8-bi-${MXFP8_MATMUL_BATCH_INVARIANT}
+JOB_NAME=grpo-llama-nodes-${NUM_NODES}-gpus-${GPUS_PER_NODE}-precision-${PRECISION}-mxfp8-backend-${MXFP8_MATMUL_BI_BACKEND}-true-on-policy-${BF16_TRUE_ON_POLICY}-mxfp8-bi-${MXFP8_MATMUL_BATCH_INVARIANT}
+CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-"/lustre/fsw/portfolios/llmservice/users/guyueh/grpo-runs"}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-"${CHECKPOINT_ROOT}/${JOB_NAME}"}
 
 TRAIN_CMD="\
 NEMO_RL_MCORE_VLLM_USE_MCORE_WITH_VLLM_PATH=${NEMO_RL_MCORE_VLLM_USE_MCORE_WITH_VLLM_PATH:-1} \
@@ -66,6 +68,7 @@ grpo.num_prompts_per_step=16 \
 grpo.num_generations_per_prompt=16 \
 policy.train_global_batch_size=256 \
 checkpointing.enabled=true \
+checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
 checkpointing.save_period=50 \
 logger.wandb_enabled=true \
 logger.wandb.project=${WANDB_PROJECT} \
@@ -91,6 +94,7 @@ echo "VLLM_IS_MX: ${VLLM_IS_MX}"
 echo "MEGATRON_FP8_ENABLED: ${MEGATRON_FP8_ENABLED}"
 echo "MEGATRON_BIAS_ACTIVATION_FUSION: ${MEGATRON_BIAS_ACTIVATION_FUSION}"
 echo "JOB_NAME: ${JOB_NAME}"
+echo "CHECKPOINT_DIR: ${CHECKPOINT_DIR}"
 echo "TRUE_ON_POLICY_ARGS: ${TRUE_ON_POLICY_ARGS}"
 
 INTERACTIVE=${INTERACTIVE:-"0"}
@@ -109,6 +113,7 @@ export BASE_LOG_DIR=${BASE_LOG_DIR:-${SUBMIT_DIR_LOGICAL}}
 export MOUNTS="\
 ${HSG_FSW_USER_DIR}:${HSG_FSW_USER_DIR},\
 ${HSG_FS1_USER_DIR}:${HSG_FS1_USER_DIR},\
+/lustre:/lustre,\
 ${REPO_MOUNTS},\
 /home/guyueh/:/home/guyueh/"
 

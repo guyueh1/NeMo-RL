@@ -114,6 +114,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
             env_vars = dict(config["megatron_cfg"].get("env_vars", {}) or {})
+            for env_name in (
+                "NEMO_RL_MXFP8_MATMUL_BI_BACKEND",
+                "NEMO_RL_TE_CUBLAS_WORKSPACE_SIZE_BYTES",
+                "CUBLAS_WORKSPACE_CONFIG",
+                "CUBLASLT_WORKSPACE_SIZE",
+            ):
+                env_value = os.environ.get(env_name)
+                if env_value is not None:
+                    env_vars.setdefault(env_name, env_value)
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(

@@ -40,7 +40,10 @@ from typing import Any
 
 import torch
 
-from nemo_rl.models.true_on_policy import get_mxfp8_matmul_bi_backend
+from nemo_rl.models.true_on_policy import (
+    get_mxfp8_matmul_bi_backend,
+    install_te_cublas_workspace_limit_from_env,
+)
 
 G_VLLM_STYLE_SDPA_SEQ_LENS: list[int] | None = None
 G_VLLM_STYLE_SDPA_PATCH_ATTR = "_nemo_rl_vllm_style_sdpa_patch"
@@ -1238,6 +1241,12 @@ def install_bi_mxfp8_matmul() -> None:
     install_mxfp8_native_for_bi_gemm()
 
 
+def install_bi_mxfp8_matmul_cublas() -> None:
+    """Keep MXFP8 GEMMs on TE's original cuBLASLt path under BI mode."""
+    install_te_cublas_workspace_limit_from_env()
+    install_mxfp8_passthrough_for_bi_gemm()
+
+
 def install_true_on_policy_patches(
     *,
     bf16_true_on_policy: bool,
@@ -1269,8 +1278,12 @@ def install_true_on_policy_patches(
         backend = get_mxfp8_matmul_bi_backend()
         if backend == "qdq":
             install_bi_mxfp8_matmul_qdq()
-        else:
+        elif backend == "native":
             install_bi_mxfp8_matmul()
+        elif backend == "cublas":
+            install_bi_mxfp8_matmul_cublas()
+        else:
+            raise AssertionError(f"Unhandled MXFP8 BI matmul backend: {backend}")
         installed["mxfp8_matmul_batch_invariant"] = backend
     elif mxfp8_active and bf16_true_on_policy:
         # Megatron's BI general_gemm patch reads `A.is_cuda` on every call,

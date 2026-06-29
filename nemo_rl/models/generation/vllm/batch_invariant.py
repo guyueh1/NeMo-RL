@@ -17,11 +17,15 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
 
-from nemo_rl.models.true_on_policy import get_mxfp8_matmul_bi_backend
+from nemo_rl.models.true_on_policy import (
+    get_mxfp8_matmul_bi_backend,
+    install_te_cublas_workspace_limit_from_env,
+)
 
 G_PATCH_MARKER_ATTR = "_nemo_rl_megatron_style_rmsnorm_patch"
 G_ORIGINAL_FORWARD_ATTR = "_nemo_rl_original_forward_cuda"
@@ -30,7 +34,9 @@ G_MEGATRON_SWIGLU_PATCH_MARKER_ATTR = "_nemo_rl_megatron_style_swiglu_patch"
 G_MEGATRON_ROPE_CACHE_ATTR = "_nemo_rl_megatron_style_cos_sin_cache"
 G_MXFP8_QDQ_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_qdq_patch"
 G_MXFP8_NATIVE_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_native_patch"
+G_MXFP8_CUBLAS_PATCH_MARKER_ATTR = "_nemo_rl_mxfp8_bi_cublas_patch"
 G_ORIGINAL_MXFP8_MM_ATTR = "_nemo_rl_original_mm_mxfp8"
+G_TRUE_ON_POLICY_COMPONENTS_ENV = "NEMO_RL_VLLM_TRUE_ON_POLICY_PATCH_COMPONENTS"
 G_TRUE_ON_POLICY_BF16_PATCH_COMPONENTS = ("rmsnorm", "rope", "swiglu")
 G_TRUE_ON_POLICY_BF16_PATCH_COMPONENT_SET = frozenset(
     G_TRUE_ON_POLICY_BF16_PATCH_COMPONENTS
@@ -496,6 +502,144 @@ def _as_swizzled_mxfp8_scale(scale: torch.Tensor, *, m: int, k: int) -> torch.Te
     )
 
 
+def _as_te_mxfp8_data(data: torch.Tensor) -> torch.Tensor:
+    if data.dtype == torch.uint8:
+        return data.contiguous()
+    if data.dtype == torch.float8_e4m3fn:
+        return data.contiguous().view(torch.uint8)
+    raise RuntimeError(
+        f"cuBLAS MXFP8 backend expected uint8 or float8_e4m3fn data, got {data.dtype}."
+    )
+
+
+def _as_te_mxfp8_scale(scale: torch.Tensor, *, m: int, k: int) -> torch.Tensor:
+    scale_cols = k // 32
+    padded_m = _ceil_div(m, 128) * 128
+    padded_scale_cols = _ceil_div(scale_cols, 4) * 4
+    expected_numel = padded_m * padded_scale_cols
+    if scale.numel() < expected_numel:
+        raise RuntimeError(
+            "cuBLAS MXFP8 backend expected swizzled scales with at least "
+            f"{expected_numel} elements for shape ({m}, {k}); got "
+            f"{scale.numel()}."
+        )
+    return (
+        scale.flatten()[:expected_numel]
+        .contiguous()
+        .view(
+            padded_m,
+            padded_scale_cols,
+        )
+    )
+
+
+def _make_te_mxfp8_tensor(
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    fake_dtype: torch.dtype,
+) -> Any:
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import (
+        MXFP8Quantizer,
+        MXFP8Tensor,
+    )
+
+    m, k = data.shape
+    fp8_dtype = tex.DType.kFloat8E4M3
+    quantizer = MXFP8Quantizer(
+        fp8_dtype=fp8_dtype,
+        rowwise=True,
+        columnwise=False,
+    )
+    quantizer.optimize_for_gemm = True
+    return MXFP8Tensor(
+        shape=data.shape,
+        dtype=fake_dtype,
+        rowwise_data=_as_te_mxfp8_data(data),
+        rowwise_scale_inv=_as_te_mxfp8_scale(scale, m=m, k=k),
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        fp8_dtype=fp8_dtype,
+        quantizer=quantizer,
+        requires_grad=False,
+        with_gemm_swizzled_scales=True,
+    )
+
+
+def install_mxfp8_bi_cublas_patch(model: torch.nn.Module) -> dict[str, Any]:
+    """Route vLLM MXFP8 GEMM through Transformer Engine cuBLASLt."""
+    del model  # The patch is module-level inside the vLLM worker process.
+
+    import vllm.utils.flashinfer as vllm_flashinfer
+
+    workspace_limit = install_te_cublas_workspace_limit_from_env()
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+
+    current_mm_mxfp8 = vllm_flashinfer.mm_mxfp8
+    already_installed = bool(
+        getattr(current_mm_mxfp8, G_MXFP8_CUBLAS_PATCH_MARKER_ATTR, False)
+    )
+    original_mm_mxfp8 = getattr(
+        current_mm_mxfp8,
+        G_ORIGINAL_MXFP8_MM_ATTR,
+        current_mm_mxfp8,
+    )
+
+    if not already_installed:
+
+        def _cublas_mm_mxfp8(
+            a: torch.Tensor,
+            b: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+            out_dtype: torch.dtype,
+            backend: str = "cutlass",  # noqa: ARG001 - preserves vLLM API.
+        ) -> torch.Tensor:
+            # vLLM passes a: [M, K] activation and b: [K, N] transposed weight.
+            # TE's MXFP8 scales are attached along each operand's original K
+            # dimension, so call TE like Megatron linears do: weight [N, K],
+            # activation [M, K], layout="TN".
+            _, k = a.shape
+            n = b.shape[1]
+            activation = _make_te_mxfp8_tensor(
+                a,
+                a_scale,
+                fake_dtype=out_dtype,
+            )
+            weight = _make_te_mxfp8_tensor(
+                b.t().contiguous(),
+                b_scale,
+                fake_dtype=out_dtype,
+            )
+            output_t, *_ = general_gemm(
+                weight,
+                activation,
+                out_dtype=out_dtype,
+                layout="TN",
+            )
+            if output_t.shape == (a.shape[0], n):
+                return output_t.contiguous()
+            if output_t.shape == (n, a.shape[0]):
+                return output_t.t().contiguous()
+            else:
+                raise RuntimeError(
+                    "Unexpected cuBLAS MXFP8 output shape from TE general_gemm: "
+                    f"got {tuple(output_t.shape)}, expected {(a.shape[0], n)} "
+                    f"or {(n, a.shape[0])} for K={k}."
+                )
+
+        setattr(_cublas_mm_mxfp8, G_MXFP8_CUBLAS_PATCH_MARKER_ATTR, True)
+        setattr(_cublas_mm_mxfp8, G_ORIGINAL_MXFP8_MM_ATTR, original_mm_mxfp8)
+        vllm_flashinfer.mm_mxfp8 = _cublas_mm_mxfp8
+
+    return {
+        "already_installed": already_installed,
+        "patched": True,
+        "te_cublas_workspace_limit": workspace_limit,
+    }
+
+
 def install_mxfp8_bi_matmul_patch(model: torch.nn.Module) -> dict[str, Any]:
     """Route vLLM MXFP8 GEMM through native block-scaled BI matmul."""
     del model  # The patch is module-level inside the vLLM worker process.
@@ -571,6 +715,19 @@ def install_true_on_policy_patch_components(
     return results
 
 
+def _get_requested_true_on_policy_components() -> tuple[str, ...]:
+    raw_components = os.environ.get(G_TRUE_ON_POLICY_COMPONENTS_ENV)
+    if raw_components is None:
+        return G_TRUE_ON_POLICY_BF16_PATCH_COMPONENTS
+    if raw_components.strip() == "":
+        return ()
+    return tuple(
+        component.strip().lower()
+        for component in raw_components.split(",")
+        if component.strip()
+    )
+
+
 def install_true_on_policy_patches(
     model: torch.nn.Module,
     *,
@@ -588,10 +745,12 @@ def install_true_on_policy_patches(
         )
 
     if bf16_true_on_policy:
+        components = _get_requested_true_on_policy_components()
+        results["bf16_components"] = components
         results.update(
             install_true_on_policy_patch_components(
                 model,
-                G_TRUE_ON_POLICY_BF16_PATCH_COMPONENTS,
+                components,
             )
         )
 
@@ -600,7 +759,11 @@ def install_true_on_policy_patches(
         results["mxfp8_matmul_backend"] = backend
         if backend == "qdq":
             results["mxfp8_matmul"] = install_mxfp8_bi_emulation_patch(model)
-        else:
+        elif backend == "native":
             results["mxfp8_matmul"] = install_mxfp8_bi_matmul_patch(model)
+        elif backend == "cublas":
+            results["mxfp8_matmul"] = install_mxfp8_bi_cublas_patch(model)
+        else:
+            raise AssertionError(f"Unhandled MXFP8 BI matmul backend: {backend}")
 
     return results
