@@ -29,7 +29,7 @@ from typing import (
 )
 
 import torch
-from typing_extensions import NotRequired, Self
+from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,

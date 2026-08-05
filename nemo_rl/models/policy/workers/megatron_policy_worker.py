@@ -669,7 +669,9 @@ class MegatronPolicyWorkerImpl(
         if self._forward_pre_hook_enabled():
             self.disable_forward_pre_hook(param_sync=param_sync)
         model_configs = [get_model_config(model) for model in self._model_chunks()]
-        param_sync_funcs = [model_config.param_sync_func for model_config in model_configs]
+        param_sync_funcs = [
+            model_config.param_sync_func for model_config in model_configs
+        ]
         self._first_train_step_param_sync_func = (
             param_sync_funcs[0] if len(param_sync_funcs) == 1 else param_sync_funcs
         )

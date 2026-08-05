@@ -1172,7 +1172,6 @@ def logprob_setup(request):
             tp=tp,
             pp=pp,
             vpp=vpp,
-            converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )
@@ -2039,7 +2038,6 @@ def topk_setup(request):
             tp=tp,
             pp=pp,
             vpp=vpp,
-            converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )

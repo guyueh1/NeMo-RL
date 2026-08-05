@@ -184,9 +184,7 @@ class MegatronGenerationMixin:
                 mcore_generation_config["inference_cuda_graph_scope"]
             ]
 
-        self.inference_context = DynamicInferenceContext(
-            model.config, inference_config
-        )
+        self.inference_context = DynamicInferenceContext(model.config, inference_config)
         self.inference_wrapped_model = GPTInferenceWrapper(
             model, self.inference_context
         )

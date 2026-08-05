@@ -21,6 +21,7 @@ from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
+import modelopt.torch.quantization as mtq
 import ray
 import torch
 import zmq
