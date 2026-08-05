@@ -33,7 +33,7 @@ Since reinforcement learning consists of training, generation and transition bet
 
 ## Performance Summary for Large Language Models
 
-Below are performance benchmarks for various large language models organized by release version. These results were obtained using performance recipes available [here](https://github.com/NVIDIA-NeMo/RL/tree/r0.4.0/examples/configs/recipes/llm/performance).
+Below are performance benchmarks for various large language models organized by release version. These results were obtained using performance recipes available [here](https://github.com/NVIDIA-NeMo/RL/tree/r0.6.0/examples/configs/recipes/llm/performance).
 
 The performance data includes:
 
@@ -43,13 +43,13 @@ The performance data includes:
 
 ---
 
-## Nemo RL v0.6
+## NeMo RL v0.6
 
 ### H100 BF16 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2); DAPO dataset: [DAPOMath17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k); SWE dataset: refer to [Nemotron super-v3 documentation - stage 2.2](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md#stage-22---swe-2-64-nodes)
 * System: DGX-H100
 * Precision: Training BF16, Generation BF16
-* Training Backend: Megatron-core.
+* Training Backend: Megatron Core.
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
@@ -62,12 +62,13 @@ The performance data includes:
 | GRPO      |Qwen3-30B3A|On policy    |4,096                |3,203            |32    |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1102               | 192|
 | GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,201            |32    |2,048|512  |[2,1]             |[1,1,8,2,n/a]             |1414               | 152|
 | GRPO      |Qwen3-30B3A|8-step Off   |4,096                |3,206            |192   |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1025               | 34.5|
+| SWE       |Nemotron-3-Nano-30B-A3B|1-step Off   |131,072  |31,599           |128   |512  |512  |[8,1]             |[8,8,8,1,n/a]             |37.5               | 430|
 
 ### H100 FP8 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
 * System: DGX-H100
 * Precision: Generation FP8, Training FP8
-* Training Backend: Megatron-core.
+* Training Backend: Megatron Core.
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
@@ -77,7 +78,7 @@ The performance data includes:
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
 * System: GB200-NVL72
 * Precision: Training BF16, Generation BF16
-* Training Backend: Megatron-core.
+* Training Backend: Megatron Core.
 
 | Algorithm | Model     |On/Off policy|T-Max Sequence Length|G-Average Seq len|#-GPUs|G-GBS|T-GBS|Generation [TP,PP]|Training [TP,CP,EP,PP,VPP]|Tokens / sec / GPU|Total Step time(s)|
 |---------  |-------    |--------     |-----                |-----            |------|---- |---- |----              |----                      |---               |---|
@@ -89,7 +90,6 @@ The performance data includes:
 | GRPO      |Qwen3-235B |1-step Off   |8,192                |5,705            |128   |512  |512  |[8,1]             |[4,1,16,4,n/a]            |85.5              | 278|
 | GRPO      |Qwen3-30B3A|On policy    |4,096                |3,199            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,910               | 221|
 | GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,197            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,406               | 301|
-| SWE       |Nemotron-3-Nano-30B-A3B|1-step Off   |131,072  |31,599           |128   |512  |512  |[8,1]             |[8,8,8,1,n/a]             |37.5               | 430|
 
 Note:
 

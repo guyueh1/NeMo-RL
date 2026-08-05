@@ -329,6 +329,125 @@ def test_sequence_packing_basic():
         assert len(problem_ids_seen) == batch_size
 
 
+def test_sequence_packing_executes_bins_largest_first():
+    """Each shard keeps its assigned bins but executes them largest-first."""
+    sequence_lengths = torch.tensor([46, 24, 55, 88, 11, 14, 73, 17])
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.ones((len(sequence_lengths), 100), dtype=torch.long),
+            "sequence_lengths": sequence_lengths,
+            "problem_ids": torch.arange(len(sequence_lengths)),
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=100,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        microbatch_order="largest_first",
+        sequence_length_pad_multiple=1,
+    )
+
+    packer_order_args = SequencePackingArgs(**sequence_packing_args)
+    packer_order_args["microbatch_order"] = "packer"
+    packer_order_shards, _ = batch_data.shard_by_batch_size(
+        shards=2,
+        sequence_packing_args=packer_order_args,
+    )
+    sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
+        shards=2,
+        sequence_packing_args=sequence_packing_args,
+    )
+
+    assert [shard.micro_batch_lengths[0] for shard in sharded_batches] == [
+        [99, 96],
+        [87, 46],
+    ]
+    for packer_shard, largest_first_shard in zip(
+        packer_order_shards, sharded_batches, strict=True
+    ):
+        assert set(packer_shard["problem_ids"].tolist()) == set(
+            largest_first_shard["problem_ids"].tolist()
+        )
+        expected_lengths = sorted(packer_shard.micro_batch_lengths[0], reverse=True)
+        assert expected_lengths == largest_first_shard.micro_batch_lengths[0]
+    reconstructed = BatchedDataDict.from_batches(sharded_batches)
+    reconstructed.reorder_data(sorted_indices)
+    assert torch.equal(reconstructed["problem_ids"], batch_data["problem_ids"])
+    assert torch.equal(reconstructed["input_ids"], batch_data["input_ids"])
+    assert torch.equal(
+        reconstructed["sequence_lengths"], batch_data["sequence_lengths"]
+    )
+
+
+def test_sequence_packing_rejects_unknown_microbatch_order():
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.ones((2, 8), dtype=torch.long),
+            "sequence_lengths": torch.tensor([4, 5]),
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=8,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        microbatch_order="unknown",  # type: ignore[typeddict-item]
+        sequence_length_pad_multiple=1,
+    )
+
+    with pytest.raises(ValueError, match="microbatch_order"):
+        batch_data.shard_by_batch_size(
+            shards=1,
+            sequence_packing_args=sequence_packing_args,
+        )
+
+
+def test_sequence_packing_largest_first_preserves_chunk_boundaries():
+    """Ordering is local to each optimizer/global-batch chunk."""
+    sequence_lengths = torch.tensor(
+        [46, 24, 55, 88, 11, 14, 73, 17, 31, 67, 19, 82, 12, 43, 58, 21]
+    )
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.ones((len(sequence_lengths), 100), dtype=torch.long),
+            "sequence_lengths": sequence_lengths,
+            "problem_ids": torch.arange(len(sequence_lengths)),
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=100,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        microbatch_order="largest_first",
+        sequence_length_pad_multiple=1,
+    )
+
+    sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
+        shards=2,
+        batch_size=8,
+        sequence_packing_args=sequence_packing_args,
+    )
+
+    for shard in sharded_batches:
+        assert len(shard.micro_batch_lengths) == 2
+        for chunk_lengths in shard.micro_batch_lengths:
+            assert chunk_lengths == sorted(chunk_lengths, reverse=True)
+
+        first_chunk_size, second_chunk_size = shard.elem_counts_per_gb
+        first_chunk_ids = shard["problem_ids"][:first_chunk_size]
+        second_chunk_ids = shard["problem_ids"][
+            first_chunk_size : first_chunk_size + second_chunk_size
+        ]
+        assert torch.all(first_chunk_ids < 8)
+        assert torch.all(second_chunk_ids >= 8)
+
+    reconstructed = BatchedDataDict.from_batches(sharded_batches)
+    reconstructed.reorder_data(sorted_indices)
+    assert torch.equal(reconstructed["problem_ids"], batch_data["problem_ids"])
+
+
 def test_sequence_packing_uniform_lengths():
     """Test sequence packing when all sequences have the same length."""
     batch_size = 16
@@ -723,6 +842,89 @@ def test_sequence_packing_bin_count_constraints(
                 )
                 problem_ids_seen.add(problem_id)
     assert len(problem_ids_seen) == batch_size
+
+
+def test_from_batches_pads_4d_tensors_along_sequence_dim():
+    pad_value = -1
+    batch1 = BatchedDataDict(
+        {
+            "routed_experts": torch.arange(2 * 3 * 4 * 2, dtype=torch.int32).reshape(
+                2, 3, 4, 2
+            )
+        }
+    )
+    batch2 = BatchedDataDict(
+        {
+            "routed_experts": torch.arange(
+                100, 100 + 1 * 5 * 4 * 2, dtype=torch.int32
+            ).reshape(1, 5, 4, 2)
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [batch1, batch2], pad_value_dict={"routed_experts": pad_value}
+    )
+
+    routed_experts = stacked["routed_experts"]
+    assert routed_experts.shape == (3, 5, 4, 2)
+    assert torch.equal(routed_experts[:2, :3], batch1["routed_experts"])
+    assert torch.equal(
+        routed_experts[:2, 3:],
+        torch.full((2, 2, 4, 2), pad_value, dtype=torch.int32),
+    )
+    assert torch.equal(routed_experts[2:], batch2["routed_experts"])
+
+
+def test_from_batches_keeps_optional_keys_missing_only_from_empty_batches():
+    empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.zeros((0, 0), dtype=torch.long),
+            "generation_lengths": torch.zeros(0, dtype=torch.long),
+        }
+    )
+    routed_experts = torch.arange(1 * 3 * 2 * 2, dtype=torch.int32).reshape(1, 3, 2, 2)
+    non_empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+            "routed_experts": routed_experts,
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [empty_batch, non_empty_batch], pad_value_dict={"output_ids": 0}
+    )
+
+    assert stacked["output_ids"].shape == (1, 3)
+    assert torch.equal(stacked["generation_lengths"], torch.tensor([3]))
+    assert torch.equal(stacked["routed_experts"], routed_experts)
+
+    non_empty_missing_optional_key = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[4, 5, 6]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+        }
+    )
+    with pytest.raises(KeyError, match="non-empty batches"):
+        BatchedDataDict.from_batches([non_empty_batch, non_empty_missing_optional_key])
+
+
+def test_from_batches_keeps_keys_missing_from_empty_mapping():
+    empty_batch = BatchedDataDict()
+    routed_experts = torch.arange(1 * 3 * 2 * 2, dtype=torch.int32).reshape(1, 3, 2, 2)
+    non_empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+            "routed_experts": routed_experts,
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches([empty_batch, non_empty_batch])
+
+    assert torch.equal(stacked["output_ids"], non_empty_batch["output_ids"])
+    assert torch.equal(stacked["generation_lengths"], torch.tensor([3]))
+    assert torch.equal(stacked["routed_experts"], routed_experts)
 
 
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])

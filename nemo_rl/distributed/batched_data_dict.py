@@ -17,7 +17,9 @@ from typing import (
     Any,
     Generic,
     Iterator,
+    Literal,
     Mapping,
+    NotRequired,
     Optional,
     Sequence,
     Type,
@@ -51,6 +53,8 @@ class SequencePackingArgs(TypedDict):
     input_key: str
     input_lengths_key: str
     algorithm: str
+    # Omit to preserve the packer's execution order.
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     sequence_length_pad_multiple: (
         int  # pad each sequence to a multiple of this value (for CP/TP alignment)
     )
@@ -128,9 +132,33 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         stacked_dict: Self = cls()
         pad_value_dict = pad_value_dict or {}
+        if not batches:
+            return stacked_dict
 
-        for k in sorted(batches[0]):
-            list_of_tensors = [item[k] for item in batches]
+        def batch_size(item: Mapping[Any, Any]) -> int:
+            if not item:
+                return 0
+            value = next(iter(item.values()))
+            if isinstance(value, PackedTensor):
+                return len(value)
+            if isinstance(value, torch.Tensor):
+                return value.shape[0]
+            return len(value)
+
+        keys = sorted({key for item in batches for key in item})
+        for k in keys:
+            missing_nonempty_batches = [
+                idx
+                for idx, item in enumerate(batches)
+                if k not in item and batch_size(item)
+            ]
+            if missing_nonempty_batches:
+                raise KeyError(
+                    f"Key {k!r} is missing from non-empty batches "
+                    f"{missing_nonempty_batches}."
+                )
+
+            list_of_tensors = [item[k] for item in batches if k in item]
 
             if isinstance(list_of_tensors[0], list):
                 tensor_or_list: list[Any] | torch.Tensor = [
@@ -142,20 +170,16 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
-                # We now add the following if statement to handle the 3D case in distillation
-                # (i.e., teacher top-k logits and indices); the else branch is the original code.
-                if list_of_tensors[0].ndim == 3:
-                    # For 3D tensors, pad only along the sequence dimension (the 1st dimension here),
-                    # keeping the feature dimension.
+                # Preserve structured per-token fields such as teacher top-k data
+                # [B, S, K] and routed experts [B, S, L, topk].
+                if list_of_tensors[0].ndim >= 3:
                     max_seq_len = max(tensor.shape[1] for tensor in list_of_tensors)
                     padded_tensors = []
                     for tensor in list_of_tensors:
-                        # Pad along the 1st dimension to max_seq_len.
                         pad_length = max_seq_len - tensor.shape[1]
                         padded = torch.nn.functional.pad(
                             tensor,
-                            # Only pad the last two dimensions (sequence length).
-                            (0, 0, 0, pad_length),
+                            (0, 0) * (tensor.ndim - 2) + (0, pad_length),
                             mode="constant",
                             value=pad_value,
                         )
@@ -437,6 +461,12 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 data[k] = sorted_v
 
         elif sequence_packing_args is not None:
+            microbatch_order = sequence_packing_args.get("microbatch_order")
+            if microbatch_order not in {None, "packer", "largest_first"}:
+                raise ValueError(
+                    "sequence packing microbatch_order must be 'packer' or "
+                    f"'largest_first', got {microbatch_order!r}"
+                )
             bin_packer = get_packer(
                 algorithm=sequence_packing_args["algorithm"],
                 bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
@@ -459,6 +489,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
             # Store bin assignments for each chunk to reuse later
             all_chunk_bin_assignments = []
+            all_chunk_padded_seqlens = []
 
             # Process each chunk separately to respect chunk boundaries
             for chunk_idx in range(num_chunks):
@@ -476,6 +507,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     sequence_lengths=chunk_padded_seqlens_list,
                 )
                 all_chunk_bin_assignments.append(chunk_bin_assignments)
+                all_chunk_padded_seqlens.append(chunk_padded_seqlens_list)
 
             # create shards with the packed bins
             sharded_data: list[list[dict]] = [[] for _ in range(shards)]
@@ -491,33 +523,43 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     [] for _ in range(shards)
                 ]
 
-                num_bins = len(all_chunk_bin_assignments[chunk_idx])
                 chunk_start = chunk_idx * batch_size
-                for bin_idx in range(num_bins):
-                    shard_idx = bin_idx % shards
-                    bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
-                    global_bin_indices = [i + chunk_start for i in bin_indices]
-                    sharded_data[shard_idx].append(
-                        self.select_indices(global_bin_indices)
-                    )
-                    global_indices_per_shard[shard_idx].extend(global_bin_indices)
-                    bin_seqlen = sum(
-                        [
-                            _get_padded_seqlen(input_lens[i].item())
-                            for i in global_bin_indices
-                        ]
-                    )
+                chunk_padded_seqlens = all_chunk_padded_seqlens[chunk_idx]
+                for shard_idx in range(shards):
+                    # Keep the packer's round-robin bin-to-rank assignment.
+                    # Only execution order within each rank is configurable.
+                    shard_bin_assignments = all_chunk_bin_assignments[chunk_idx][
+                        shard_idx::shards
+                    ]
+                    if microbatch_order == "largest_first":
+                        # Establish the largest token-scaled allocations first so
+                        # smaller microbatches can reuse their cached segments.
+                        shard_bin_assignments = sorted(
+                            shard_bin_assignments,
+                            key=lambda bin_indices: sum(
+                                chunk_padded_seqlens[i] for i in bin_indices
+                            ),
+                            reverse=True,
+                        )
 
-                    if chunk_sharded_micro_indices[shard_idx] == []:
-                        chunk_sharded_micro_indices[shard_idx].append(
-                            [0, len(bin_indices)]
+                    for bin_indices in shard_bin_assignments:
+                        global_bin_indices = [i + chunk_start for i in bin_indices]
+                        sharded_data[shard_idx].append(
+                            self.select_indices(global_bin_indices)
                         )
-                    else:
-                        prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
-                        chunk_sharded_micro_indices[shard_idx].append(
-                            [prev_bin_end, prev_bin_end + len(bin_indices)]
-                        )
-                    chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
+                        global_indices_per_shard[shard_idx].extend(global_bin_indices)
+                        bin_seqlen = sum(chunk_padded_seqlens[i] for i in bin_indices)
+
+                        if chunk_sharded_micro_indices[shard_idx] == []:
+                            chunk_sharded_micro_indices[shard_idx].append(
+                                [0, len(bin_indices)]
+                            )
+                        else:
+                            prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
+                            chunk_sharded_micro_indices[shard_idx].append(
+                                [prev_bin_end, prev_bin_end + len(bin_indices)]
+                            )
+                        chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
 
                 for shard_idx in range(shards):
                     sharded_micro_indices[shard_idx].append(
