@@ -475,6 +475,7 @@ def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
 
     worker = namespace["_Worker"]()
     worker.model = FakeDDP()
+    worker._model_chunks = lambda: [worker.model]
     worker._forward_pre_hook_enabled = lambda: True
     disable_calls = []
     worker.disable_forward_pre_hook = lambda param_sync=True: disable_calls.append(
