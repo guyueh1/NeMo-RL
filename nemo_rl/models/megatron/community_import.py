@@ -152,13 +152,15 @@ def import_model_from_hf_name(
             "num_layers_in_last_pipeline_stage"
         ]
         if hasattr(model_provider, "virtual_pipeline_model_parallel_size"):
-            model_provider.virtual_pipeline_model_parallel_size = megatron_config[
-                "virtual_pipeline_model_parallel_size"
-            ]
+            model_provider.virtual_pipeline_model_parallel_size = megatron_config.get(
+                "virtual_pipeline_model_parallel_size",
+                orig_virtual_pipeline_model_parallel_size,
+            )
         if hasattr(model_provider, "pipeline_model_parallel_layout"):
-            model_provider.pipeline_model_parallel_layout = megatron_config[
-                "pipeline_model_parallel_layout"
-            ]
+            model_provider.pipeline_model_parallel_layout = megatron_config.get(
+                "pipeline_model_parallel_layout",
+                orig_pipeline_model_parallel_layout,
+            )
         model_provider.pipeline_dtype = to_torch_dtype(
             megatron_config["pipeline_dtype"]
         )

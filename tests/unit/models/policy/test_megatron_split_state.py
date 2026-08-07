@@ -64,6 +64,7 @@ def _make_mock_model():
     ``modules()`` that yields nothing (so the inference-cache reset loop
     is a no-op)."""
     model = MagicMock()
+    model.module = None
     model.config = MagicMock()
     model.config.grad_sync_func = "ORIGINAL_GRAD_SYNC_FUNC"  # sentinel
     model.config.num_moe_experts = None  # disable MoE branch
