@@ -214,7 +214,7 @@ def test_megatron_offload_after_refit_finalizes_before_model_move(monkeypatch):
 
     events = []
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.model = _FakeTrainableModel()
+    worker.model = [_FakeTrainableModel()]
     worker.finalize_async_save = lambda: events.append("finalize_async_save")
     worker.move_model = lambda model, device: events.append("move_model") or model
     worker.offload_before_refit = lambda: events.append("offload_before_refit")
@@ -333,7 +333,7 @@ def test_megatron_prepare_for_training_restores_optimizer():
     model = _FakeTrainableModel()
     restored_devices = []
 
-    worker.model = model
+    worker.model = [model]
     worker.optimizer = object()
     worker.optimizer_cpu_offload = False
     worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}

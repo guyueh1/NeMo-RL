@@ -619,6 +619,28 @@ class TestApplyParallelismConfig:
         assert model_cfg.pipeline_model_parallel_layout is None
         assert model_cfg.microbatch_group_size_per_vp_stage == 2
 
+    def test_optional_virtual_pipeline_keys_default_to_none(self):
+        """Missing VPP keys are treated the same as explicit null defaults."""
+        from nemo_rl.models.megatron.setup import _apply_parallelism_config
+
+        model_cfg = MagicMock()
+        config = {
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "num_layers_in_first_pipeline_stage": None,
+                "num_layers_in_last_pipeline_stage": None,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+            },
+            "sequence_packing": {"enabled": False},
+        }
+
+        _apply_parallelism_config(model_cfg, config)
+
+        assert model_cfg.virtual_pipeline_model_parallel_size is None
+        assert model_cfg.pipeline_model_parallel_layout is None
+
 
 @pytest.mark.mcore
 class TestApplyMoeConfig:

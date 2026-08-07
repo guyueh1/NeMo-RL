@@ -713,12 +713,12 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
-    model_cfg.virtual_pipeline_model_parallel_size = config["megatron_cfg"][
-        "virtual_pipeline_model_parallel_size"
-    ]
-    model_cfg.pipeline_model_parallel_layout = config["megatron_cfg"][
-        "pipeline_model_parallel_layout"
-    ]
+    model_cfg.virtual_pipeline_model_parallel_size = config["megatron_cfg"].get(
+        "virtual_pipeline_model_parallel_size", None
+    )
+    model_cfg.pipeline_model_parallel_layout = config["megatron_cfg"].get(
+        "pipeline_model_parallel_layout", None
+    )
     model_cfg.microbatch_group_size_per_vp_stage = config["megatron_cfg"][
         "pipeline_model_parallel_size"
     ]
