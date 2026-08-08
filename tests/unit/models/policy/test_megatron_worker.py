@@ -3509,8 +3509,17 @@ def test_worker_forward_pre_hooks_apply_to_all_model_chunks(monkeypatch):
 
     class FakeDDP:
         def __init__(self):
-            self.enable_forward_pre_hook = MagicMock()
-            self.disable_forward_pre_hook = MagicMock()
+            self.remove_forward_pre_hook_handles = {}
+            self.enable_forward_pre_hook = MagicMock(
+                side_effect=lambda: self.remove_forward_pre_hook_handles.update(
+                    {"hook": object()}
+                )
+            )
+            self.disable_forward_pre_hook = MagicMock(
+                side_effect=lambda param_sync=True: (
+                    self.remove_forward_pre_hook_handles.clear()
+                )
+            )
 
     monkeypatch.setattr(worker_module, "DistributedDataParallel", FakeDDP)
     worker = _new_worker_impl()
@@ -3695,6 +3704,7 @@ def test_worker_refit_conversion_tasks_use_model_chunk_list():
     worker = _new_worker_impl()
     worker.model = [MagicMock(), MagicMock()]
     worker.dtype = torch.float32
+    worker.fp8_cfg = None
     mapping = SimpleNamespace(tp_size=2, ep_size=1, is_expert=False)
     task = SimpleNamespace(
         param_name="layer.weight",
