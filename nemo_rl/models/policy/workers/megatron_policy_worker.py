@@ -1761,7 +1761,8 @@ class MegatronPolicyWorkerImpl(
 
         - Tensors with matching shape: in-place copy (parameters / buffers).
         - _extra_state keys (e.g. FP8 scale/amax) with shape mismatch or non-Tensor value:
-          resolve the submodule and call set_extra_state(); supports DDP and Float16Module unwrap.
+          resolve the submodule and call set_extra_state() when it is implemented;
+          supports DDP and Float16Module unwrap.
 
         Args:
             source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
@@ -1809,6 +1810,11 @@ class MegatronPolicyWorkerImpl(
                 if not hasattr(base_module, top_level_name):
                     base_module = getattr(base_module, "module", base_module)
                 target_module = base_module.get_submodule(submodule_path)
+                if (
+                    type(target_module).set_extra_state
+                    is torch.nn.Module.set_extra_state
+                ):
+                    continue
                 target_module.set_extra_state(source_value)
 
     @contextmanager

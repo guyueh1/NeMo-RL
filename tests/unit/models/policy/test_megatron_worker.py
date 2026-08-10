@@ -3583,6 +3583,22 @@ def test_worker_apply_extra_state_uses_current_model_chunk():
     assert worker.model[0].block.extra_state is extra_state
 
 
+def test_worker_apply_extra_state_skips_default_set_extra_state():
+    class ExtraStateWithoutSetter(torch.nn.Module):
+        def get_extra_state(self):
+            return torch.zeros(1)
+
+    class Chunk(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = ExtraStateWithoutSetter()
+
+    worker = _new_worker_impl()
+    worker.model = [Chunk()]
+
+    worker._apply_state_dict_to_model({"0/block._extra_state": torch.ones(2)})
+
+
 def test_worker_use_reference_model_restores_all_model_chunks():
     class Chunk0(torch.nn.Module):
         def __init__(self):
