@@ -174,6 +174,32 @@ def create_megatron_config(
 
 
 @pytest.mark.parametrize(
+    "megatron_cfg_update",
+    [
+        {"virtual_pipeline_model_parallel_size": 2},
+        {"pipeline_model_parallel_layout": "E(tt|)*13tL"},
+    ],
+)
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_megatron_generation_backend_rejects_virtual_pipeline_parallelism(
+    mock_ray_worker_group,
+    megatron_cfg_update,
+):
+    config = create_megatron_config("test-model", tp=1, pp=2)
+    config["generation"]["backend"] = "megatron"
+    config["megatron_cfg"].update(megatron_cfg_update)
+
+    with pytest.raises(ValueError, match="virtual pipeline parallelism"):
+        Policy(
+            cluster=create_mock_cluster(world_size=2),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    mock_ray_worker_group.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [
         # Valid cases - DTensor backend (PP is always 1 for DTensor)

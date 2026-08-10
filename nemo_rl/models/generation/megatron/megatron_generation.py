@@ -26,6 +26,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
+from nemo_rl.models.generation.megatron.validation import (
+    validate_megatron_generation_backend_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 
 if TYPE_CHECKING:
@@ -81,12 +84,13 @@ class MegatronGeneration(GenerationInterface):
             processor: Optional processor for VLMs (non-colocated only).
             weights_path: Optional path to model weights (non-colocated only).
         """
-        # Import here to avoid circular imports
-        from nemo_rl.models.policy.lm_policy import Policy
-
         assert (cluster is None) != (policy is None), (
             "Provide exactly one of `cluster` or `policy`."
         )
+        validate_megatron_generation_backend_config(config)
+
+        # Import here to avoid circular imports
+        from nemo_rl.models.policy.lm_policy import Policy
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
         # `self._policy_config` keeps a reference to the full PolicyConfig.

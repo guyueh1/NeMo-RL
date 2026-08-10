@@ -38,6 +38,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.generation.megatron.validation import (
+    validate_megatron_generation_backend_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -117,6 +120,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
                 "DTensor (policy.dtensor_cfg.enabled=true), not both."
             )
+        if megatron_enable:
+            validate_megatron_generation_backend_config(config)
         if draft_enabled and not megatron_enable:
             raise ValueError(
                 "policy.draft.enabled=true is only supported with the Megatron backend. "
