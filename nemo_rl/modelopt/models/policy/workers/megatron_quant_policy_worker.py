@@ -521,7 +521,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         mode = self._get_real_quant_mode()
         export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
         yield from self.megatron_bridge.export_hf_weights_modelopt(
-            [self.model],
+            self._model_chunks(),
             quant_mode="nvfp4" if mode == "w4a4" else "w4a16_nvfp4",
             cpu=export_cpu_offload,
             show_progress=False,
