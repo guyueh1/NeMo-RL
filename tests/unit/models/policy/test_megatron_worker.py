@@ -1643,9 +1643,16 @@ def test_megatron_checkpoint_save_kill_and_restore(
             else None
         )
 
-        # Create initial config
+        # This test exercises VPP policy save/restore, not Megatron generation.
+        # Use a supported generation backend for the VPP case so the explicit
+        # Megatron-generation VPP guard does not reject the policy-only setup.
         initial_config = create_megatron_test_config(
-            model_name=model_name, tp=tp, pp=pp, vpp=vpp, precision="float32"
+            model_name=model_name,
+            tp=tp,
+            pp=pp,
+            vpp=vpp,
+            precision="float32",
+            generation_backend="vllm" if vpp else "megatron",
         )
 
         # Step 1: Create first policy and train
@@ -3479,7 +3486,9 @@ def test_policy_sequence_packing_vpp_sets_microbatch_bin_constraints(monkeypatch
         _sorted_bundle_indices=None,
         num_gpus_per_node=4,
     )
-    config = create_megatron_test_config("dummy-model", pp=2, vpp=2)
+    config = create_megatron_test_config(
+        "dummy-model", pp=2, vpp=2, generation_backend="vllm"
+    )
     config["sequence_packing"] = {
         "enabled": True,
         "algorithm": "modified_first_fit_decreasing",
