@@ -19,7 +19,7 @@ from unittest.mock import patch
 import ray
 import torch
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModelForCausalLM
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
@@ -45,6 +45,8 @@ MXFP8_BLOCK_QUANT_KWARGS = {
     "quant_method": "modelopt",
     "quant_algo": "MXFP8",
 }
+
+DEFAULT_QUANTIZATION_IGNORED_LAYERS = ("lm_head",)
 
 
 @dataclass(frozen=True)
@@ -258,7 +260,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModelForCausalLM.from_config(config)
         param_names = [name for name, _ in model.named_parameters()]
 
         bf16_params = []
@@ -280,12 +282,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
     if len(quantization_ignored_layer_kws):
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModelForCausalLM.from_config(config)
         param_names = [
-            f"model.{name}".removesuffix(".weight").replace(
-                "model.backbone.", "backbone."
-            )
-            for name, _ in model.named_parameters()
+            name.removesuffix(".weight").replace("model.backbone.", "backbone.")
+            for name, _ in model.named_parameters(remove_duplicate=False)
         ]
         ignored_layers = [
             n
@@ -297,8 +297,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         else:
             fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
         print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
-    if "ignored_layers" in fp8_block_quant_kwargs:
-        fp8_block_quant_kwargs["ignore"] = fp8_block_quant_kwargs["ignored_layers"]
+    ignored_layers = fp8_block_quant_kwargs.setdefault("ignored_layers", [])
+    ignored_layers.extend(DEFAULT_QUANTIZATION_IGNORED_LAYERS)
+    fp8_block_quant_kwargs["ignored_layers"] = list(dict.fromkeys(ignored_layers))
+    fp8_block_quant_kwargs["ignore"] = fp8_block_quant_kwargs["ignored_layers"]
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
     vllm_kwargs = {

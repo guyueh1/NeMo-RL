@@ -73,7 +73,13 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     assert vllm_kwargs == {
         "quantization": "fp8",
         "kv_cache_dtype": "auto",
-        "hf_overrides": {"quantization_config": fp8.MXFP8_BLOCK_QUANT_KWARGS},
+        "hf_overrides": {
+            "quantization_config": {
+                **fp8.MXFP8_BLOCK_QUANT_KWARGS,
+                "ignored_layers": ["lm_head"],
+                "ignore": ["lm_head"],
+            }
+        },
     }
     assert applied_configs == [fp8.global_fp8_config]
     assert fp8.global_fp8_config.is_mx is True
@@ -377,6 +383,74 @@ def test_process_mxfp8_moe_initializes_kernel_once(fp8_module, monkeypatch):
         "routing_tables": (None, None, None),
         "layer": layer,
     }
+
+
+def test_init_fp8_expands_ignored_layers_and_ignores_lm_head_by_default(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+
+    class FakeCausalLM:
+        def named_parameters(self, *, remove_duplicate=True):
+            assert remove_duplicate is False
+            return iter(
+                [
+                    ("model.layers.0.self_attn.q_proj.weight", object()),
+                    ("model.layers.0.self_attn.k_proj.weight", object()),
+                    ("model.layers.0.self_attn.v_proj.weight", object()),
+                    ("model.layers.0.self_attn.o_proj.weight", object()),
+                    ("model.layers.0.mlp.up_proj.weight", object()),
+                    ("model.layers.0.mlp.gate_proj.weight", object()),
+                    ("model.layers.0.mlp.down_proj.weight", object()),
+                    ("model.backbone.layers.0.mixer.q_proj.weight", object()),
+                    ("lm_head.weight", object()),
+                    ("model.norm.weight", object()),
+                ]
+            )
+
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=1),
+    )
+    monkeypatch.setattr(
+        fp8.AutoModelForCausalLM,
+        "from_config",
+        lambda *_args, **_kwargs: FakeCausalLM(),
+    )
+    vllm_kwargs = fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+            "quantization_ignored_layer_kws": [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "up_proj",
+                "gate_proj",
+                "down_proj",
+            ],
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    quantization_config = vllm_kwargs["hf_overrides"]["quantization_config"]
+    assert quantization_config["ignored_layers"] == [
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.k_proj",
+        "model.layers.0.self_attn.v_proj",
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.mlp.up_proj",
+        "model.layers.0.mlp.gate_proj",
+        "model.layers.0.mlp.down_proj",
+        "backbone.layers.0.mixer.q_proj",
+        "lm_head",
+    ]
+    assert quantization_config["ignore"] == quantization_config["ignored_layers"]
 
 
 @pytest.mark.parametrize(
