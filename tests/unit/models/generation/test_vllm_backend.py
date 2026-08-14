@@ -164,14 +164,28 @@ def test_update_weights_from_collective_uses_native_reload(monkeypatch):
 
 
 @pytest.mark.vllm
-def test_collective_preserves_batched_loading_for_fp8(monkeypatch):
+def test_collective_fp8_uses_native_reload_iterator(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8
 
     ext, _ = _make_collective_update_extension(vllm_backend)
     monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: True)
+    source_weights = iter([("model.weight", "weight-value")])
+    quantized_weights = iter(
+        [("model.weight", "quantized"), ("model.weight_scale", "scale")]
+    )
 
-    assert ext._collective_requires_batched_loading() is True
+    def get_quantized_weight_iterator(weights, model_runner):
+        assert weights is source_weights
+        assert model_runner is ext.model_runner
+        return quantized_weights
+
+    monkeypatch.setattr(
+        fp8, "get_quantized_weight_iterator", get_quantized_weight_iterator
+    )
+
+    assert ext._collective_requires_batched_loading() is False
+    assert ext._prepare_reload_weight_iterator(source_weights) is quantized_weights
 
 
 @pytest.mark.vllm

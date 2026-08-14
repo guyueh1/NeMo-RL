@@ -217,14 +217,15 @@ class VllmInternalWorkerExtension:
                 (fix_gemma3_vision_weight_name(name), weight)
                 for name, weight in weights
             )
-        return weights
 
-    def _collective_requires_batched_loading(self) -> bool:
-        """Return whether refit requires the existing batched loading lifecycle."""
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if fp8.is_fp8_model(self.model_runner.vllm_config):
-            return True
+            return fp8.get_quantized_weight_iterator(weights, self.model_runner)
+        return weights
+
+    def _collective_requires_batched_loading(self) -> bool:
+        """Return whether a speculative drafter also consumes the refit stream."""
         if any(name.startswith("draft.") for name in self.state_dict_info):
             return True
         if self._get_drafter_model() is None:
