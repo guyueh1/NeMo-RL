@@ -470,6 +470,57 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
+def test_load_weights_gets_mxfp8_mode_from_worker_config(fp8_module, monkeypatch):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    fp8 = fp8_module
+    loaded_weights = []
+    quantized_weight = object()
+    quantized_scale = fp8.torch.ones(2, 1)
+    model_runner = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            load_weights=lambda weights: loaded_weights.extend(weights),
+        ),
+        vllm_config=types.SimpleNamespace(
+            quant_config=object.__new__(ModelOptMxFp8Config)
+        ),
+    )
+
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    monkeypatch.setattr(
+        mxfp8_utils,
+        "mxfp8_e4m3_quantize",
+        lambda _weight: (quantized_weight, quantized_scale),
+    )
+    monkeypatch.setenv(fp8.NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG, "1")
+
+    assert fp8.global_fp8_config is None
+    fp8.load_weights([("layer.weight", fp8.torch.ones(2, 2))], model_runner)
+
+    assert loaded_weights[0] == ["layer.weight", quantized_weight]
+    assert loaded_weights[1][0] == "layer.weight_scale_from_checkpoint"
+    fp8.torch.testing.assert_close(
+        loaded_weights[1][1], fp8.torch.squeeze(quantized_scale, dim=-1)
+    )
+
+
+def test_load_weights_reports_missing_process_local_config(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    monkeypatch.delenv(fp8.NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG, raising=False)
+
+    model_runner = types.SimpleNamespace(
+        model=types.SimpleNamespace(),
+        vllm_config=types.SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=fp8.NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG,
+    ):
+        fp8.load_weights([], model_runner)
+
+
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
 

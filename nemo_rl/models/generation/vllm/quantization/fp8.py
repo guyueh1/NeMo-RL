@@ -46,6 +46,8 @@ MXFP8_BLOCK_QUANT_KWARGS = {
     "quant_algo": "MXFP8",
 }
 
+NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG = "NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG"
+
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -334,6 +336,32 @@ def is_fp8_model(vllm_config):
     return False
 
 
+def is_mxfp8_model(vllm_config):
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8Config,
+        )
+    except ImportError:
+        return False
+
+    return isinstance(getattr(vllm_config, "quant_config", None), ModelOptMxFp8Config)
+
+
+def _get_refit_is_mx(model_runner):
+    if os.environ.get(NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG, "0") == "1":
+        return is_mxfp8_model(model_runner.vllm_config)
+
+    if global_fp8_config is None:
+        raise RuntimeError(
+            "The process-local FP8 configuration is unavailable in this vLLM "
+            "refit worker. Set "
+            f"{NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG}=1 to derive the "
+            "quantization mode from the worker's resolved vLLM config."
+        )
+
+    return global_fp8_config.is_mx
+
+
 def _get_params_in_layers(param_names, layers):
     layer_templates = []
     for i in layers:
@@ -442,16 +470,16 @@ def _is_fp8_weight(name, model):
 
 
 def load_weights(weights, model_runner):
-    global global_fp8_config
     weights_quantized = []
     model = model_runner.model
+    is_mx = _get_refit_is_mx(model_runner)
 
     for k, v in weights:
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        if global_fp8_config.is_mx:
+        if is_mx:
             from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
                 mxfp8_e4m3_quantize,
             )
@@ -463,7 +491,7 @@ def load_weights(weights, model_runner):
                 weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        if global_fp8_config.is_mx:
+        if is_mx:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
         else:
