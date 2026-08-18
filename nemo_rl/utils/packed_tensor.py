@@ -263,7 +263,6 @@ def packed_broadcast_consumer(
         A lazy iterator when ``return_iterator`` is True, otherwise None.
 
     """
-
     batches = _packed_broadcast_consumer_batches(iterator, group, src)
     if return_iterator:
         return (weight for batch in batches for weight in batch)

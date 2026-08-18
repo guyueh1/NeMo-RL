@@ -38,6 +38,7 @@ def _make_collective_update_extension(backend):
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(architectures=[]),
             speculative_config=None,
+            additional_config={backend.REFIT_WITH_RELOAD_API_CONFIG_KEY: False},
         ),
         drafter=None,
     )
@@ -127,11 +128,61 @@ def _make_mtp_refit_extension(
 
 
 @pytest.mark.vllm
-def test_update_weights_from_collective_uses_native_reload(monkeypatch):
+def test_update_weights_from_collective_uses_legacy_loader_by_default(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
     call_order = []
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+
+    @contextlib.contextmanager
+    def lifecycle(transport):
+        assert transport == "collective"
+        call_order.append("lifecycle")
+        yield lambda: call_order.append("finalize")
+
+    def load_weights(weights):
+        call_order.append("load")
+        assert weights == [("model.weight", "weight-value")]
+
+    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+        call_order.append("broadcast")
+        assert list(iterator) == [("model.weight", expected_state_info)]
+        assert group is ext.model_update_group
+        assert src == 0
+        post_unpack_func([("model.weight", "weight-value")])
+
+    ext._weight_update_lifecycle = lifecycle
+    ext._load_weights = load_weights
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
+    monkeypatch.setattr(
+        vllm_backend.torch.cuda,
+        "empty_cache",
+        lambda: call_order.append("empty_cache"),
+    )
+
+    assert ext.update_weights_from_collective() is True
+    assert call_order == [
+        "lifecycle",
+        "broadcast",
+        "load",
+        "finalize",
+        "gc",
+        "empty_cache",
+    ]
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+    ext.model_runner.vllm_config.additional_config[
+        vllm_backend.REFIT_WITH_RELOAD_API_CONFIG_KEY
+    ] = True
 
     def packed_broadcast_consumer(
         iterator, group, src, post_unpack_func, return_iterator=False
@@ -161,6 +212,21 @@ def test_update_weights_from_collective_uses_native_reload(monkeypatch):
 
     assert ext.update_weights_from_collective() is True
     assert call_order == ["broadcast", "reload", "gc", "empty_cache"]
+
+
+@pytest.mark.vllm
+def test_update_weights_from_collective_rejects_reload_for_draft_weights():
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, state_info = _make_collective_update_extension(vllm_backend)
+    ext.state_dict_info = {"draft.weight": state_info}
+    ext.model_runner.vllm_config.additional_config[
+        vllm_backend.REFIT_WITH_RELOAD_API_CONFIG_KEY
+    ] = True
+    ext._weight_update_errors_are_fatal = lambda: True
+
+    with pytest.raises(RuntimeError, match="refit_with_reload_api=true"):
+        ext.update_weights_from_collective()
 
 
 @pytest.mark.vllm
@@ -394,6 +460,58 @@ async def test_nccl_reshard_refit_resets_encoder_cache():
 
 
 @pytest.mark.vllm
+def test_configure_reload_refit_preserves_additional_config():
+    from nemo_rl.models.generation.vllm.config import REFIT_WITH_RELOAD_API_CONFIG_KEY
+    from nemo_rl.models.generation.vllm.vllm_worker import _configure_reload_refit
+
+    vllm_kwargs = {"additional_config": {"existing": "value"}}
+
+    _configure_reload_refit(
+        vllm_kwargs,
+        {"refit_with_reload_api": True},
+    )
+
+    assert vllm_kwargs["additional_config"] == {
+        "existing": "value",
+        REFIT_WITH_RELOAD_API_CONFIG_KEY: True,
+    }
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    ("async_engine", "expected_method"),
+    [(False, "prepare_refit_info"), (True, "prepare_refit_info_async")],
+)
+def test_generation_prepare_refit_info_keeps_reload_flag_out_of_rpc(
+    monkeypatch, async_engine, expected_method
+):
+    from nemo_rl.models.generation.vllm import vllm_generation
+
+    generation = vllm_generation.VllmGeneration.__new__(vllm_generation.VllmGeneration)
+    generation.cfg = {
+        "vllm_cfg": {
+            "async_engine": async_engine,
+            "refit_with_reload_api": True,
+        }
+    }
+    generation.worker_group = SimpleNamespace(
+        run_all_workers_single_data=MagicMock(return_value=["future"])
+    )
+    ray_get = MagicMock()
+    monkeypatch.setattr(vllm_generation.ray, "get", ray_get)
+    state_dict_info = {"model.weight": object()}
+
+    generation.prepare_refit_info(state_dict_info)
+
+    generation.worker_group.run_all_workers_single_data.assert_called_once_with(
+        expected_method,
+        state_dict_info=state_dict_info,
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+    ray_get.assert_called_once_with(["future"])
+
+
+@pytest.mark.vllm
 def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.policy.utils import IPCProtocol
@@ -423,6 +541,72 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
 
     assert ext.update_weights_via_ipc_zmq() is False
     assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
+
+
+@pytest.mark.vllm
+def test_update_weights_via_ipc_uses_reload_when_enabled(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.policy.utils import IPCProtocol
+
+    class FakeSocket:
+        def __init__(self):
+            self.messages = [
+                ("ipc-handle", ["model.weight"], 4),
+                IPCProtocol.COMPLETE,
+            ]
+            self.sent = []
+
+        def recv_pyobj(self):
+            return self.messages.pop(0)
+
+        def send(self, payload):
+            self.sent.append(payload)
+
+    call_order = []
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
+    ext.device = torch.device("cpu")
+    ext.model_runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={vllm_backend.REFIT_WITH_RELOAD_API_CONFIG_KEY: True}
+        )
+    )
+    ext.zmq_socket = FakeSocket()
+    ext.maybe_init_zmq = lambda: None
+    ext._prepare_reload_weight_iterator = lambda weights: weights
+    ext._synchronize_before_ipc_data_ack = lambda: call_order.append("sync")
+
+    def reload_weights(*, weights_iterator):
+        call_order.append("reload")
+        weights = list(weights_iterator)
+        assert len(weights) == 1
+        name, tensor = weights[0]
+        assert name == "model.weight"
+        assert tensor.shape == torch.Size([1])
+        assert tensor.dtype == torch.float32
+
+    ext.model_runner.reload_weights = reload_weights
+    monkeypatch.setattr(
+        vllm_backend,
+        "rebuild_cuda_tensor_from_ipc",
+        lambda _handle, _device_index: torch.arange(4, dtype=torch.uint8),
+    )
+    monkeypatch.setattr(vllm_backend, "calculate_aligned_size", lambda size: size)
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
+    monkeypatch.setattr(
+        vllm_backend.torch.cuda,
+        "empty_cache",
+        lambda: call_order.append("empty_cache"),
+    )
+
+    assert ext.update_weights_via_ipc_zmq() is True
+    assert ext.zmq_socket.sent == [
+        IPCProtocol.ACK.value.encode(),
+        IPCProtocol.ACK.value.encode(),
+    ]
+    assert call_order == ["reload", "sync", "gc", "empty_cache"]
 
 
 @pytest.mark.vllm

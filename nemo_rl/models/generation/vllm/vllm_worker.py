@@ -41,8 +41,10 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmCheckpointEngineRpcMixin,
 )
 from nemo_rl.models.generation.vllm.config import (
+    REFIT_WITH_RELOAD_API_CONFIG_KEY,
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
+    VllmSpecificArgs,
 )
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
@@ -99,6 +101,17 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
     vllm_kwargs.update(fp8_kwargs)
     existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
     vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
+
+
+def _configure_reload_refit(
+    vllm_kwargs: dict[str, Any], vllm_cfg: VllmSpecificArgs
+) -> None:
+    """Pass NeMo-RL refit mode metadata through vLLM's config object."""
+    additional_config = dict(vllm_kwargs.get("additional_config") or {})
+    additional_config[REFIT_WITH_RELOAD_API_CONFIG_KEY] = vllm_cfg[
+        "refit_with_reload_api"
+    ]
+    vllm_kwargs["additional_config"] = additional_config
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -375,6 +388,8 @@ class BaseVllmGenerationWorker:
             )
 
             configure_nixl_worker(self.cfg, vllm_kwargs)
+
+        _configure_reload_refit(vllm_kwargs, self.cfg["vllm_cfg"])
 
         # A speculative_config with num_speculative_tokens == 0 is the supported
         # way to disable speculative decoding (e.g. MTP) from a launch script

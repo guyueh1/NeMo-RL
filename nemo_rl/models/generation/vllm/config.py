@@ -21,6 +21,7 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
+REFIT_WITH_RELOAD_API_CONFIG_KEY = "nemo_rl_refit_with_reload_api"
 
 
 class VllmSpecificArgs(TypedDict):
@@ -72,6 +73,10 @@ class VllmSpecificArgs(TypedDict):
     # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
     # affecting other test cases.
     env_vars: NotRequired[dict[str, str]]
+    # Opt into vLLM's native reload_weights API for refit. The default stays
+    # False so existing IPC/NCCL refit behavior keeps using NeMo-RL's legacy
+    # loader path.
+    refit_with_reload_api: bool
     # A filepath that can be imported to register a vLLM reasoning parser
     reasoning_parser_plugin: NotRequired[str]
 

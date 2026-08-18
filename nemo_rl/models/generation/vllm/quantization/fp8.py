@@ -243,6 +243,13 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
         os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
+    if not vllm_cfg["refit_with_reload_api"]:
+        if vllm_cfg["async_engine"]:
+            EngineCoreProc.run_engine_core = my_run_engine_core
+            CoreEngineProcManager.__init__ = my_init
+        else:
+            monkey_patch_vllm_ray_executor(global_fp8_config)
+
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)

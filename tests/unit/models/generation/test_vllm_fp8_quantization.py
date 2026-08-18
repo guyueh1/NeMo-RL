@@ -29,6 +29,8 @@ def fp8_module():
     old_config = fp8.global_fp8_config
     old_state = fp8.fp8_state
     old_patches_applied = fp8.fp8_patches_applied
+    old_run_engine_core = fp8.EngineCoreProc.run_engine_core
+    old_core_manager_init = fp8.CoreEngineProcManager.__init__
     fp8.global_fp8_config = None
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
@@ -39,15 +41,19 @@ def fp8_module():
         fp8.global_fp8_config = old_config
         fp8.fp8_state = old_state
         fp8.fp8_patches_applied = old_patches_applied
+        fp8.EngineCoreProc.run_engine_core = old_run_engine_core
+        fp8.CoreEngineProcManager.__init__ = old_core_manager_init
 
 
 @pytest.mark.parametrize("async_engine", [False, True])
+@pytest.mark.parametrize("refit_with_reload_api", [False, True])
 def test_init_fp8_uses_mxfp8_quantization_config(
-    fp8_module, monkeypatch, async_engine
+    fp8_module, monkeypatch, async_engine, refit_with_reload_api
 ):
     fp8 = fp8_module
     original_run_engine_core = fp8.EngineCoreProc.run_engine_core
     original_core_manager_init = fp8.CoreEngineProcManager.__init__
+    applied_configs = []
 
     monkeypatch.setattr(
         fp8.AutoConfig,
@@ -57,7 +63,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(
     monkeypatch.setattr(
         fp8,
         "monkey_patch_vllm_ray_executor",
-        lambda _fp8_config: pytest.fail("init_fp8 must not install FP8 monkey patches"),
+        lambda fp8_config: applied_configs.append(fp8_config),
     )
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
@@ -69,6 +75,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(
             "async_engine": async_engine,
             "is_mx": True,
             "use_deep_gemm": True,
+            "refit_with_reload_api": refit_with_reload_api,
         },
         "dummy-model",
         model_parallel_size=1,
@@ -79,8 +86,19 @@ def test_init_fp8_uses_mxfp8_quantization_config(
         "kv_cache_dtype": "auto",
         "hf_overrides": {"quantization_config": fp8.MXFP8_BLOCK_QUANT_KWARGS},
     }
-    assert fp8.EngineCoreProc.run_engine_core is original_run_engine_core
-    assert fp8.CoreEngineProcManager.__init__ is original_core_manager_init
+    if refit_with_reload_api:
+        assert applied_configs == []
+        assert fp8.EngineCoreProc.run_engine_core is original_run_engine_core
+        assert fp8.CoreEngineProcManager.__init__ is original_core_manager_init
+    elif async_engine:
+        assert applied_configs == []
+        assert fp8.EngineCoreProc.run_engine_core is fp8.my_run_engine_core
+        assert fp8.CoreEngineProcManager.__init__ is fp8.my_init
+    else:
+        assert len(applied_configs) == 1
+        assert applied_configs[0] is fp8.global_fp8_config
+        assert fp8.EngineCoreProc.run_engine_core is original_run_engine_core
+        assert fp8.CoreEngineProcManager.__init__ is original_core_manager_init
     assert fp8.global_fp8_config.is_mx is True
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
@@ -455,6 +473,7 @@ def test_init_fp8_rejects_non_pow2_mxfp8_scales(fp8_module, monkeypatch, field, 
                 "kv_cache_dtype": "auto",
                 "async_engine": False,
                 "is_mx": True,
+                "refit_with_reload_api": False,
                 field: False,
             },
             "dummy-model",
@@ -626,9 +645,7 @@ def test_mxfp8_load_weights_routes_moe_weights_to_checkpoint_params(
     ]
 
 
-def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(
-    fp8_module, monkeypatch
-):
+def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(fp8_module, monkeypatch):
     import torch
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 

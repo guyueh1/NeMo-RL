@@ -17,7 +17,7 @@ import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import torch
 import zmq
@@ -27,6 +27,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
+from nemo_rl.models.generation.vllm.config import REFIT_WITH_RELOAD_API_CONFIG_KEY
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -185,6 +186,15 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+
+    def _refit_with_reload_api_enabled(self) -> bool:
+        """Return whether this vLLM engine opted into native reload refit."""
+        return cast(
+            bool,
+            self.model_runner.vllm_config.additional_config[
+                REFIT_WITH_RELOAD_API_CONFIG_KEY
+            ],
+        )
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -664,6 +674,92 @@ class VllmInternalWorkerExtension:
         """Fence work consuming one IPC data batch before its acknowledgment."""
         torch.cuda.current_stream().synchronize()
 
+    def _iter_ipc_refit_weights(
+        self,
+        manifest: _IPCWeightManifest,
+        stream_state: dict[str, bool],
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield IPC/ZMQ refit weights for vLLM's native reload API."""
+        buffer = None
+        weight_view = None
+        weights = None
+
+        while True:
+            payload = self.zmq_socket.recv_pyobj()
+
+            if payload == IPCProtocol.COMPLETE:
+                stream_state["complete"] = True
+                try:
+                    manifest.require_complete()
+                finally:
+                    self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                break
+
+            batch_keys = None
+            batch_error = None
+            try:
+                ipc_handle, list_keys, used_bytes = payload
+                batch_keys = manifest.validate_batch(list_keys)
+                if batch_keys is None:
+                    continue
+
+                buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
+                weights = []
+                offset = 0
+                for key in list_keys:
+                    shape, dtype = self.state_dict_info[key]  # pyrefly
+                    if not isinstance(shape, torch.Size):
+                        shape = torch.Size(shape)
+
+                    size_in_bytes = dtype.itemsize * shape.numel()
+                    weight_view = (
+                        buffer[offset : offset + size_in_bytes]
+                        .view(dtype=dtype)
+                        .view(shape)
+                    )
+                    weights.append((key, weight_view))
+                    offset += calculate_aligned_size(size_in_bytes)
+
+                assert offset == used_bytes, (
+                    "Offset is not equal to used bytes, usually indicate "
+                    "inaccurate info like keys or cached dtype in "
+                    "state_dict_info"
+                )
+                for weight_item in weights:
+                    yield weight_item
+            except Exception as error:
+                batch_error = error
+                batch_desc = ", ".join(
+                    f"{k}: {tuple(w.shape)} {w.dtype}" for k, w in (weights or [])[:40]
+                )
+                logger.exception("IPC weight batch load failed (batch: %s)", batch_desc)
+            finally:
+                if buffer is not None:
+                    try:
+                        self._synchronize_before_ipc_data_ack()
+                    except Exception as error:
+                        if batch_error is None:
+                            batch_error = error
+
+                if batch_error is not None:
+                    manifest.record_load_failure(batch_error)
+                elif batch_keys is not None:
+                    manifest.record_loaded(batch_keys)
+
+                del weight_view, weights, buffer
+                weight_view = None
+                weights = None
+                buffer = None
+                self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+
+    def _drain_ipc_refit_stream(self) -> None:
+        """Acknowledge the remaining IPC stream after native reload aborts."""
+        while True:
+            payload = self.zmq_socket.recv_pyobj()
+            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+            if payload == IPCProtocol.COMPLETE:
+                break
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -678,6 +774,36 @@ class VllmInternalWorkerExtension:
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
+            if self._refit_with_reload_api_enabled():
+                stream_state = {"complete": False}
+                weight_iterator = self._iter_ipc_refit_weights(manifest, stream_state)
+                try:
+                    self.model_runner.reload_weights(
+                        weights_iterator=self._prepare_reload_weight_iterator(
+                            weight_iterator
+                        )
+                    )
+                    if not stream_state["complete"]:
+                        raise RuntimeError(
+                            "vLLM reload_weights returned before consuming the "
+                            "complete IPC refit stream"
+                        )
+                except Exception:
+                    weight_iterator.close()
+                    if not stream_state["complete"]:
+                        try:
+                            self._drain_ipc_refit_stream()
+                        except Exception:
+                            logger.exception(
+                                "Failed to drain IPC refit stream after native reload "
+                                "abort"
+                            )
+                    raise
+
+                gc.collect()
+                torch.cuda.empty_cache()
+                return True
+
             with self._weight_update_lifecycle("ipc") as finalize:
                 while True:
                     # Blocking receive with timeout (this is the main operation)
@@ -783,9 +909,17 @@ class VllmInternalWorkerExtension:
         )
 
         try:
-            if self._collective_requires_batched_loading():
-                # Eagle/MTP drafters consume parts of the same stream. Preserve
-                # their existing batched loading and explicit finalization path.
+            requires_batched_loading = self._collective_requires_batched_loading()
+            refit_with_reload_api = self._refit_with_reload_api_enabled()
+            if refit_with_reload_api and requires_batched_loading:
+                raise RuntimeError(
+                    "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+                    "supported when vLLM refit also updates draft weights. Set it "
+                    "to false for Eagle/MTP speculative decoding."
+                )
+            if not refit_with_reload_api:
+                # Preserve the existing NeMo-RL loader and its explicit
+                # finalization path unless native reload is requested.
                 with self._weight_update_lifecycle("collective") as finalize:
                     packed_broadcast_consumer(
                         iterator=iter(self.state_dict_info.items()),
