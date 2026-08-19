@@ -1890,7 +1890,7 @@ def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
         backend.torch.cuda, "empty_cache", lambda: calls.append("empty")
     )
 
-    assert extension.update_weights_via_ipc_zmq(refit_with_reload_api=False) is True
+    assert extension.update_weights_via_ipc_zmq() is True
     assert calls == [
         ("initialize", model),
         ("finalize", model, model_config),
@@ -1938,7 +1938,7 @@ def test_real_quant_ipc_finalize_failure_acks_complete(monkeypatch):
     with pytest.raises(
         RuntimeError, match="ModelOpt real-quant refit post-processing failed"
     ):
-        extension.update_weights_via_ipc_zmq(refit_with_reload_api=False)
+        extension.update_weights_via_ipc_zmq()
     assert socket.sent == [IPCProtocol.ACK.value.encode()]
 
 
@@ -2031,7 +2031,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     monkeypatch.setattr(backend.torch.accelerator, "synchronize", lambda: None)
 
     with pytest.raises(RuntimeError, match=error):
-        extension.update_weights_via_ipc_zmq(refit_with_reload_api=False)
+        extension.update_weights_via_ipc_zmq()
     assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * len(payloads)
 
 
@@ -2130,7 +2130,7 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     )
     monkeypatch.setattr(base_backend.gc, "collect", lambda: calls.append("gc"))
 
-    assert extension.update_weights_via_ipc_zmq(refit_with_reload_api=False) is True
+    assert extension.update_weights_via_ipc_zmq() is True
 
     assert extension.zmq_socket.sent == [
         IPCProtocol.ACK.value.encode(),
@@ -2165,12 +2165,10 @@ def test_non_real_quant_ipc_delegates(monkeypatch):
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "update_weights_via_ipc_zmq",
-        lambda self, refit_with_reload_api: "delegated",
+        lambda self: "delegated",
     )
 
-    assert (
-        extension.update_weights_via_ipc_zmq(refit_with_reload_api=False) == "delegated"
-    )
+    assert extension.update_weights_via_ipc_zmq() == "delegated"
 
 
 def test_weight_snapshot_returns_cpu_clone_and_missing_name_raises(monkeypatch):

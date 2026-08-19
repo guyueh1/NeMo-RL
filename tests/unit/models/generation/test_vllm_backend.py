@@ -331,14 +331,17 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
 
 @pytest.mark.vllm
 @pytest.mark.parametrize(
-    "method_name",
-    ["update_weights_via_ipc_zmq", "update_weights_from_collective"],
+    ("method_name", "expected_rpc_args"),
+    [
+        ("update_weights_via_ipc_zmq", tuple()),
+        ("update_weights_from_collective", (True,)),
+    ],
 )
 @pytest.mark.parametrize(
     "worker_results, expected", [([True, True], True), ([True, False], False)]
 )
 def test_sync_weight_updates_check_every_internal_worker(
-    method_name, worker_results, expected
+    method_name, expected_rpc_args, worker_results, expected
 ):
     """A failure on a later PP rank must not be hidden by rank zero success."""
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
@@ -350,21 +353,28 @@ def test_sync_weight_updates_check_every_internal_worker(
     assert getattr(worker, method_name)() is expected
     worker.llm.collective_rpc.assert_called_once_with(
         method_name,
-        args=(True,),
+        args=expected_rpc_args,
     )
 
 
 @pytest.mark.vllm
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "method_name",
-    ["update_weights_via_ipc_zmq_async", "update_weights_from_collective_async"],
+    ("method_name", "expected_rpc_method", "expected_rpc_args"),
+    [
+        ("update_weights_via_ipc_zmq_async", "update_weights_via_ipc_zmq", tuple()),
+        (
+            "update_weights_from_collective_async",
+            "update_weights_from_collective",
+            (True,),
+        ),
+    ],
 )
 @pytest.mark.parametrize(
     "worker_results, expected", [([True, True], True), ([True, False], False)]
 )
 async def test_async_weight_updates_check_every_internal_worker(
-    method_name, worker_results, expected
+    method_name, expected_rpc_method, expected_rpc_args, worker_results, expected
 ):
     """Async refit also reports failures from every internal PP rank."""
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -386,8 +396,8 @@ async def test_async_weight_updates_check_every_internal_worker(
 
     assert await getattr(worker, method_name)() is expected
     worker.llm.collective_rpc.assert_awaited_once_with(
-        method_name.removesuffix("_async"),
-        args=(True,),
+        expected_rpc_method,
+        args=expected_rpc_args,
     )
     if expected:
         worker.llm.reset_encoder_cache.assert_awaited_once_with()
@@ -463,6 +473,25 @@ async def test_nccl_reshard_refit_resets_encoder_cache():
 
 
 @pytest.mark.vllm
+def test_vllm_worker_rejects_reload_refit_when_colocated():
+    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+
+    with pytest.raises(AssertionError, match="refit_with_reload_api=true.*colocated"):
+        worker._init_config(
+            {
+                "vllm_cfg": {"refit_with_reload_api": True},
+                "colocated": {"enabled": True},
+            },
+            bundle_indices=None,
+            fraction_of_gpus=1.0,
+            seed=None,
+            extra_env_vars=None,
+        )
+
+
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     ("async_engine", "expected_method"),
     [(False, "prepare_refit_info"), (True, "prepare_refit_info_async")],
@@ -524,70 +553,8 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
 
     ext._weight_update_lifecycle = lifecycle
 
-    assert ext.update_weights_via_ipc_zmq(refit_with_reload_api=False) is False
+    assert ext.update_weights_via_ipc_zmq() is False
     assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
-
-
-@pytest.mark.vllm
-def test_update_weights_via_ipc_uses_reload_when_enabled(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_backend
-    from nemo_rl.models.policy.utils import IPCProtocol
-
-    class FakeSocket:
-        def __init__(self):
-            self.messages = [
-                ("ipc-handle", ["model.weight"], 4),
-                IPCProtocol.COMPLETE,
-            ]
-            self.sent = []
-
-        def recv_pyobj(self):
-            return self.messages.pop(0)
-
-        def send(self, payload):
-            self.sent.append(payload)
-
-    call_order = []
-    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
-        vllm_backend.VllmInternalWorkerExtension
-    )
-    ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
-    ext.device = torch.device("cpu")
-    ext.model_runner = SimpleNamespace(vllm_config=SimpleNamespace())
-    ext.zmq_socket = FakeSocket()
-    ext.maybe_init_zmq = lambda: None
-    ext._prepare_reload_weight_iterator = lambda weights: weights
-    ext._synchronize_before_ipc_data_ack = lambda: call_order.append("sync")
-
-    def reload_weights(*, weights_iterator):
-        call_order.append("reload")
-        weights = list(weights_iterator)
-        assert len(weights) == 1
-        name, tensor = weights[0]
-        assert name == "model.weight"
-        assert tensor.shape == torch.Size([1])
-        assert tensor.dtype == torch.float32
-
-    ext.model_runner.reload_weights = reload_weights
-    monkeypatch.setattr(
-        vllm_backend,
-        "rebuild_cuda_tensor_from_ipc",
-        lambda _handle, _device_index: torch.arange(4, dtype=torch.uint8),
-    )
-    monkeypatch.setattr(vllm_backend, "calculate_aligned_size", lambda size: size)
-    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
-    monkeypatch.setattr(
-        vllm_backend.torch.cuda,
-        "empty_cache",
-        lambda: call_order.append("empty_cache"),
-    )
-
-    assert ext.update_weights_via_ipc_zmq(refit_with_reload_api=True) is True
-    assert ext.zmq_socket.sent == [
-        IPCProtocol.ACK.value.encode(),
-        IPCProtocol.ACK.value.encode(),
-    ]
-    assert call_order == ["reload", "sync", "gc", "empty_cache"]
 
 
 @pytest.mark.vllm
