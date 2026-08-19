@@ -14,6 +14,7 @@
 
 import os
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 from unittest.mock import patch
 
 import ray
@@ -73,6 +74,7 @@ class FP8State:
 # Global FP8 config that can be accessed by patched vLLM functions
 # initialized by 'init_fp8_cfg()'
 global_fp8_config: FP8Config = None
+_refit_fp8_config_cache = {}
 # Global FP8 state that holds runtime fp8 objects
 fp8_state: FP8State = FP8State()
 
@@ -128,6 +130,7 @@ def apply_fp8_patches(self, fp8_config):
     assert not fp8_patches_applied
 
     global_fp8_config = fp8_config
+    _clear_refit_fp8_config_cache()
 
     # Apply patches conditionally based on configuration
     # Only apply weight patches if using FP8 weights
@@ -236,6 +239,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "pow2_activation_scaling_factors", False
         )
     global_fp8_config = FP8Config(**fp8_config_kwargs)
+    _clear_refit_fp8_config_cache()
 
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
@@ -366,6 +370,49 @@ def fp8_config_from_vllm_config(vllm_config) -> FP8Config | None:
     )
 
 
+def _fp8_config_cache_token(raw_config):
+    if isinstance(raw_config, dict):
+        try:
+            return tuple(sorted(raw_config.items()))
+        except TypeError:
+            return id(raw_config)
+    if isinstance(raw_config, FP8Config) or raw_config is None:
+        return raw_config
+    return id(raw_config)
+
+
+def _refit_fp8_config_cache_key(model_runner):
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    additional_config = getattr(vllm_config, "additional_config", None)
+    raw_config = None
+    if isinstance(additional_config, dict):
+        raw_config = additional_config.get(NEMO_RL_FP8_CONFIG_KEY)
+
+    return (
+        id(model_runner),
+        id(vllm_config),
+        id(additional_config),
+        _fp8_config_cache_token(raw_config),
+        global_fp8_config,
+    )
+
+
+def _clear_refit_fp8_config_cache():
+    _refit_fp8_config_cache.clear()
+
+
+def _cache_refit_fp8_config(func):
+    @wraps(func)
+    def wrapped(model_runner):
+        cache_key = _refit_fp8_config_cache_key(model_runner)
+        if cache_key not in _refit_fp8_config_cache:
+            _refit_fp8_config_cache[cache_key] = func(model_runner)
+        return _refit_fp8_config_cache[cache_key]
+
+    return wrapped
+
+
+@_cache_refit_fp8_config
 def _get_refit_fp8_config(model_runner) -> FP8Config:
     worker_fp8_config = fp8_config_from_vllm_config(
         getattr(model_runner, "vllm_config", None)
