@@ -38,7 +38,6 @@ def _make_collective_update_extension(backend):
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(architectures=[]),
             speculative_config=None,
-            additional_config={backend.REFIT_WITH_RELOAD_API_CONFIG_KEY: False},
         ),
         drafter=None,
     )
@@ -163,7 +162,7 @@ def test_update_weights_from_collective_uses_legacy_loader_by_default(monkeypatc
         lambda: call_order.append("empty_cache"),
     )
 
-    assert ext.update_weights_from_collective() is True
+    assert ext.update_weights_from_collective(refit_with_reload_api=False) is True
     assert call_order == [
         "lifecycle",
         "broadcast",
@@ -180,9 +179,6 @@ def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypa
 
     call_order = []
     ext, expected_state_info = _make_collective_update_extension(vllm_backend)
-    ext.model_runner.vllm_config.additional_config[
-        vllm_backend.REFIT_WITH_RELOAD_API_CONFIG_KEY
-    ] = True
 
     def packed_broadcast_consumer(
         iterator, group, src, post_unpack_func, return_iterator=False
@@ -210,7 +206,7 @@ def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypa
         lambda: call_order.append("empty_cache"),
     )
 
-    assert ext.update_weights_from_collective() is True
+    assert ext.update_weights_from_collective(refit_with_reload_api=True) is True
     assert call_order == ["broadcast", "reload", "gc", "empty_cache"]
 
 
@@ -220,13 +216,10 @@ def test_update_weights_from_collective_rejects_reload_for_draft_weights():
 
     ext, state_info = _make_collective_update_extension(vllm_backend)
     ext.state_dict_info = {"draft.weight": state_info}
-    ext.model_runner.vllm_config.additional_config[
-        vllm_backend.REFIT_WITH_RELOAD_API_CONFIG_KEY
-    ] = True
     ext._weight_update_errors_are_fatal = lambda: True
 
     with pytest.raises(RuntimeError, match="refit_with_reload_api=true"):
-        ext.update_weights_from_collective()
+        ext.update_weights_from_collective(refit_with_reload_api=True)
 
 
 @pytest.mark.vllm
@@ -314,7 +307,7 @@ def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatc
         lambda: call_order.append("empty_cache"),
     )
 
-    assert ext.update_weights_from_collective() is True
+    assert ext.update_weights_from_collective(refit_with_reload_api=False) is True
 
     expected_process_calls = [(ext.model_runner.model, ext.model_config, ext.device)]
     expected_call_order = [
@@ -351,10 +344,14 @@ def test_sync_weight_updates_check_every_internal_worker(
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.cfg = {"vllm_cfg": {"async_engine": False, "refit_with_reload_api": True}}
     worker.llm = SimpleNamespace(collective_rpc=MagicMock(return_value=worker_results))
 
     assert getattr(worker, method_name)() is expected
+    worker.llm.collective_rpc.assert_called_once_with(
+        method_name,
+        args=(True,),
+    )
 
 
 @pytest.mark.vllm
@@ -378,6 +375,7 @@ async def test_async_weight_updates_check_every_internal_worker(
     worker.cfg = {
         "vllm_cfg": {
             "async_engine": True,
+            "refit_with_reload_api": True,
             "reset_encoder_cache_after_weight_update": True,
         }
     }
@@ -387,6 +385,10 @@ async def test_async_weight_updates_check_every_internal_worker(
     )
 
     assert await getattr(worker, method_name)() is expected
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        method_name.removesuffix("_async"),
+        args=(True,),
+    )
     if expected:
         worker.llm.reset_encoder_cache.assert_awaited_once_with()
     else:
@@ -402,7 +404,7 @@ async def test_async_weight_update_skips_encoder_cache_reset_when_disabled():
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.cfg = {"vllm_cfg": {"async_engine": True, "refit_with_reload_api": False}}
     worker.llm = SimpleNamespace(
         collective_rpc=AsyncMock(return_value=[True]),
         reset_encoder_cache=AsyncMock(),
@@ -424,6 +426,7 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
     worker.cfg = {
         "vllm_cfg": {
             "async_engine": True,
+            "refit_with_reload_api": False,
             "reset_encoder_cache_after_weight_update": True,
         }
     }
@@ -457,24 +460,6 @@ async def test_nccl_reshard_refit_resets_encoder_cache():
 
     assert await worker.nccl_reshard_refit_async() is True
     worker.llm.reset_encoder_cache.assert_awaited_once_with()
-
-
-@pytest.mark.vllm
-def test_configure_reload_refit_preserves_additional_config():
-    from nemo_rl.models.generation.vllm.config import REFIT_WITH_RELOAD_API_CONFIG_KEY
-    from nemo_rl.models.generation.vllm.vllm_worker import _configure_reload_refit
-
-    vllm_kwargs = {"additional_config": {"existing": "value"}}
-
-    _configure_reload_refit(
-        vllm_kwargs,
-        {"refit_with_reload_api": True},
-    )
-
-    assert vllm_kwargs["additional_config"] == {
-        "existing": "value",
-        REFIT_WITH_RELOAD_API_CONFIG_KEY: True,
-    }
 
 
 @pytest.mark.vllm
@@ -539,7 +524,7 @@ def test_update_weights_via_ipc_acks_manifest_error_and_returns_false(monkeypatc
 
     ext._weight_update_lifecycle = lifecycle
 
-    assert ext.update_weights_via_ipc_zmq() is False
+    assert ext.update_weights_via_ipc_zmq(refit_with_reload_api=False) is False
     assert ext.zmq_socket.sent == [IPCProtocol.ACK.value.encode()]
 
 
@@ -568,11 +553,7 @@ def test_update_weights_via_ipc_uses_reload_when_enabled(monkeypatch):
     )
     ext.state_dict_info = {"model.weight": (torch.Size([1]), torch.float32)}
     ext.device = torch.device("cpu")
-    ext.model_runner = SimpleNamespace(
-        vllm_config=SimpleNamespace(
-            additional_config={vllm_backend.REFIT_WITH_RELOAD_API_CONFIG_KEY: True}
-        )
-    )
+    ext.model_runner = SimpleNamespace(vllm_config=SimpleNamespace())
     ext.zmq_socket = FakeSocket()
     ext.maybe_init_zmq = lambda: None
     ext._prepare_reload_weight_iterator = lambda weights: weights
@@ -601,7 +582,7 @@ def test_update_weights_via_ipc_uses_reload_when_enabled(monkeypatch):
         lambda: call_order.append("empty_cache"),
     )
 
-    assert ext.update_weights_via_ipc_zmq() is True
+    assert ext.update_weights_via_ipc_zmq(refit_with_reload_api=True) is True
     assert ext.zmq_socket.sent == [
         IPCProtocol.ACK.value.encode(),
         IPCProtocol.ACK.value.encode(),

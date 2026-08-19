@@ -37,15 +37,10 @@ from nemo_rl.modelopt.utils import (
     resolve_nvfp4_real_quant_mode,
     resolve_quant_cfg,
 )
-from nemo_rl.models.generation.vllm.config import REFIT_WITH_RELOAD_API_CONFIG_KEY
 
 
-def _vllm_config(*, refit_with_reload_api: bool = False):
-    return types.SimpleNamespace(
-        additional_config={
-            REFIT_WITH_RELOAD_API_CONFIG_KEY: refit_with_reload_api,
-        }
-    )
+def _vllm_config():
+    return types.SimpleNamespace(additional_config={})
 
 
 @pytest.fixture(autouse=True)
@@ -1764,7 +1759,7 @@ def test_real_quant_collective_reload_uses_vllm_layerwise_lifecycle(monkeypatch)
         lambda: calls.append("sync"),
     )
 
-    assert extension.update_weights_from_collective() is True
+    assert extension.update_weights_from_collective(refit_with_reload_api=False) is True
     assert calls == [
         ("initialize", model),
         ("consume", "_load_weights"),
@@ -1814,7 +1809,7 @@ def test_real_quant_collective_reload_raises_on_failure(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="collective refit failed"):
-        extension.update_weights_from_collective()
+        extension.update_weights_from_collective(refit_with_reload_api=False)
     assert calls == [("initialize", model)]
 
 
@@ -1830,10 +1825,13 @@ def test_non_real_quant_collective_reload_delegates(monkeypatch):
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "update_weights_from_collective",
-        lambda self: "delegated",
+        lambda self, refit_with_reload_api: "delegated",
     )
 
-    assert extension.update_weights_from_collective() == "delegated"
+    assert (
+        extension.update_weights_from_collective(refit_with_reload_api=False)
+        == "delegated"
+    )
 
 
 def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
@@ -1892,7 +1890,7 @@ def test_real_quant_ipc_complete_finalizes_vllm_layerwise_reload_and_acks(
         backend.torch.cuda, "empty_cache", lambda: calls.append("empty")
     )
 
-    assert extension.update_weights_via_ipc_zmq() is True
+    assert extension.update_weights_via_ipc_zmq(refit_with_reload_api=False) is True
     assert calls == [
         ("initialize", model),
         ("finalize", model, model_config),
@@ -1940,7 +1938,7 @@ def test_real_quant_ipc_finalize_failure_acks_complete(monkeypatch):
     with pytest.raises(
         RuntimeError, match="ModelOpt real-quant refit post-processing failed"
     ):
-        extension.update_weights_via_ipc_zmq()
+        extension.update_weights_via_ipc_zmq(refit_with_reload_api=False)
     assert socket.sent == [IPCProtocol.ACK.value.encode()]
 
 
@@ -2033,7 +2031,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     monkeypatch.setattr(backend.torch.accelerator, "synchronize", lambda: None)
 
     with pytest.raises(RuntimeError, match=error):
-        extension.update_weights_via_ipc_zmq()
+        extension.update_weights_via_ipc_zmq(refit_with_reload_api=False)
     assert extension.zmq_socket.sent == [IPCProtocol.ACK.value.encode()] * len(payloads)
 
 
@@ -2078,9 +2076,7 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
         model=model,
         vllm_config=types.SimpleNamespace(
             model_config=types.SimpleNamespace(architectures=["GptOssForCausalLM"]),
-            additional_config={
-                REFIT_WITH_RELOAD_API_CONFIG_KEY: False,
-            },
+            additional_config={},
         ),
     )
     extension.model_config = model_config
@@ -2134,7 +2130,7 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     )
     monkeypatch.setattr(base_backend.gc, "collect", lambda: calls.append("gc"))
 
-    assert extension.update_weights_via_ipc_zmq() is True
+    assert extension.update_weights_via_ipc_zmq(refit_with_reload_api=False) is True
 
     assert extension.zmq_socket.sent == [
         IPCProtocol.ACK.value.encode(),
@@ -2169,10 +2165,12 @@ def test_non_real_quant_ipc_delegates(monkeypatch):
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "update_weights_via_ipc_zmq",
-        lambda self: "delegated",
+        lambda self, refit_with_reload_api: "delegated",
     )
 
-    assert extension.update_weights_via_ipc_zmq() == "delegated"
+    assert (
+        extension.update_weights_via_ipc_zmq(refit_with_reload_api=False) == "delegated"
+    )
 
 
 def test_weight_snapshot_returns_cpu_clone_and_missing_name_raises(monkeypatch):

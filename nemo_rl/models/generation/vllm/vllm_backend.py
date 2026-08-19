@@ -17,7 +17,7 @@ import re
 import socket
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import torch
 import zmq
@@ -27,7 +27,6 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
     preinit_nixl_from_vllm_config,
     resolve_rollout_rank,
 )
-from nemo_rl.models.generation.vllm.config import REFIT_WITH_RELOAD_API_CONFIG_KEY
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -186,15 +185,6 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
-
-    def _refit_with_reload_api_enabled(self) -> bool:
-        """Return whether this vLLM engine opted into native reload refit."""
-        return cast(
-            bool,
-            self.model_runner.vllm_config.additional_config[
-                REFIT_WITH_RELOAD_API_CONFIG_KEY
-            ],
-        )
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -761,8 +751,11 @@ class VllmInternalWorkerExtension:
                 break
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
-    def update_weights_via_ipc_zmq(self) -> bool:
+    def update_weights_via_ipc_zmq(self, refit_with_reload_api: bool) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
+
+        Args:
+            refit_with_reload_api: Whether to use vLLM's native reload API.
 
         Returns:
             bool: True if weights were successfully updated.
@@ -774,7 +767,7 @@ class VllmInternalWorkerExtension:
         try:
             self.maybe_init_zmq()
             manifest = _IPCWeightManifest(self.state_dict_info)
-            if self._refit_with_reload_api_enabled():
+            if refit_with_reload_api:
                 stream_state = {"complete": False}
                 weight_iterator = self._iter_ipc_refit_weights(manifest, stream_state)
                 try:
@@ -901,8 +894,12 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
-        """Update the model weights from collective communication."""
+    def update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
+        """Update the model weights from collective communication.
+
+        Args:
+            refit_with_reload_api: Whether to use vLLM's native reload API.
+        """
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."
@@ -910,7 +907,6 @@ class VllmInternalWorkerExtension:
 
         try:
             requires_batched_loading = self._collective_requires_batched_loading()
-            refit_with_reload_api = self._refit_with_reload_api_enabled()
             if refit_with_reload_api and requires_batched_loading:
                 raise RuntimeError(
                     "policy.generation.vllm_cfg.refit_with_reload_api=true is not "

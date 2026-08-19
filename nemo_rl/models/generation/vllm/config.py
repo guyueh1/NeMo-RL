@@ -21,7 +21,6 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
-REFIT_WITH_RELOAD_API_CONFIG_KEY = "nemo_rl_refit_with_reload_api"
 
 
 class VllmSpecificArgs(TypedDict):
