@@ -44,7 +44,6 @@ def fp8_module():
     old_config = fp8.global_fp8_config
     old_state = fp8.fp8_state
     old_patches_applied = fp8.fp8_patches_applied
-    fp8._clear_refit_fp8_config_cache()
     fp8.global_fp8_config = None
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
@@ -52,7 +51,6 @@ def fp8_module():
     try:
         yield fp8
     finally:
-        fp8._clear_refit_fp8_config_cache()
         fp8.global_fp8_config = old_config
         fp8.fp8_state = old_state
         fp8.fp8_patches_applied = old_patches_applied
@@ -587,38 +585,6 @@ def test_refit_rejects_process_local_and_worker_mxfp8_mismatch(fp8_module):
 
     with pytest.raises(RuntimeError, match="disagrees"):
         fp8.load_weights([], model_runner)
-
-
-def test_get_refit_fp8_config_caches_worker_config(fp8_module, monkeypatch):
-    fp8 = fp8_module
-    parse_calls = 0
-    raw_config = _fp8_config_payload(is_mx=False)
-    model_runner = types.SimpleNamespace(
-        vllm_config=types.SimpleNamespace(
-            additional_config={fp8.NEMO_RL_FP8_CONFIG_KEY: raw_config}
-        ),
-    )
-    original_parser = fp8.fp8_config_from_vllm_config
-
-    def parse_with_count(vllm_config):
-        nonlocal parse_calls
-        parse_calls += 1
-        return original_parser(vllm_config)
-
-    monkeypatch.setattr(fp8, "fp8_config_from_vllm_config", parse_with_count)
-
-    first_config = fp8._get_refit_fp8_config(model_runner)
-    second_config = fp8._get_refit_fp8_config(model_runner)
-
-    assert first_config is second_config
-    assert parse_calls == 1
-
-    raw_config["is_mx"] = True
-    updated_config = fp8._get_refit_fp8_config(model_runner)
-
-    assert updated_config.is_mx is True
-    assert updated_config is not first_config
-    assert parse_calls == 2
 
 
 def test_load_weights_reports_missing_process_local_config(fp8_module, monkeypatch):
