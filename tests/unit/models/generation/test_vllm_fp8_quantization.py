@@ -20,6 +20,21 @@ import torch
 pytestmark = pytest.mark.vllm
 
 
+def _fp8_config_payload(**overrides):
+    payload = {
+        "use_weight_pow2_scale": False,
+        "use_activation_pow2_scale": False,
+        "num_first_layers_in_bf16": 0,
+        "num_last_layers_in_bf16": 0,
+        "model_parallel_size": 1,
+        "kv_cache_dtype": "auto",
+        "use_fp8_weights": True,
+        "is_mx": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
 @pytest.fixture()
 def fp8_module():
     pytest.importorskip("vllm")
@@ -74,6 +89,9 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
         "quantization": "fp8",
         "kv_cache_dtype": "auto",
         "hf_overrides": {"quantization_config": fp8.MXFP8_BLOCK_QUANT_KWARGS},
+        "additional_config": {
+            fp8.NEMO_RL_FP8_CONFIG_KEY: _fp8_config_payload(is_mx=True)
+        },
     }
     assert applied_configs == [fp8.global_fp8_config]
     assert fp8.global_fp8_config.is_mx is True
@@ -470,8 +488,9 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
-def test_load_weights_gets_mxfp8_mode_from_worker_config(fp8_module, monkeypatch):
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+def test_load_weights_gets_mxfp8_mode_from_worker_additional_config(
+    fp8_module, monkeypatch
+):
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
     fp8 = fp8_module
@@ -483,7 +502,9 @@ def test_load_weights_gets_mxfp8_mode_from_worker_config(fp8_module, monkeypatch
             load_weights=lambda weights: loaded_weights.extend(weights),
         ),
         vllm_config=types.SimpleNamespace(
-            quant_config=object.__new__(ModelOptMxFp8Config)
+            additional_config={
+                fp8.NEMO_RL_FP8_CONFIG_KEY: _fp8_config_payload(is_mx=True)
+            }
         ),
     )
 
@@ -504,12 +525,74 @@ def test_load_weights_gets_mxfp8_mode_from_worker_config(fp8_module, monkeypatch
     )
 
 
+def test_load_weights_passes_worker_fp8_config_to_blockwise_refit(
+    fp8_module, monkeypatch
+):
+    fp8 = fp8_module
+    loaded_weights = []
+    quantized_weight = object()
+    quantized_scale = fp8.torch.ones(2, 1)
+    observed_configs = []
+    model_runner = types.SimpleNamespace(
+        model=types.SimpleNamespace(
+            load_weights=lambda weights: loaded_weights.extend(weights),
+        ),
+        vllm_config=types.SimpleNamespace(
+            additional_config={
+                fp8.NEMO_RL_FP8_CONFIG_KEY: _fp8_config_payload(
+                    use_weight_pow2_scale=True,
+                    is_mx=False,
+                )
+            }
+        ),
+    )
+
+    def fake_blockwise(_weight, *, weight_block_size, fp8_config):
+        del weight_block_size
+        observed_configs.append(fp8_config)
+        return quantized_weight, quantized_scale
+
+    monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
+    monkeypatch.setattr(fp8, "cast_tensor_to_fp8_blockwise", fake_blockwise)
+
+    assert fp8.global_fp8_config is None
+    fp8.load_weights([("layer.weight", fp8.torch.ones(2, 2))], model_runner)
+
+    assert observed_configs[0].use_weight_pow2_scale is True
+    assert observed_configs[0].is_mx is False
+    assert loaded_weights[0] == ["layer.weight", quantized_weight]
+    assert loaded_weights[1][0] == "layer.weight_scale_inv"
+    fp8.torch.testing.assert_close(
+        loaded_weights[1][1], fp8.torch.squeeze(quantized_scale, dim=-1)
+    )
+
+
+def test_refit_rejects_process_local_and_worker_mxfp8_mismatch(fp8_module):
+    fp8 = fp8_module
+    fp8.global_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=False,
+    )
+    model_runner = types.SimpleNamespace(
+        model=types.SimpleNamespace(),
+        vllm_config=types.SimpleNamespace(
+            additional_config={
+                fp8.NEMO_RL_FP8_CONFIG_KEY: _fp8_config_payload(is_mx=True)
+            }
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="disagrees"):
+        fp8.load_weights([], model_runner)
+
+
 def test_load_weights_reports_missing_process_local_config(fp8_module, monkeypatch):
     fp8 = fp8_module
 
     model_runner = types.SimpleNamespace(
         model=types.SimpleNamespace(),
-        vllm_config=types.SimpleNamespace(),
+        vllm_config=types.SimpleNamespace(additional_config={}),
     )
 
     with pytest.raises(
