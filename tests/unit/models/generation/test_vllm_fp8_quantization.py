@@ -493,7 +493,6 @@ def test_load_weights_gets_mxfp8_mode_from_worker_config(fp8_module, monkeypatch
         "mxfp8_e4m3_quantize",
         lambda _weight: (quantized_weight, quantized_scale),
     )
-    monkeypatch.setenv(fp8.NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG, "1")
 
     assert fp8.global_fp8_config is None
     fp8.load_weights([("layer.weight", fp8.torch.ones(2, 2))], model_runner)
@@ -507,7 +506,6 @@ def test_load_weights_gets_mxfp8_mode_from_worker_config(fp8_module, monkeypatch
 
 def test_load_weights_reports_missing_process_local_config(fp8_module, monkeypatch):
     fp8 = fp8_module
-    monkeypatch.delenv(fp8.NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG, raising=False)
 
     model_runner = types.SimpleNamespace(
         model=types.SimpleNamespace(),
@@ -516,7 +514,7 @@ def test_load_weights_reports_missing_process_local_config(fp8_module, monkeypat
 
     with pytest.raises(
         RuntimeError,
-        match=fp8.NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG,
+        match="process-local FP8 configuration",
     ):
         fp8.load_weights([], model_runner)
 

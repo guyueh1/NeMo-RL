@@ -46,8 +46,6 @@ MXFP8_BLOCK_QUANT_KWARGS = {
     "quant_algo": "MXFP8",
 }
 
-NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG = "NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG"
-
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -348,18 +346,18 @@ def is_mxfp8_model(vllm_config):
 
 
 def _get_refit_is_mx(model_runner):
-    if os.environ.get(NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG, "0") == "1":
-        return is_mxfp8_model(model_runner.vllm_config)
+    if global_fp8_config is not None:
+        return global_fp8_config.is_mx
 
-    if global_fp8_config is None:
-        raise RuntimeError(
-            "The process-local FP8 configuration is unavailable in this vLLM "
-            "refit worker. Set "
-            f"{NRL_VLLM_MXFP8_REFIT_USE_WORKER_CONFIG}=1 to derive the "
-            "quantization mode from the worker's resolved vLLM config."
-        )
+    if is_mxfp8_model(getattr(model_runner, "vllm_config", None)):
+        return True
 
-    return global_fp8_config.is_mx
+    raise RuntimeError(
+        "The process-local FP8 configuration is unavailable in this vLLM "
+        "refit worker, and the worker's resolved vLLM config is not MXFP8. "
+        "Non-MX FP8 refit still requires the process-local FP8 config because "
+        "it controls weight-scale handling."
+    )
 
 
 def _get_params_in_layers(param_names, layers):
