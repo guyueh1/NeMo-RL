@@ -222,7 +222,11 @@ class VllmInternalWorkerExtension:
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if fp8.is_fp8_model(self.model_runner.vllm_config):
-            return fp8.get_quantized_weight_iterator(weights, self.model_runner)
+            return fp8.get_quantized_weight_iterator(
+                weights,
+                self.model_runner,
+                refit_with_reload_api=True,
+            )
         return weights
 
     def _collective_requires_batched_loading(self) -> bool:

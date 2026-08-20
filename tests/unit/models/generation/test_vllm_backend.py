@@ -234,9 +234,10 @@ def test_collective_fp8_uses_native_reload_iterator(monkeypatch):
         [("model.weight", "quantized"), ("model.weight_scale", "scale")]
     )
 
-    def get_quantized_weight_iterator(weights, model_runner):
+    def get_quantized_weight_iterator(weights, model_runner, *, refit_with_reload_api):
         assert weights is source_weights
         assert model_runner is ext.model_runner
+        assert refit_with_reload_api is True
         return quantized_weights
 
     monkeypatch.setattr(

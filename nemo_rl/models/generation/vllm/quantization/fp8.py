@@ -466,7 +466,7 @@ def get_quantized_weight_iterator(
     weights: Iterable[tuple[str, torch.Tensor]],
     model_runner: Any,
     *,
-    use_refit_params: bool = False,
+    refit_with_reload_api: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert trainer weights to the checkpoint tensors expected by vLLM."""
     model = model_runner.model
@@ -486,7 +486,10 @@ def get_quantized_weight_iterator(
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
         if is_mx:
-            if use_refit_params:
+            if refit_with_reload_api:
+                yield k, param_lp
+                yield k + "_scale", param_scale
+            else:
                 module = _get_module_from_param_name(model, k)
                 if isinstance(module, RoutedExperts) and k.endswith(
                     ("w13_weight", "w2_weight")
@@ -495,9 +498,6 @@ def get_quantized_weight_iterator(
                 else:
                     yield k, param_lp
                 yield k + "_scale_from_checkpoint", param_scale
-            else:
-                yield k, param_lp
-                yield k + "_scale", param_scale
         else:
             yield k, param_lp
             yield k + "_scale_inv", param_scale
@@ -512,7 +512,7 @@ def load_weights(
         get_quantized_weight_iterator(
             weights,
             model_runner,
-            use_refit_params=True,
+            refit_with_reload_api=False,
         )
     )
 

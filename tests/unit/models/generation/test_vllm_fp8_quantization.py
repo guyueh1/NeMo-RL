@@ -669,6 +669,7 @@ def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(fp8_module, monke
         fp8.get_quantized_weight_iterator(
             [("model.layers.0.mlp.experts.w13_weight", torch.zeros(2, 32, 32))],
             fake_runner,
+            refit_with_reload_api=True,
         )
     )
 
