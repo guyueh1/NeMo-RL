@@ -488,6 +488,55 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
+def test_fp8_config_from_vllm_config_accepts_config_object(fp8_module):
+    fp8 = fp8_module
+    fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+
+    assert (
+        fp8.fp8_config_from_vllm_config(
+            types.SimpleNamespace(
+                additional_config={fp8.NEMO_RL_FP8_CONFIG_KEY: fp8_config}
+            )
+        )
+        is fp8_config
+    )
+    assert (
+        fp8.fp8_config_from_vllm_config(
+            types.SimpleNamespace(additional_config="not-a-dict")
+        )
+        is None
+    )
+
+    with pytest.raises(TypeError, match=fp8.NEMO_RL_FP8_CONFIG_KEY):
+        fp8.fp8_config_from_vllm_config(
+            types.SimpleNamespace(additional_config={fp8.NEMO_RL_FP8_CONFIG_KEY: True})
+        )
+
+
+def test_refit_prefers_matching_process_local_fp8_config(fp8_module):
+    fp8 = fp8_module
+    fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+    )
+    fp8.global_fp8_config = fp8_config
+    model_runner = types.SimpleNamespace(
+        vllm_config=types.SimpleNamespace(
+            additional_config={
+                fp8.NEMO_RL_FP8_CONFIG_KEY: _fp8_config_payload(is_mx=True)
+            }
+        )
+    )
+
+    assert fp8._get_refit_fp8_config(model_runner) is fp8_config
+    assert fp8._get_refit_is_mx(model_runner) is True
+
+
 def test_load_weights_gets_mxfp8_mode_from_worker_additional_config(
     fp8_module, monkeypatch
 ):
