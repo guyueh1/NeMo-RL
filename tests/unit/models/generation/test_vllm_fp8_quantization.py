@@ -636,7 +636,7 @@ def test_load_weights_gets_mxfp8_mode_from_worker_additional_config(
     assert fp8.global_fp8_config.is_mx is True
     assert fp8.global_fp8_config_is_mx_checked is True
     assert loaded_weights[0][0] == "layer.weight"
-    assert fp8.torch.equal(loaded_weights[0][1], quantized_weight)
+    assert loaded_weights[0][1] is quantized_weight
     assert loaded_weights[1][0] == "layer.weight_scale_from_checkpoint"
     assert fp8.torch.equal(
         loaded_weights[1][1], fp8.torch.squeeze(quantized_scale, dim=-1)
