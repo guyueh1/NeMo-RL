@@ -42,9 +42,11 @@ def fp8_module():
     from nemo_rl.models.generation.vllm.quantization import fp8
 
     old_config = fp8.global_fp8_config
+    old_config_is_mx_checked = fp8.global_fp8_config_is_mx_checked
     old_state = fp8.fp8_state
     old_patches_applied = fp8.fp8_patches_applied
     fp8.global_fp8_config = None
+    fp8.global_fp8_config_is_mx_checked = False
     fp8.fp8_state = fp8.FP8State()
     fp8.fp8_patches_applied = False
 
@@ -52,6 +54,7 @@ def fp8_module():
         yield fp8
     finally:
         fp8.global_fp8_config = old_config
+        fp8.global_fp8_config_is_mx_checked = old_config_is_mx_checked
         fp8.fp8_state = old_state
         fp8.fp8_patches_applied = old_patches_applied
 
@@ -72,6 +75,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     )
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM", raising=False)
     monkeypatch.delenv("VLLM_USE_DEEP_GEMM_E8M0", raising=False)
+    fp8.global_fp8_config_is_mx_checked = True
 
     vllm_kwargs = fp8.init_fp8(
         {
@@ -95,6 +99,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
     }
     assert applied_configs == [fp8.global_fp8_config]
     assert fp8.global_fp8_config.is_mx is True
+    assert fp8.global_fp8_config_is_mx_checked is False
     assert "VLLM_USE_DEEP_GEMM" not in fp8.os.environ
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
@@ -566,7 +571,7 @@ def test_fp8_config_from_vllm_config_accepts_config_object(fp8_module):
         )
 
 
-def test_refit_prefers_matching_process_local_fp8_config(fp8_module):
+def test_refit_prefers_matching_process_local_fp8_config(fp8_module, monkeypatch):
     fp8 = fp8_module
     fp8_config = fp8.FP8Config(
         use_fp8_weights=True,
@@ -582,7 +587,16 @@ def test_refit_prefers_matching_process_local_fp8_config(fp8_module):
         )
     )
 
+    assert fp8.global_fp8_config_is_mx_checked is False
     assert fp8._get_refit_fp8_config(model_runner) is fp8_config
+    assert fp8.global_fp8_config_is_mx_checked is True
+
+    def fail_if_worker_config_is_read(_vllm_config):
+        raise AssertionError("worker FP8 config should not be read after is_mx check")
+
+    monkeypatch.setattr(
+        fp8, "fp8_config_from_vllm_config", fail_if_worker_config_is_read
+    )
     assert fp8._get_refit_is_mx(model_runner) is True
 
 
@@ -615,8 +629,12 @@ def test_load_weights_gets_mxfp8_mode_from_worker_additional_config(
     )
 
     assert fp8.global_fp8_config is None
+    assert fp8.global_fp8_config_is_mx_checked is False
     fp8.load_weights([("layer.weight", weight)], model_runner)
 
+    assert fp8.global_fp8_config is not None
+    assert fp8.global_fp8_config.is_mx is True
+    assert fp8.global_fp8_config_is_mx_checked is True
     assert loaded_weights[0][0] == "layer.weight"
     assert fp8.torch.equal(loaded_weights[0][1], quantized_weight)
     assert loaded_weights[1][0] == "layer.weight_scale_from_checkpoint"
@@ -685,6 +703,7 @@ def test_refit_rejects_process_local_and_worker_mxfp8_mismatch(fp8_module):
 
     with pytest.raises(RuntimeError, match="disagrees"):
         fp8.load_weights([], model_runner)
+    assert fp8.global_fp8_config_is_mx_checked is False
 
 
 def test_load_weights_reports_missing_process_local_config(fp8_module, monkeypatch):

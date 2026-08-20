@@ -73,6 +73,7 @@ class FP8State:
 # Global FP8 config that can be accessed by patched vLLM functions
 # initialized by 'init_fp8_cfg()'
 global_fp8_config: FP8Config = None
+global_fp8_config_is_mx_checked: bool = False
 # Global FP8 state that holds runtime fp8 objects
 fp8_state: FP8State = FP8State()
 
@@ -124,10 +125,11 @@ def monkey_patch_vllm_ray_executor(fp8_config):
 
 
 def apply_fp8_patches(self, fp8_config):
-    global global_fp8_config, fp8_patches_applied
+    global global_fp8_config, global_fp8_config_is_mx_checked, fp8_patches_applied
     assert not fp8_patches_applied
 
     global_fp8_config = fp8_config
+    global_fp8_config_is_mx_checked = False
 
     # Apply patches conditionally based on configuration
     # Only apply weight patches if using FP8 weights
@@ -189,7 +191,7 @@ def apply_fp8_patches(self, fp8_config):
 
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    global global_fp8_config
+    global global_fp8_config, global_fp8_config_is_mx_checked
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     if vllm_cfg.get("is_mx") and not use_fp8_weights:
@@ -238,6 +240,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "pow2_activation_scaling_factors", False
         )
     global_fp8_config = FP8Config(**fp8_config_kwargs)
+    global_fp8_config_is_mx_checked = False
 
     if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
@@ -369,6 +372,8 @@ def fp8_config_from_vllm_config(vllm_config) -> FP8Config | None:
 
 
 def _get_refit_fp8_config(model_runner) -> FP8Config:
+    global global_fp8_config, global_fp8_config_is_mx_checked
+
     worker_fp8_config = fp8_config_from_vllm_config(
         getattr(model_runner, "vllm_config", None)
     )
@@ -382,10 +387,13 @@ def _get_refit_fp8_config(model_runner) -> FP8Config:
                 "The process-local FP8 configuration disagrees with the "
                 "vLLM worker additional_config for MXFP8 mode."
             )
+        global_fp8_config_is_mx_checked = True
         return global_fp8_config
 
     if worker_fp8_config is not None:
-        return worker_fp8_config
+        global_fp8_config = worker_fp8_config
+        global_fp8_config_is_mx_checked = True
+        return global_fp8_config
 
     raise RuntimeError(
         "The process-local FP8 configuration is unavailable in this vLLM "
@@ -395,6 +403,8 @@ def _get_refit_fp8_config(model_runner) -> FP8Config:
 
 
 def _get_refit_is_mx(model_runner):
+    if global_fp8_config_is_mx_checked and global_fp8_config is not None:
+        return global_fp8_config.is_mx
     return _get_refit_fp8_config(model_runner).is_mx
 
 
