@@ -108,7 +108,7 @@ jobs:
             base_sha=$(echo "$PR_INFO_JSON" | jq -r '.base.sha')
             head_ref=$(echo "$PR_INFO_JSON" | jq -r '.head.ref')
             head_sha=$(echo "$PR_INFO_JSON" | jq -r '.head.sha')
-            test_sha=$(echo "$PR_INFO_JSON" | jq -r '.merge_commit_sha')
+            test_sha=$(echo "$PR_INFO_JSON" | jq -r '.merge_commit_sha // .head.sha')
             head_label=$(echo "$PR_INFO_JSON" | jq -r '.head.label // empty')
             ci_label=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(startswith("CI:"))] | first // empty')
             has_skip_cicd=$(echo "$PR_INFO_JSON" | jq -r '[.labels[]? | (if type == "string" then . else .name end) | select(. == "Skip CICD")] | length > 0')
