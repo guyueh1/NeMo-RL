@@ -1003,14 +1003,9 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
-    @patch.dict(
-        os.environ,
-        {"NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG": "1"},
-        clear=False,
-    )
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
-    def test_loads_te_precision_config_when_enabled(self, mock_load_recipe):
-        """The opt-in loader attaches Megatron's parsed recipe to the model config."""
+    def test_loads_te_precision_config_when_configured(self, mock_load_recipe):
+        """The loader attaches Megatron's parsed recipe to the model config."""
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
         model_cfg = MagicMock(bf16=False, fp16=False)
@@ -1028,38 +1023,18 @@ class TestApplyPrecisionConfig:
         mock_load_recipe.assert_called_once_with("te_precision.yaml")
         assert model_cfg.quant_recipe is recipe
 
-    def test_te_precision_config_requires_opt_in(self, monkeypatch):
-        """A configured recipe must not be silently ignored when the gate is off."""
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_skips_te_precision_config_when_not_configured(self, mock_load_recipe):
+        """Missing recipe path leaves quant_recipe unset."""
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
-        monkeypatch.delenv("NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG", raising=False)
-        model_cfg = MagicMock(bf16=False, fp16=False)
-        config = {
-            "megatron_cfg": {
-                "pipeline_dtype": "bfloat16",
-                "te_precision_config_file": "te_precision.yaml",
-            }
-        }
-
-        with pytest.raises(
-            RuntimeError, match="NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG=1"
-        ):
-            _apply_precision_config(model_cfg, config, torch.bfloat16)
-
-    @patch.dict(
-        os.environ,
-        {"NRL_MEGATRON_LOAD_TE_PRECISION_CONFIG": "1"},
-        clear=False,
-    )
-    def test_te_precision_config_gate_requires_file(self):
-        """Enabling the loader without a recipe path fails during setup."""
-        from nemo_rl.models.megatron.setup import _apply_precision_config
-
-        model_cfg = MagicMock(bf16=False, fp16=False)
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
         config = {"megatron_cfg": {"pipeline_dtype": "bfloat16"}}
 
-        with pytest.raises(ValueError, match="te_precision_config_file"):
-            _apply_precision_config(model_cfg, config, torch.bfloat16)
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        mock_load_recipe.assert_not_called()
+        assert not hasattr(model_cfg, "quant_recipe")
 
 
 @pytest.mark.mcore
