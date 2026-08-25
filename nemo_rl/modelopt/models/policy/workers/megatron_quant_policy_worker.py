@@ -446,8 +446,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         enabled = 0
         with_amax = 0
         positive_amax = 0
-        for chunk in self.model:
-            for _, module in chunk.named_modules():
+        kv_amax = {}
+        for chunk_idx, chunk in enumerate(self.model):
+            for name, module in chunk.named_modules():
                 if isinstance(module, TensorQuantizer):
                     total += 1
                     if module.is_enabled:
@@ -456,11 +457,21 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                             with_amax += 1
                             if (module.amax > 0).all():
                                 positive_amax += 1
+                            if name.endswith(("k_bmm_quantizer", "v_bmm_quantizer")):
+                                # Prefix with the VPP chunk index so local layer
+                                # names from different chunks cannot collide.
+                                key = (
+                                    name
+                                    if len(self.model) == 1
+                                    else f"chunk{chunk_idx}.{name}"
+                                )
+                                kv_amax[key] = module.amax.detach().cpu().clone()
         return {
             "total": total,
             "enabled": enabled,
             "with_amax": with_amax,
             "positive_amax": positive_amax,
+            "kv_amax": kv_amax,
         }
 
     def generate(self, **kwargs):
