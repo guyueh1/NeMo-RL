@@ -377,6 +377,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         else:
             self.use_sequence_packing = False
+            if config["megatron_cfg"]["enabled"]:
+                # Mirror the sequence-packing VPP check on the fixed-microbatch
+                # path: mcore's interleaved schedule requires the per-DP-rank
+                # microbatch count to be divisible by pp_size, and otherwise
+                # fails only after the model is built.
+                vpp_size = (
+                    config["megatron_cfg"]["virtual_pipeline_model_parallel_size"] or 1
+                )
+                vpp_layout = config["megatron_cfg"]["pipeline_model_parallel_layout"]
+                if vpp_size > 1 or vpp_layout is not None:
+                    dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+                    gbs = config["train_global_batch_size"]
+                    mbs = config["train_micro_batch_size"]
+                    num_microbatches = gbs // dp_size // mbs
+                    assert num_microbatches % pp_size == 0, (
+                        "Virtual pipeline parallelism requires the number of "
+                        "microbatches per data-parallel rank "
+                        f"(train_global_batch_size / dp / train_micro_batch_size = "
+                        f"{gbs} / {dp_size} / {mbs} = {num_microbatches}) to be "
+                        f"divisible by pipeline_model_parallel_size ({pp_size})."
+                    )
 
         self.cfg = config
 

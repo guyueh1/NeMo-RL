@@ -158,6 +158,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def __init__(self, config, *args, **kwargs):
         """Initialize the MegatronQuantPolicyWorker."""
         megatron_cfg = config.get("megatron_cfg", {}) or {}
+        # _quantize is a Bridge post_wrap_hook that receives the full VPP chunk
+        # list in one call but calibrates only the first chunk; reject VPP
+        # outright rather than silently leaving chunks 1..N-1 in full precision.
+        assert (megatron_cfg.get("virtual_pipeline_model_parallel_size") or 1) == 1, (
+            "Virtual pipeline parallelism (VPP) is not supported with "
+            "MegatronQuantPolicyWorker (ModelOpt quantization)."
+        )
         # Default to True to match the underlying Megatron-Bridge
         assert not megatron_cfg.get("gradient_accumulation_fusion", True), (
             "gradient_accumulation_fusion=True is not supported with "
@@ -203,7 +210,17 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
-        unwrapped_model = unwrap_model(model)[0]
+        unwrapped = unwrap_model(model)
+        unwrapped_chunks = (
+            list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+        )
+        # Covers layout-derived multi-chunk models the config-time VPP assert
+        # cannot see; quantizing only chunk 0 would silently skip the rest.
+        assert len(unwrapped_chunks) == 1, (
+            "ModelOpt quantization calibrates a single model chunk; got "
+            f"{len(unwrapped_chunks)} VPP chunks."
+        )
+        unwrapped_model = unwrapped_chunks[0]
 
         tokenizer = get_tokenizer(self.cfg["model_name"])
         quantize_model(
