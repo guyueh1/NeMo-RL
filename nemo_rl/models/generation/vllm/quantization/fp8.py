@@ -548,8 +548,7 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 def load_weights(weights, model_runner):
     weights_quantized = []
     model = model_runner.model
-    fp8_config = _get_refit_fp8_config(model_runner)
-    is_mx = fp8_config.is_mx
+    fp8_config: FP8Config | None = None
 
     for k, v in weights:
         # Grouped MoE experts arrive as fused slabs without a ``.weight`` suffix
@@ -573,7 +572,8 @@ def load_weights(weights, model_runner):
                 and experts_module.w13_weight.dtype == torch.float8_e4m3fn
                 and experts_module.w2_weight.dtype == torch.float8_e4m3fn
             ):
-                if global_fp8_config.is_mx:
+                fp8_config = fp8_config or _get_refit_fp8_config(model_runner)
+                if fp8_config.is_mx:
                     raise NotImplementedError(
                         "MXFP8 refit does not support grouped MoE expert weights."
                     )
@@ -585,7 +585,8 @@ def load_weights(weights, model_runner):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        if is_mx:
+        fp8_config = fp8_config or _get_refit_fp8_config(model_runner)
+        if fp8_config.is_mx:
             param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
@@ -594,12 +595,14 @@ def load_weights(weights, model_runner):
                 fp8_config=fp8_config,
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        if is_mx:
+        if fp8_config.is_mx:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
         else:
             weights_quantized.append([k, param_lp])
             weights_quantized.append([k + "_scale_inv", param_scale])
+    if not weights_quantized:
+        _get_refit_fp8_config(model_runner)
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
 
