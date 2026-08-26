@@ -970,7 +970,7 @@ def test_fp8_config_from_vllm_config_accepts_config_object(fp8_module):
         )
 
 
-def test_refit_prefers_matching_process_local_fp8_config(fp8_module, monkeypatch):
+def test_refit_prefers_matching_process_local_fp8_config(fp8_module):
     fp8 = fp8_module
     fp8_config = fp8.FP8Config(
         use_fp8_weights=True,
@@ -989,14 +989,6 @@ def test_refit_prefers_matching_process_local_fp8_config(fp8_module, monkeypatch
     assert fp8.global_fp8_config_is_mx_checked is False
     assert fp8._get_refit_fp8_config(model_runner) is fp8_config
     assert fp8.global_fp8_config_is_mx_checked is True
-
-    def fail_if_worker_config_is_read(_vllm_config):
-        raise AssertionError("worker FP8 config should not be read after is_mx check")
-
-    monkeypatch.setattr(
-        fp8, "fp8_config_from_vllm_config", fail_if_worker_config_is_read
-    )
-    assert fp8._get_refit_is_mx(model_runner) is True
 
 
 def test_load_weights_gets_mxfp8_mode_from_worker_additional_config(
@@ -1121,6 +1113,17 @@ def test_load_weights_reports_missing_process_local_config(fp8_module, monkeypat
         match="process-local FP8 configuration",
     ):
         fp8.load_weights([], model_runner)
+
+
+def test_cast_tensor_to_fp8_blockwise_requires_config(fp8_module):
+    fp8 = fp8_module
+    assert fp8.global_fp8_config is None
+
+    with pytest.raises(RuntimeError, match="requires an FP8 configuration"):
+        fp8.cast_tensor_to_fp8_blockwise(
+            fp8.torch.ones(2, 2),
+            weight_block_size=fp8.FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+        )
 
 
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):

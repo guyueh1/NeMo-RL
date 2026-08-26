@@ -385,17 +385,6 @@ def is_fp8_model(vllm_config):
     return False
 
 
-def is_mxfp8_model(vllm_config):
-    try:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptMxFp8Config,
-        )
-    except ImportError:
-        return False
-
-    return isinstance(getattr(vllm_config, "quant_config", None), ModelOptMxFp8Config)
-
-
 def fp8_config_from_vllm_config(vllm_config) -> FP8Config | None:
     additional_config = getattr(vllm_config, "additional_config", None)
     if not isinstance(additional_config, dict):
@@ -443,12 +432,6 @@ def _get_refit_fp8_config(model_runner) -> FP8Config:
         "refit worker, and the worker's vLLM additional_config does not carry "
         f"{NEMO_RL_FP8_CONFIG_KEY}."
     )
-
-
-def _get_refit_is_mx(model_runner):
-    if global_fp8_config_is_mx_checked and global_fp8_config is not None:
-        return global_fp8_config.is_mx
-    return _get_refit_fp8_config(model_runner).is_mx
 
 
 def _get_params_in_layers(param_names, layers):
