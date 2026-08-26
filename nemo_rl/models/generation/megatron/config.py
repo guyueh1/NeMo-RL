@@ -28,13 +28,14 @@ class MCoreGenerationSpecificArgs(TypedDict):
 
     expose_http_server: bool
     parsers: list[str]
-
     buffer_size_gb: int
     block_size_tokens: int
     max_tokens: int
     max_model_len: int
 
-    num_cuda_graphs: int
+    # None disables CUDA-graph bucket construction; -1 selects automatic
+    # sizing; positive values request a fixed maximum bucket count.
+    num_cuda_graphs: int | None
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: str
     # Inference CUDA-graph scope. Options:
@@ -64,6 +65,10 @@ class MCoreGenerationSpecificArgs(TypedDict):
     kv_cache_management_mode: Literal["persist", "offload"]
 
     logging_step_interval: NotRequired[int]
+    # Whether MCore returns selected-token log-probs before or after sampling
+    # processors. Policy recomputation uses raw model logits, so numerical
+    # parity checks should select raw_logprobs explicitly.
+    logprobs_mode: Literal["processed_logprobs", "raw_logprobs"]
 
 
 class MCoreGenerationConfig(GenerationConfig):
