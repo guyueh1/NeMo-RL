@@ -71,6 +71,31 @@ def test_serve_wrapper_applies_only_external_vllm_patches(monkeypatch):
 
     assert calls == ["patches", "ray", "vllm"]
 
+    
+def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
+    script = REPO_ROOT / "tools/external_gym_vllm/serve_vllm_on_ray.py"
+    program = textwrap.dedent(
+        f"""
+        import runpy
+        import sys
+        import types
+
+        sys.modules["ray"] = types.ModuleType("ray")
+        namespace = runpy.run_path({str(script)!r})
+        namespace["_load_apply_vllm_patches"]()
+        assert "nemo_rl.models.generation" not in sys.modules
+        assert "nemo_rl.models.policy" not in sys.modules
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
 
 def test_shutdown_timeout_bounds_watchdog_restart_outage():
     assert 0 < SHUTDOWN_TIMEOUT_SECONDS <= 120
@@ -626,6 +651,13 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert (
         'COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"' in source
     )
+    assert "++env.nemo_gym.external_service_readiness" in source
+    assert "expected_backends:${replicas[${pool}]}" in source
+    assert "external_service_readiness_json" not in source
+    assert source.index('bash "${RAY_SUB}" &') < source.index(
+        "deadline=$((SECONDS + max_startup_timeout))"
+    )
+    assert source.count("check_startup_steps") == 3
     assert "genrm" not in source.lower()
     assert "nl2bash" not in source.lower()
     assert "safety" not in source.lower()
