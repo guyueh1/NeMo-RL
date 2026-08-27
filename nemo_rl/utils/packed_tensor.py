@@ -128,7 +128,11 @@ def packed_broadcast_producer(
 
 
 def _packed_broadcast_consumer_batches(
-    iterator: Iterator[Any], group: Any, src: int
+    iterator: Iterator[Any],
+    group: Any,
+    src: int,
+    *,
+    num_buffers: int | None = None,
 ) -> Iterator[list[tuple[str, torch.Tensor]]]:
     """Yield unpacked batches while retaining ownership of their receive buffers."""
 
@@ -172,7 +176,8 @@ def _packed_broadcast_consumer_batches(
 
     target_packed_tensor_size = get_target_packed_tensor_size()
 
-    num_buffers = get_num_buffers()
+    if num_buffers is None:
+        num_buffers = get_num_buffers()
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
@@ -247,6 +252,8 @@ def packed_broadcast_consumer(
     src: int,
     post_unpack_func: Callable[[list[tuple[str, torch.Tensor]]], None] | None,
     return_iterator: bool = False,
+    *,
+    num_buffers: int | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]] | None:
     """Consume a packed tensor as callbacks or a lazy weight iterator.
 
@@ -258,12 +265,18 @@ def packed_broadcast_consumer(
             when ``return_iterator`` is True.
         return_iterator: return a lazy, flattened weight iterator for consumers
             such as vLLM's ``reload_weights`` API.
+        num_buffers: number of alternating CUDA buffers/streams. Uses the
+            NRL_REFIT_NUM_BUFFERS default when unset. Chunk boundaries only
+            depend on the packed-buffer target size, so the producer and
+            consumer may use different buffer counts.
 
     Returns:
         A lazy iterator when ``return_iterator`` is True, otherwise None.
 
     """
-    batches = _packed_broadcast_consumer_batches(iterator, group, src)
+    batches = _packed_broadcast_consumer_batches(
+        iterator, group, src, num_buffers=num_buffers
+    )
     if return_iterator:
         return (weight for batch in batches for weight in batch)
 
