@@ -86,11 +86,8 @@ def test_init_fp8_uses_mxfp8_quantization_config(
         "kv_cache_dtype": "auto",
         "hf_overrides": {"quantization_config": fp8.MXFP8_BLOCK_QUANT_KWARGS},
     }
-    if refit_with_reload_api:
-        assert applied_configs == []
-        assert fp8.EngineCoreProc.run_engine_core is original_run_engine_core
-        assert fp8.CoreEngineProcManager.__init__ is original_core_manager_init
-    elif async_engine:
+    assert fp8.global_fp8_config.refit_with_reload_api is refit_with_reload_api
+    if async_engine:
         assert applied_configs == []
         assert fp8.EngineCoreProc.run_engine_core is fp8.my_run_engine_core
         assert fp8.CoreEngineProcManager.__init__ is fp8.my_init
@@ -540,6 +537,27 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     )
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
+    fp8.fp8_state = fp8.FP8State()
+    fp8.fp8_patches_applied = False
+    patched_paths.clear()
+
+    reload_fp8_config = fp8.FP8Config(
+        use_fp8_weights=True,
+        model_parallel_size=1,
+        is_mx=True,
+        use_activation_pow2_scale=True,
+        refit_with_reload_api=True,
+    )
+    fp8.apply_fp8_patches(None, reload_fp8_config)
+
+    assert fp8.global_fp8_config is reload_fp8_config
+    assert not any(
+        path.endswith("process_weights_after_loading") for path in patched_paths
+    )
+    assert not any("ModelOptMxFp8" in path for path in patched_paths)
+    assert any("per_token_group_quant_fp8" in path for path in patched_paths)
+    assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
+
 
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
@@ -596,16 +614,13 @@ def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     assert torch.equal(layer.weight.data, torch.ones(4, 4))
 
 
-def test_mxfp8_load_weights_routes_moe_weights_to_checkpoint_params(
+def test_mxfp8_load_weights_routes_moe_scales_to_checkpoint_params(
     fp8_module, monkeypatch
 ):
     import torch
     from vllm.model_executor.layers.quantization.utils import mxfp8_utils
 
     fp8 = fp8_module
-
-    class FakeRoutedExperts:
-        pass
 
     captured_weights = []
 
@@ -624,14 +639,8 @@ def test_mxfp8_load_weights_routes_moe_weights_to_checkpoint_params(
         vllm_config=types.SimpleNamespace(),
     )
 
-    monkeypatch.setattr(fp8, "RoutedExperts", FakeRoutedExperts)
     fp8.global_fp8_config = fp8.FP8Config(is_mx=True)
     monkeypatch.setattr(fp8, "_is_fp8_weight", lambda _name, _model: True)
-    monkeypatch.setattr(
-        fp8,
-        "_get_module_from_param_name",
-        lambda _model, _name: FakeRoutedExperts(),
-    )
     monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", fake_mxfp8_e4m3_quantize)
 
     fp8.load_weights(
@@ -640,7 +649,7 @@ def test_mxfp8_load_weights_routes_moe_weights_to_checkpoint_params(
     )
 
     assert [name for name, _ in captured_weights] == [
-        "model.layers.0.mlp.experts.w13_weight_from_checkpoint",
+        "model.layers.0.mlp.experts.w13_weight",
         "model.layers.0.mlp.experts.w13_weight_scale_from_checkpoint",
     ]
 
