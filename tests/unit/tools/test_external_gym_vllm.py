@@ -45,8 +45,8 @@ def test_serve_wrapper_applies_only_external_vllm_patches(monkeypatch):
     calls = []
     monkeypatch.setattr(
         serve_vllm_on_ray,
-        "_apply_external_vllm_patches",
-        lambda: calls.append("patches"),
+        "_load_apply_external_vllm_patches",
+        lambda: lambda: calls.append("patches"),
     )
     monkeypatch.setattr(
         serve_vllm_on_ray.ray,
@@ -71,7 +71,7 @@ def test_serve_wrapper_applies_only_external_vllm_patches(monkeypatch):
 
     assert calls == ["patches", "ray", "vllm"]
 
-    
+
 def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
     script = REPO_ROOT / "tools/external_gym_vllm/serve_vllm_on_ray.py"
     program = textwrap.dedent(
@@ -82,7 +82,8 @@ def test_serve_wrapper_loads_patches_without_importing_nemo_rl_package():
 
         sys.modules["ray"] = types.ModuleType("ray")
         namespace = runpy.run_path({str(script)!r})
-        namespace["_load_apply_vllm_patches"]()
+        apply_external_vllm_patches = namespace["_load_apply_external_vllm_patches"]()
+        assert callable(apply_external_vllm_patches)
         assert "nemo_rl.models.generation" not in sys.modules
         assert "nemo_rl.models.policy" not in sys.modules
         """
