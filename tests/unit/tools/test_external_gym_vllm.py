@@ -16,9 +16,11 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -35,6 +37,39 @@ from tools.external_gym_vllm.vllm_pool_lb import (
 )
 
 REPO_ROOT = Path(__file__).parents[3]
+
+
+def test_serve_wrapper_applies_only_external_vllm_patches(monkeypatch):
+    from tools.external_gym_vllm import serve_vllm_on_ray
+
+    calls = []
+    monkeypatch.setattr(
+        serve_vllm_on_ray,
+        "_apply_external_vllm_patches",
+        lambda: calls.append("patches"),
+    )
+    monkeypatch.setattr(
+        serve_vllm_on_ray.ray,
+        "init",
+        lambda **_kwargs: calls.append("ray"),
+    )
+
+    vllm_module = types.ModuleType("vllm")
+    vllm_module.__path__ = []
+    entrypoints_module = types.ModuleType("vllm.entrypoints")
+    entrypoints_module.__path__ = []
+    cli_module = types.ModuleType("vllm.entrypoints.cli")
+    cli_module.__path__ = []
+    cli_main_module = types.ModuleType("vllm.entrypoints.cli.main")
+    cli_main_module.main = lambda: calls.append("vllm")
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints", entrypoints_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.cli", cli_module)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints.cli.main", cli_main_module)
+
+    serve_vllm_on_ray.main()
+
+    assert calls == ["patches", "ray", "vllm"]
 
 
 def test_shutdown_timeout_bounds_watchdog_restart_outage():

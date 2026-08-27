@@ -168,8 +168,11 @@ Each pool container must provide:
 - importable `nemo_rl`, `ray`, and `vllm` packages in that environment; and
 - the `ray` command on `PATH`.
 
-`serve_vllm_on_ray.py` applies NeMo RL's vLLM compatibility patches before it
-imports the vLLM API server. `CONTAINER` must provide
+`serve_vllm_on_ray.py` applies an explicit allowlist of NeMo RL compatibility
+patches before it imports the vLLM API server: OpenAI `NamespaceTool`
+compatibility plus the RayExecutorV2 TCPStore and MessageQueue port-race fixes.
+It does not apply model-, worker-, or policy-refit-specific patches because
+these servers are inference-only. `CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 
 ## Slurm submission

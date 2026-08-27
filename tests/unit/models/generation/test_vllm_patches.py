@@ -50,6 +50,32 @@ _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "initializer_factor = self.config.initializer_factor"
 
 
+def test_external_vllm_patch_allowlist(monkeypatch):
+    vllm_module = types.ModuleType("vllm")
+    vllm_module.__path__ = []
+    logger_module = types.ModuleType("vllm.logger")
+    logger_module.init_logger = logging.getLogger
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setitem(sys.modules, "vllm.logger", logger_module)
+
+    calls = []
+    allowed_patches = (
+        "_patch_vllm_tool_parser_namespace_tool",
+        "_patch_vllm_ray_executor_v2_tcpstore_port",
+        "_patch_vllm_shm_broadcast_bind_retry",
+    )
+    for patch_name in allowed_patches:
+        monkeypatch.setattr(
+            patches,
+            patch_name,
+            lambda _logger, name=patch_name: calls.append(name),
+        )
+
+    patches._apply_external_vllm_patches()
+
+    assert calls == list(allowed_patches)
+
+
 @pytest.fixture
 def patched_tool_parser_source(tmp_path, monkeypatch):
     """The installed tool_parsers/utils.py, unpatched then patched in tmp."""
