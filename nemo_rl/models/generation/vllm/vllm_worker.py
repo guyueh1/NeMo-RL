@@ -309,14 +309,7 @@ class BaseVllmGenerationWorker:
     ):
         """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
-        assert not (
-            self.cfg["vllm_cfg"]["refit_with_reload_api"]
-            and self.cfg["colocated"]["enabled"]
-        ), (
-            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
-            "supported with colocated vLLM refit. Disable colocated refit or "
-            "set refit_with_reload_api=false."
-        )
+        self._assert_reload_refit_config_supported()
         self.model_name = self.cfg["model_name"]
         # Refined from the model's expert count in _load_model.
         self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
@@ -350,6 +343,71 @@ class BaseVllmGenerationWorker:
         # vLLM handles the parallelism internally through Ray
         self.rank = 0
         self.world_size = 1
+
+    def _assert_reload_refit_config_supported(self) -> None:
+        if not self.cfg["vllm_cfg"]["refit_with_reload_api"]:
+            return
+
+        assert not self.cfg["colocated"]["enabled"], (
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+            "supported yet with colocated vLLM refit. Support for the "
+            "colocated IPC/ZMQ reload-refit path will be added later. Set "
+            "refit_with_reload_api=false for now."
+        )
+        refit_transport = self.cfg.get("refit_transport")
+        if refit_transport == "nccl_reshard":
+            raise AssertionError(
+                "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+                "explicitly unsupported with "
+                "policy.generation.refit_transport='nccl_reshard'. "
+                "nccl_reshard_refit is its own refit path and does not use "
+                "vLLM's reload_weights API."
+            )
+        if refit_transport == "nixl" or (
+            isinstance(refit_transport, str) and ":" in refit_transport
+        ):
+            raise AssertionError(
+                "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+                "supported yet with checkpoint-engine refit "
+                "(update_weights_from_checkpoint_engine). Support for using "
+                "vLLM's reload_weights API with checkpoint-engine transports is "
+                "future work. Set refit_transport=null or set "
+                "refit_with_reload_api=false for now."
+            )
+        assert refit_transport is None, (
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is only "
+            "supported with the default non-colocated collective refit path. "
+            f"Got policy.generation.refit_transport={refit_transport!r}. Set "
+            "refit_transport=null or set refit_with_reload_api=false."
+        )
+        assert not self.cfg.get("real_quant"), (
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+            "explicitly unsupported with policy.generation.real_quant=true. "
+            "Set real_quant=false or set refit_with_reload_api=false."
+        )
+
+    def _assert_reload_refit_state_dict_supported(
+        self, state_dict_info: dict[str, Any]
+    ) -> None:
+        if not self.cfg["vllm_cfg"]["refit_with_reload_api"]:
+            return
+
+        vllm_kwargs = self.cfg.get("vllm_kwargs") or {}
+        spec_cfg = vllm_kwargs.get("speculative_config")
+        spec_method = None
+        if isinstance(spec_cfg, dict) and spec_cfg.get("num_speculative_tokens") != 0:
+            spec_method = spec_cfg.get("method")
+
+        if any(name.startswith("draft.") for name in state_dict_info) or (
+            spec_method in ("deepseek_mtp", "mtp")
+            and self.cfg.get("_mtp_weights_from_refit", False)
+        ):
+            raise AssertionError(
+                "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+                "supported yet when vLLM refit also updates draft weights. "
+                "Support for Eagle/MTP speculative decoding with reload refit "
+                "will be added later. Set refit_with_reload_api=false for now."
+            )
 
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
@@ -1152,6 +1210,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
+        self._assert_reload_refit_state_dict_supported(state_dict_info)
         self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")

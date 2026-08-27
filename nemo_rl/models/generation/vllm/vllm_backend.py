@@ -229,14 +229,6 @@ class VllmInternalWorkerExtension:
             )
         return weights
 
-    def _collective_requires_batched_loading(self) -> bool:
-        """Return whether a speculative drafter also consumes the refit stream."""
-        if any(name.startswith("draft.") for name in self.state_dict_info):
-            return True
-        if self._get_drafter_model() is None:
-            return False
-        return self._mtp_drafter_refit_enabled()
-
     def bind_numa(self) -> bool:
         """Pin this TP worker to its GPU's NUMA-local CPUs/memory.
 
@@ -792,13 +784,6 @@ class VllmInternalWorkerExtension:
         )
 
         try:
-            requires_batched_loading = self._collective_requires_batched_loading()
-            if refit_with_reload_api and requires_batched_loading:
-                raise RuntimeError(
-                    "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
-                    "supported when vLLM refit also updates draft weights. Set it "
-                    "to false for Eagle/MTP speculative decoding."
-                )
             if not refit_with_reload_api:
                 # Preserve the existing NeMo-RL loader and its explicit
                 # finalization path unless native reload is requested.

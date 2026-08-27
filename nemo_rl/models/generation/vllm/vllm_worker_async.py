@@ -1405,6 +1405,7 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
+        self._assert_reload_refit_state_dict_supported(state_dict_info)
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
     async def _reset_encoder_cache_after_weight_update(self) -> None:
