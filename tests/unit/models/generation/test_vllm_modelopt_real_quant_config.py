@@ -40,7 +40,7 @@ from nemo_rl.modelopt.utils import (
 
 
 def _vllm_config():
-    return types.SimpleNamespace(additional_config={})
+    return types.SimpleNamespace()
 
 
 @pytest.fixture(autouse=True)
@@ -2076,7 +2076,6 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
         model=model,
         vllm_config=types.SimpleNamespace(
             model_config=types.SimpleNamespace(architectures=["GptOssForCausalLM"]),
-            additional_config={},
         ),
     )
     extension.model_config = model_config

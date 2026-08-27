@@ -19,6 +19,19 @@ topology first, then select one non-colocated transport with
 reads only `refit_cfg.nixl`. Because one selector chooses the transport, sparse
 delta and NIXL cannot both be active.
 
+## vLLM Reload API
+
+For non-colocated vLLM using the default NCCL transport, set
+`policy.generation.vllm_cfg.refit_with_reload_api: true` to install refitted
+weights through vLLM's native `reload_weights` API. The flag is off by default.
+
+The reload API path currently supports only `policy.generation.backend: vllm`,
+`policy.generation.colocated.enabled: false`, and
+`policy.generation.refit_transport: null`. It is explicitly unsupported with
+`nccl_reshard`, `policy.generation.real_quant: true`, sparse refit transports,
+and checkpoint-engine/NIXL transports. Eagle/MTP draft weights refitted from the
+trainer are not supported yet; use the legacy loader for those cases.
+
 ## Constraints
 
 | Transport | Generation backend | Policy backend | Quantization and MoE |

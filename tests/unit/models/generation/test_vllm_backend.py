@@ -236,6 +236,24 @@ def test_collective_fp8_uses_native_reload_iterator(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_prepare_reload_weight_iterator_fixes_gemma3_vision_names(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.quantization import fp8
+
+    ext, _ = _make_collective_update_extension(vllm_backend)
+    ext.model_runner.vllm_config.model_config.architectures = [
+        "Gemma3ForConditionalGeneration"
+    ]
+    monkeypatch.setattr(fp8, "is_fp8_model", lambda _config: False)
+
+    result = list(
+        ext._prepare_reload_weight_iterator([("vision_tower.patch_embed.w", "w")])
+    )
+
+    assert result == [("vision_tower.vision_model.patch_embed.w", "w")]
+
+
+@pytest.mark.vllm
 def test_update_weights_from_collective_preserves_mtp_batched_loading(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
