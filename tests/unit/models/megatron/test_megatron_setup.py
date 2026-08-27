@@ -25,6 +25,7 @@ nemo_rl.models.megatron.setup, focusing on:
 """
 
 import os
+import warnings
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -1028,12 +1029,21 @@ class TestApplyPrecisionConfig:
         assert model_cfg.quant_recipe is recipe
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
-    def test_skips_te_precision_config_when_not_configured(self, mock_load_recipe):
+    @pytest.mark.parametrize(
+        "megatron_cfg",
+        [
+            {"pipeline_dtype": "bfloat16"},
+            {"pipeline_dtype": "bfloat16", "te_precision_config_file": None},
+        ],
+    )
+    def test_skips_te_precision_config_when_not_configured(
+        self, mock_load_recipe, megatron_cfg
+    ):
         """Missing recipe path leaves quant_recipe unset."""
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
         model_cfg = SimpleNamespace(bf16=False, fp16=False)
-        config = {"megatron_cfg": {"pipeline_dtype": "bfloat16"}}
+        config = {"megatron_cfg": megatron_cfg}
 
         _apply_precision_config(model_cfg, config, torch.bfloat16)
 
@@ -1079,6 +1089,31 @@ class TestApplyPrecisionConfig:
         with pytest.warns(UserWarning, match="fp8_cfg"):
             _apply_precision_config(model_cfg, config, torch.bfloat16)
 
+        mock_load_recipe.assert_called_once_with(str(recipe_file))
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_does_not_warn_when_fp8_cfg_disabled(
+        self, mock_load_recipe, tmp_path
+    ):
+        """A disabled fp8_cfg does not conflict with a precision recipe."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = MagicMock(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": False},
+            }
+        }
+
+        with warnings.catch_warnings(record=True) as warning_records:
+            warnings.simplefilter("always")
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert len(warning_records) == 0
         mock_load_recipe.assert_called_once_with(str(recipe_file))
 
 

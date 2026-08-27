@@ -1074,13 +1074,15 @@ def _apply_precision_config(
 
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
     if te_precision_config_file is not None:
-        if not os.path.isfile(te_precision_config_file):
+        te_precision_config_exists = os.path.isfile(te_precision_config_file)
+        if not te_precision_config_exists:
             raise FileNotFoundError(
                 "megatron_cfg.te_precision_config_file does not exist: "
                 f"{te_precision_config_file}"
             )
         fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-        if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+        fp8_cfg_enabled = fp8_cfg is not None and fp8_cfg.get("enabled", False)
+        if fp8_cfg_enabled:
             warnings.warn(
                 "Both megatron_cfg.fp8_cfg and megatron_cfg.te_precision_config_file "
                 "are set; modules matched by the precision recipe use the recipe's "
