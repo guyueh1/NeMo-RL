@@ -21,14 +21,13 @@ import sys
 
 import ray
 
-from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
+from nemo_rl.models.generation.vllm.patches import _apply_external_vllm_patches
 
 
 def main() -> None:
     """Connect to the private cluster and start the requested vLLM command."""
-    worker_python = sys.executable
-    _apply_vllm_patches(worker_python)
-    ray.init(address="auto", runtime_env={"py_executable": worker_python})
+    _apply_external_vllm_patches()
+    ray.init(address="auto", runtime_env={"py_executable": sys.executable})
 
     # vLLM is available only in the generation worker environment and must be
     # imported after NeMo RL applies its runtime patches.

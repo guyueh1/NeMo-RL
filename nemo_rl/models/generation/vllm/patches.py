@@ -1067,6 +1067,21 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_layerscale_loader(patch_logger)
 
 
+def _apply_external_vllm_patches() -> None:
+    """Apply only compatibility patches required by external vLLM servers.
+
+    External Gym model servers are inference-only. Keep this list explicit so
+    policy-specific runtime patches, such as refit support, are not installed
+    in their vLLM engine processes.
+    """
+    from vllm.logger import init_logger
+
+    patch_logger = init_logger("vllm_patch")
+    _patch_vllm_tool_parser_namespace_tool(patch_logger)
+    _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
+    _patch_vllm_shm_broadcast_bind_retry(patch_logger)
+
+
 def _apply_vllm_patches(
     py_executable: str,
     *,
