@@ -603,7 +603,6 @@ def _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(
     """
     # These imports require vLLM, so keep them out of module import time.
     import torch
-    from vllm.logger import init_logger
     from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
         UnquantizedMoeBackend,
         convert_to_unquantized_kernel_format,
@@ -614,6 +613,8 @@ def _apply_vllm_flashinfer_trtllm_refit_buffer_runtime_patch(
     )
 
     if logger is None:
+        from vllm.logger import init_logger
+
         logger = init_logger("vllm_patch")
 
     if getattr(UnquantizedFusedMoEMethod, G_FLASHINFER_TRTLLM_PATCH_ATTR, False):
