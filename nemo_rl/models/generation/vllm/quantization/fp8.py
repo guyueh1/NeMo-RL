@@ -16,6 +16,7 @@ import os
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import patch
 
 import ray
@@ -96,33 +97,78 @@ def my_run_engine_core(*args, **kwargs):
     return original_run_engine_core(*args, **kwargs)
 
 
-def monkey_patch_vllm_ray_executor(fp8_config):
-    if fp8_config.model_parallel_size > 1:
-        # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
-        # a ray remote that patches each worker with the required fp8 vllm patches
-        from vllm.v1.executor.ray_executor import RayDistributedExecutor
+def monkey_patch_vllm_ray_executor(fp8_config: FP8Config) -> None:
+    global fp8_patches_applied
 
-        original_run_workers = RayDistributedExecutor.collective_rpc
-
-        def patched_run_workers(self, *args, **kwargs):
-            global fp8_patches_applied
-            if not fp8_patches_applied:
-                futures = [
-                    worker.execute_method.remote(apply_fp8_patches, fp8_config)
-                    for worker in self.workers
-                ]
-                [ray.get(future) for future in futures]
-                fp8_patches_applied = True
-
-            return original_run_workers(self, *args, **kwargs)
-
-        RayDistributedExecutor.collective_rpc = patched_run_workers
-    else:
+    if fp8_config.model_parallel_size <= 1:
         # for single gpu there is no ray, so just call the patches
         apply_fp8_patches(None, fp8_config)
 
-        global fp8_patches_applied
         fp8_patches_applied = True
+        return
+
+    use_ray_v2_executor = (
+        os.environ.get("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1").strip() != "0"
+    )
+    if use_ray_v2_executor:
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+
+        RayWorkerProc._nrl_fp8_config = fp8_config
+        if getattr(RayWorkerProc, "_nrl_fp8_patched", False):
+            return
+
+        # RayExecutorV2 loads the model inside RayWorkerProc.initialize_worker(),
+        # before executor-level collective_rpc is available, so patch the worker
+        # at that earlier entry point.
+        RayWorkerProc._nrl_fp8_original_initialize_worker = (
+            RayWorkerProc.initialize_worker
+        )
+        RayWorkerProc.initialize_worker = _patched_ray_executor_v2_initialize_worker
+        RayWorkerProc._nrl_fp8_patched = True
+        return
+
+    try:
+        # vLLM 0.25+
+        from vllm.v1.executor.ray_executor import RayDistributedExecutor
+    except ImportError:
+        # Older vLLM releases used this import path.
+        from vllm.executor.ray_distributed_executor import RayDistributedExecutor
+
+    RayDistributedExecutor._nrl_fp8_config = fp8_config
+    if getattr(RayDistributedExecutor, "_nrl_fp8_patched", False):
+        return
+
+    # Patch vLLM's collective_rpc so that before vLLM initializes the model on
+    # each rank, we execute a ray remote that patches each worker with the
+    # required FP8 vLLM patches.
+    RayDistributedExecutor._nrl_fp8_original_collective_rpc = (
+        RayDistributedExecutor.collective_rpc
+    )
+    RayDistributedExecutor.collective_rpc = (
+        _patched_ray_distributed_executor_collective_rpc
+    )
+    RayDistributedExecutor._nrl_fp8_patched = True
+
+
+def _patched_ray_distributed_executor_collective_rpc(
+    self, *args: Any, **kwargs: Any
+) -> Any:
+    global fp8_patches_applied
+    if not fp8_patches_applied:
+        futures = [
+            worker.execute_method.remote(apply_fp8_patches, self._nrl_fp8_config)
+            for worker in self.workers
+        ]
+        ray.get(futures)
+        fp8_patches_applied = True
+
+    return self._nrl_fp8_original_collective_rpc(*args, **kwargs)
+
+
+def _patched_ray_executor_v2_initialize_worker(self, *args: Any, **kwargs: Any) -> Any:
+    if not fp8_patches_applied:
+        apply_fp8_patches(self, self._nrl_fp8_config)
+    return self._nrl_fp8_original_initialize_worker(*args, **kwargs)
 
 
 def apply_fp8_patches(self, fp8_config):

@@ -918,6 +918,180 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
 
+def test_monkey_patch_vllm_ray_executor_patches_legacy_workers_before_rpc(
+    fp8_module, monkeypatch
+):
+    try:
+        from vllm.v1.executor import ray_executor_v2
+    except ImportError:
+        ray_executor_v2 = None
+    from vllm.v1.executor.ray_executor import RayDistributedExecutor
+
+    fp8 = fp8_module
+    worker_calls = []
+    original_calls = []
+    ray_get_calls = []
+
+    class FakeExecuteMethod:
+        def remote(self, func, config):
+            worker_calls.append((func, config))
+            return f"future-{len(worker_calls)}"
+
+    class FakeWorker:
+        def __init__(self):
+            self.execute_method = FakeExecuteMethod()
+
+    def original_collective_rpc(self, *args, **kwargs):
+        original_calls.append((self, args, kwargs))
+        return "rpc-result"
+
+    def fake_ray_get(futures):
+        ray_get_calls.append(futures)
+        return ["patched"]
+
+    def original_initialize_worker(self, *args, **kwargs):
+        return "initialized"
+
+    monkeypatch.setattr(
+        RayDistributedExecutor, "collective_rpc", original_collective_rpc
+    )
+    monkeypatch.setattr(
+        RayDistributedExecutor, "_nrl_fp8_patched", False, raising=False
+    )
+    monkeypatch.setattr(RayDistributedExecutor, "_nrl_fp8_config", None, raising=False)
+    monkeypatch.setattr(
+        RayDistributedExecutor,
+        "_nrl_fp8_original_collective_rpc",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(fp8.ray, "get", fake_ray_get)
+    monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "0")
+    if ray_executor_v2 is not None:
+        monkeypatch.setattr(
+            ray_executor_v2.RayWorkerProc,
+            "initialize_worker",
+            original_initialize_worker,
+        )
+        monkeypatch.setattr(
+            ray_executor_v2.RayWorkerProc, "_nrl_fp8_patched", False, raising=False
+        )
+        monkeypatch.setattr(
+            ray_executor_v2.RayWorkerProc, "_nrl_fp8_config", None, raising=False
+        )
+        monkeypatch.setattr(
+            ray_executor_v2.RayWorkerProc,
+            "_nrl_fp8_original_initialize_worker",
+            None,
+            raising=False,
+        )
+
+    config = fp8.FP8Config(use_fp8_weights=True, model_parallel_size=2)
+    executor = RayDistributedExecutor.__new__(RayDistributedExecutor)
+    executor.workers = [FakeWorker(), FakeWorker()]
+
+    fp8.monkey_patch_vllm_ray_executor(config)
+    if ray_executor_v2 is not None:
+        assert (
+            ray_executor_v2.RayWorkerProc.initialize_worker
+            is original_initialize_worker
+        )
+    result = RayDistributedExecutor.collective_rpc(
+        executor, "load_model", timeout=1, kwargs={"foo": "bar"}
+    )
+
+    assert result == "rpc-result"
+    assert worker_calls == [
+        (fp8.apply_fp8_patches, config),
+        (fp8.apply_fp8_patches, config),
+    ]
+    assert ray_get_calls == [["future-1", "future-2"]]
+    assert original_calls == [
+        (executor, ("load_model",), {"timeout": 1, "kwargs": {"foo": "bar"}})
+    ]
+    assert fp8.fp8_patches_applied is True
+
+
+def test_monkey_patch_vllm_ray_executor_v2_patches_worker_before_initialize(
+    fp8_module, monkeypatch
+):
+    ray_executor_v2 = pytest.importorskip("vllm.v1.executor.ray_executor_v2")
+    from vllm.v1.executor.ray_executor import RayDistributedExecutor
+
+    fp8 = fp8_module
+    events = []
+
+    def original_collective_rpc(self, *args, **kwargs):
+        raise AssertionError("RayExecutorV2 worker patch must not use legacy RPC")
+
+    def original_initialize_worker(self, *args, **kwargs):
+        events.append(("initialize", self, args, kwargs))
+        return "initialized"
+
+    def fake_apply_fp8_patches(self, config):
+        events.append(("apply", self, config))
+        fp8.fp8_patches_applied = True
+
+    monkeypatch.setattr(
+        RayDistributedExecutor, "collective_rpc", original_collective_rpc
+    )
+    monkeypatch.setattr(
+        RayDistributedExecutor, "_nrl_fp8_patched", False, raising=False
+    )
+    monkeypatch.setattr(RayDistributedExecutor, "_nrl_fp8_config", None, raising=False)
+    monkeypatch.setattr(
+        RayDistributedExecutor,
+        "_nrl_fp8_original_collective_rpc",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ray_executor_v2.RayWorkerProc,
+        "initialize_worker",
+        original_initialize_worker,
+    )
+    monkeypatch.setattr(
+        ray_executor_v2.RayWorkerProc, "_nrl_fp8_patched", False, raising=False
+    )
+    monkeypatch.setattr(
+        ray_executor_v2.RayWorkerProc, "_nrl_fp8_config", None, raising=False
+    )
+    monkeypatch.setattr(
+        ray_executor_v2.RayWorkerProc,
+        "_nrl_fp8_original_initialize_worker",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(fp8, "apply_fp8_patches", fake_apply_fp8_patches)
+    monkeypatch.delenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", raising=False)
+
+    config = fp8.FP8Config(use_fp8_weights=True, model_parallel_size=2)
+    worker = ray_executor_v2.RayWorkerProc.__new__(ray_executor_v2.RayWorkerProc)
+
+    fp8.monkey_patch_vllm_ray_executor(config)
+    assert RayDistributedExecutor.collective_rpc is original_collective_rpc
+
+    result = ray_executor_v2.RayWorkerProc.initialize_worker(
+        worker,
+        0,
+        {"LOCAL_RANK": "0"},
+        driver_env_vars={"RANK": "0"},
+        assigned_physical_gpu_ids=[0],
+    )
+
+    assert result == "initialized"
+    assert events == [
+        ("apply", worker, config),
+        (
+            "initialize",
+            worker,
+            (0, {"LOCAL_RANK": "0"}),
+            {"driver_env_vars": {"RANK": "0"}, "assigned_physical_gpu_ids": [0]},
+        ),
+    ]
+    assert fp8.fp8_patches_applied is True
+
+
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
 
