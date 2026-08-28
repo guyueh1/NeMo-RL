@@ -953,6 +953,13 @@ class TestApplyMoeConfig:
 class TestApplyPrecisionConfig:
     """Tests for _apply_precision_config function."""
 
+    @staticmethod
+    def _quant_recipe(configs: dict[str, dict[str, Any]]) -> SimpleNamespace:
+        return SimpleNamespace(
+            matchers=[SimpleNamespace(config_key=config_key) for config_key in configs],
+            configs=configs,
+        )
+
     @pytest.mark.parametrize(
         "dtype,expected_bf16,expected_fp16,expected_params_dtype",
         [
@@ -1029,6 +1036,100 @@ class TestApplyPrecisionConfig:
         assert model_cfg.quant_recipe is recipe
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_allows_matching_fp8_recipe_when_fp8_cfg_enabled(
+        self, mock_load_recipe, tmp_path
+    ):
+        """A matching per-module FP8 recipe can share NeMo-RL's outer FP8 config."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        recipe = self._quant_recipe(
+            {
+                "mxfp8": {
+                    "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                    "evaluation_recipe": {},
+                }
+            }
+        )
+        mock_load_recipe.return_value = recipe
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            }
+        }
+
+        with pytest.warns(UserWarning, match="fp8_cfg"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.quant_recipe is recipe
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_rejects_conflicting_fp8_recipe(
+        self, mock_load_recipe, tmp_path
+    ):
+        """Mixed FP8 recipes are rejected because outer fp8_cfg drives padding."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {
+                "blockwise": {
+                    "training_recipe": {"fp8_quantization_recipe": "blockwise"},
+                }
+            }
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            }
+        }
+
+        with (
+            pytest.warns(UserWarning, match="fp8_cfg"),
+            pytest.raises(ValueError, match="mixed FP8 precision recipes"),
+        ):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    def test_te_precision_config_rejects_fp4_recipe_when_fp8_cfg_enabled(
+        self, mock_load_recipe, tmp_path
+    ):
+        """FP4 precision recipes cannot share NeMo-RL's outer FP8 config."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {
+                "fp4": {
+                    "training_recipe": {"fp4_quantization_recipe": "nvfp4"},
+                }
+            }
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            }
+        }
+
+        with (
+            pytest.warns(UserWarning, match="fp8_cfg"),
+            pytest.raises(ValueError, match="mixed FP4/FP8 precision recipes"),
+        ):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     @pytest.mark.parametrize(
         "megatron_cfg",
         [
@@ -1078,6 +1179,7 @@ class TestApplyPrecisionConfig:
         recipe_file = tmp_path / "te_precision.yaml"
         recipe_file.write_text("{}")
         model_cfg = MagicMock(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe({})
         config = {
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
@@ -1131,6 +1233,13 @@ class TestApplyPrecisionConfig:
         recipe_file = tmp_path / "te_precision.yaml"
         recipe_file.write_text("{}")
         model_cfg = MagicMock(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {
+                "blockwise": {
+                    "training_recipe": {"fp8_quantization_recipe": "blockwise"},
+                }
+            }
+        )
         config = {
             "megatron_cfg": {
                 "pipeline_dtype": "bfloat16",
