@@ -1039,7 +1039,7 @@ class TestApplyPrecisionConfig:
     def test_skips_te_precision_config_when_not_configured(
         self, mock_load_recipe, megatron_cfg
     ):
-        """Missing recipe path leaves quant_recipe unset."""
+        """An unset config key leaves quant_recipe untouched."""
         from nemo_rl.models.megatron.setup import _apply_precision_config
 
         model_cfg = SimpleNamespace(bf16=False, fp16=False)
@@ -1090,6 +1090,36 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.bfloat16)
 
         mock_load_recipe.assert_called_once_with(str(recipe_file))
+
+    def test_te_precision_config_parses_real_recipe_file(self, tmp_path):
+        """A real recipe file parses, and matchers need an explicit enabled flag."""
+        from megatron.core.quantization.utils import load_quantization_recipe
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text(
+            "configs:\n"
+            "  mxfp8:\n"
+            "    transformer_engine_config_type: TEQuantizationParams\n"
+            "    training_recipe: {fp8_quantization_recipe: mxfp8}\n"
+            "    evaluation_recipe: {}\n"
+            "matchers:\n"
+            "  all: {config: mxfp8, type: glob, pattern: '*', enabled: true}\n"
+        )
+        recipe = load_quantization_recipe(str(recipe_file))
+        assert len(recipe.matchers) == 1
+        assert "mxfp8" in recipe.configs
+
+        # A matcher without `enabled: true` is dropped, so nothing matches.
+        disabled_file = tmp_path / "disabled.yaml"
+        disabled_file.write_text(
+            "configs:\n"
+            "  mxfp8:\n"
+            "    transformer_engine_config_type: TEQuantizationParams\n"
+            "    training_recipe: {fp8_quantization_recipe: mxfp8}\n"
+            "matchers:\n"
+            "  all: {config: mxfp8, type: glob, pattern: '*'}\n"
+        )
+        assert load_quantization_recipe(str(disabled_file)).matchers == []
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_te_precision_config_does_not_warn_when_fp8_cfg_disabled(

@@ -1091,7 +1091,25 @@ def _apply_precision_config(
             )
         # NeMo-RL constructs TransformerConfig directly and therefore bypasses
         # Megatron-LM's CLI path that normally turns this file into quant_recipe.
-        model_cfg.quant_recipe = load_quantization_recipe(te_precision_config_file)
+        quant_recipe = load_quantization_recipe(te_precision_config_file)
+        # A recipe can store primary weights in FP8/FP4 through its own
+        # fp8_param/fp4_param fields, which are separate from fp8_cfg.fp8_param.
+        # NeMo-RL derives sequence padding, refit export, and reshard validation
+        # from fp8_cfg alone, so such weights would reach the inference engine as
+        # if they were BF16. Reject until the refit path understands them.
+        for config_key in sorted({m.config_key for m in quant_recipe.matchers}):
+            payload = quant_recipe.configs.get(config_key) or {}
+            for block in ("training_recipe", "evaluation_recipe"):
+                block_cfg = payload.get(block) or {}
+                if block_cfg.get("fp8_param") or block_cfg.get("fp4_param"):
+                    raise ValueError(
+                        "megatron_cfg.te_precision_config_file sets fp8_param or "
+                        f"fp4_param in '{config_key}.{block}'. NeMo-RL reads "
+                        "megatron_cfg.fp8_cfg for all FP8 behavior, so these "
+                        "weights would be sent to the inference engine as BF16. "
+                        "Use megatron_cfg.fp8_cfg for FP8 parameter storage."
+                    )
+        model_cfg.quant_recipe = quant_recipe
 
 
 def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
