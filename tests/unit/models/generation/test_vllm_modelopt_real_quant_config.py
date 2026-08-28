@@ -1825,7 +1825,7 @@ def test_non_real_quant_collective_reload_delegates(monkeypatch):
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "update_weights_from_collective",
-        lambda self, refit_with_reload_api: "delegated",
+        lambda self, refit_timeout_s=None, refit_with_reload_api=False: "delegated",
     )
 
     assert (
