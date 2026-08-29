@@ -278,7 +278,13 @@ def packed_broadcast_consumer(
         iterator, group, src, num_buffers=num_buffers
     )
     if return_iterator:
-        return (weight for batch in batches for weight in batch)
+
+        def weight_iterator() -> Iterator[tuple[str, torch.Tensor]]:
+            for batch in batches:
+                for weight in batch:
+                    yield weight
+
+        return weight_iterator()
 
     if post_unpack_func is None:
         raise ValueError("post_unpack_func is required when return_iterator is False")
