@@ -1649,8 +1649,8 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
-            message.setdefault("is_invalid_tool_call", False)
-            message.setdefault("has_malformed_thinking", False)
+            message["is_invalid_tool_call"] = False
+            message["has_malformed_thinking"] = False
 
         return d
 
