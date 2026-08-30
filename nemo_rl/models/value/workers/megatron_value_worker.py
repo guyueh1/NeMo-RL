@@ -52,6 +52,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -78,11 +79,19 @@ from nemo_rl.models.megatron.train import (
     megatron_forward_backward,
     suspend_activation_offload_for_forward_only,
 )
+from nemo_rl.models.megatron.vpp_utils import (
+    map_model_chunks,
+    model_chunks,
+    primary_model,
+    set_models_train_mode,
+    zero_grad_buffer,
+)
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
+from nemo_rl.telemetry.setup import init_telemetry_worker
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
@@ -216,7 +225,7 @@ def _value_loss_prepare_fn(
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class MegatronValueWorkerImpl(AbstractPolicyWorker):
+class MegatronValueWorkerImpl(TQWorkerMixin, AbstractPolicyWorker):
     """Megatron-Core based value function worker for PPO.
 
     This worker wraps a Megatron-Core GPT model backbone with a value head
@@ -237,6 +246,51 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
         else:
             return f"{self.__class__.__qualname__}"
+
+    def _local_coords(self) -> dict[str, int]:
+        """Axis to local-rank mapping. Deliberate copy of MegatronPolicyWorkerImpl."""
+        if not torch.distributed.is_initialized():
+            return {}
+        return {
+            "tensor_parallel": parallel_state.get_tensor_model_parallel_rank(),
+            "context_parallel": parallel_state.get_context_parallel_rank(),
+            "pipeline_parallel": parallel_state.get_pipeline_model_parallel_rank(),
+        }
+
+    def _get_replica_group(self) -> Optional[Any]:
+        """Replica group = TP x CP x PP siblings within this DP rank.
+
+        Deliberate copy of MegatronPolicyWorkerImpl._get_replica_group; see
+        there for why it is never gated on CP > 1 and why new_group has to be
+        called collectively.
+        """
+        if not torch.distributed.is_initialized():
+            return None
+        cached = getattr(self, "_replica_group_cache", "uninit")
+        if cached != "uninit":
+            return cached
+
+        world_size = torch.distributed.get_world_size()
+        my_dp_rank = parallel_state.get_data_parallel_rank()
+        my_replica_ranks_t = torch.full(
+            (world_size,),
+            -1,
+            dtype=torch.long,
+            device="cuda",
+        )
+        my_replica_ranks_t[torch.distributed.get_rank()] = my_dp_rank
+        torch.distributed.all_reduce(
+            my_replica_ranks_t, op=torch.distributed.ReduceOp.MAX
+        )
+        all_dp_ranks = my_replica_ranks_t.tolist()
+
+        groups: dict[int, Any] = {}
+        for dp in sorted(set(all_dp_ranks)):
+            ranks = [r for r, d in enumerate(all_dp_ranks) if d == dp]
+            grp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+            groups[dp] = grp
+        self._replica_group_cache = groups[my_dp_rank]
+        return self._replica_group_cache
 
     @staticmethod
     def configure_worker(
@@ -307,11 +361,15 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         # (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1).
         bind_to_gpu_numa(local_rank)
 
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
         self.cfg = config
         self.rank = get_rank_safe()
 
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(config)
 
         # Step 2: Validate and setup model paths
         # Value config uses the same model_name field as policy config.
@@ -418,18 +476,16 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         print(f"MegatronValueWorker initialized on rank {self.rank}")
 
     def _model_chunks(self) -> list[Any]:
-        return self.model if isinstance(self.model, list) else [self.model]
+        return model_chunks(self.model)
 
     def _primary_model(self) -> Any:
-        return self._model_chunks()[0]
+        return primary_model(self.model)
 
     def _set_models_train_mode(self, training: bool) -> None:
-        for model in self._model_chunks():
-            model.train(training)
+        set_models_train_mode(self.model, training)
 
     def _zero_grad_buffer(self) -> None:
-        for model in self._model_chunks():
-            model.zero_grad_buffer()
+        zero_grad_buffer(self.model)
 
     def _clear_inference_params(self) -> None:
         for model in self._model_chunks():
@@ -833,53 +889,54 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         move_grads: bool = True,
     ) -> torch.nn.Module | list[torch.nn.Module]:
         """Move model parameters and gradient buffers to the specified device."""
-        if isinstance(model, list):
-            return [
-                self.move_model(
-                    chunk, device, move_params=move_params, move_grads=move_grads
-                )
-                for chunk in model
-            ]
 
-        if isinstance(model, DistributedDataParallel):
-            for buffers in [model.buffers, model.expert_parallel_buffers]:
-                for buffer_idx in range(len(buffers)):
-                    if device == "cpu":
-                        buffers[buffer_idx].offload_to_cpu(
-                            move_params=move_params, move_grads=move_grads
-                        )
-                    elif device == "cuda":
-                        buffers[buffer_idx].reload_from_cpu(
-                            move_params=move_params, move_grads=move_grads
-                        )
-                    else:
-                        raise ValueError(
-                            f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
-                        )
-        elif isinstance(
-            model, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
-        ):
-            if device == "cpu":
-                model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
-            elif device == "cuda":
-                model.param_and_grad_buffer.reload_from_cpu(
-                    move_params=move_params, move_grads=move_grads
-                )
+        def move_one_model(single_model: torch.nn.Module) -> torch.nn.Module:
+            if isinstance(single_model, DistributedDataParallel):
+                for buffers in [
+                    single_model.buffers,
+                    single_model.expert_parallel_buffers,
+                ]:
+                    for buffer_idx in range(len(buffers)):
+                        if device == "cpu":
+                            buffers[buffer_idx].offload_to_cpu(
+                                move_params=move_params, move_grads=move_grads
+                            )
+                        elif device == "cuda":
+                            buffers[buffer_idx].reload_from_cpu(
+                                move_params=move_params, move_grads=move_grads
+                            )
+                        else:
+                            raise ValueError(
+                                f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
+                            )
+            elif isinstance(
+                single_model, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+            ):
+                if device == "cpu":
+                    single_model.param_and_grad_buffer.offload_to_cpu(
+                        move_params, move_grads
+                    )
+                elif device == "cuda":
+                    single_model.param_and_grad_buffer.reload_from_cpu(
+                        move_params=move_params, move_grads=move_grads
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
+                    )
             else:
-                raise ValueError(
-                    f"Invalid device: {device}. Only 'cpu' and 'cuda' are supported."
-                )
-        else:
-            if move_params:
-                new_state_dict = {}
-                for name, item in model.state_dict().items():
-                    if isinstance(item, torch.Tensor):
-                        item = item.detach().to(
-                            device=device, non_blocking=True, copy=True
-                        )
-                    new_state_dict[name] = item
-                model.load_state_dict(new_state_dict)
-        return model
+                if move_params:
+                    new_state_dict = {}
+                    for name, item in single_model.state_dict().items():
+                        if isinstance(item, torch.Tensor):
+                            item = item.detach().to(
+                                device=device, non_blocking=True, copy=True
+                            )
+                        new_state_dict[name] = item
+                    single_model.load_state_dict(new_state_dict)
+            return single_model
+
+        return map_model_chunks(model, move_one_model)
 
     def move_optimizer(self, device: str):
         """Move optimizer state to the specified device."""
