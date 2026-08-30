@@ -111,6 +111,29 @@ def test_init_fp8_uses_mxfp8_quantization_config(
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
+def test_init_fp8_defaults_missing_reload_refit_flag_to_false(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    monkeypatch.setattr(
+        fp8.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
+
+    fp8.init_fp8(
+        {
+            "precision": "fp8",
+            "kv_cache_dtype": "auto",
+            "async_engine": False,
+            "is_mx": True,
+        },
+        "dummy-model",
+        model_parallel_size=1,
+    )
+
+    assert fp8.global_fp8_config.refit_with_reload_api is False
+
+
 def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     fp8_module, monkeypatch
 ):

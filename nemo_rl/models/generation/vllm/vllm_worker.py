@@ -457,7 +457,7 @@ class BaseVllmGenerationWorker:
         self.world_size = 1
 
     def _assert_reload_refit_config_supported(self) -> None:
-        if not self.cfg["vllm_cfg"]["refit_with_reload_api"]:
+        if not self._refit_with_reload_api_enabled():
             return
 
         assert not self.cfg["colocated"]["enabled"], (
@@ -498,10 +498,13 @@ class BaseVllmGenerationWorker:
             "Set real_quant=false or set refit_with_reload_api=false."
         )
 
+    def _refit_with_reload_api_enabled(self) -> bool:
+        return self.cfg["vllm_cfg"].get("refit_with_reload_api", False)
+
     def _assert_reload_refit_state_dict_supported(
         self, state_dict_info: dict[str, Any]
     ) -> None:
-        if not self.cfg["vllm_cfg"]["refit_with_reload_api"]:
+        if not self._refit_with_reload_api_enabled():
             return
 
         vllm_kwargs = self.cfg.get("vllm_kwargs") or {}
@@ -1386,7 +1389,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
 
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_from_collective",
-                args=(refit_timeout_s, self.cfg["vllm_cfg"]["refit_with_reload_api"]),
+                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
             )
             worker_results = cast(list[bool], result_or_coro)
 

@@ -1232,6 +1232,78 @@ async def test_nccl_reshard_refit_resets_encoder_cache():
 
 
 @pytest.mark.vllm
+def test_vllm_worker_defaults_missing_reload_refit_flag_to_false(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
+        vllm_worker.VllmGenerationWorkerImpl
+    )
+    apply_patches = MagicMock()
+    monkeypatch.setattr(vllm_worker, "_apply_vllm_patches", apply_patches)
+
+    worker._init_config(
+        {
+            "model_name": "test-model",
+            "vllm_cfg": {
+                "tensor_parallel_size": 1,
+                "pipeline_parallel_size": 1,
+                "expert_parallel_size": 1,
+                "gpu_memory_utilization": 0.8,
+                "precision": "bfloat16",
+            },
+            "colocated": {"enabled": True},
+        },
+        bundle_indices=None,
+        fraction_of_gpus=1.0,
+        seed=None,
+        extra_env_vars=None,
+    )
+
+    assert worker.llm is None
+    assert worker.tokenizer is None
+    assert worker.rank == 0
+    assert worker.world_size == 1
+    apply_patches.assert_called_once()
+
+
+@pytest.mark.vllm
+def test_sync_weight_update_defaults_missing_reload_refit_flag_to_false():
+    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+    worker.llm = SimpleNamespace(collective_rpc=MagicMock(return_value=[True]))
+
+    assert worker.update_weights_from_collective() is True
+    worker.llm.collective_rpc.assert_called_once_with(
+        "update_weights_from_collective",
+        args=(None, False),
+    )
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_weight_update_defaults_missing_reload_refit_flag_to_false():
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(return_value=[True]),
+        reset_encoder_cache=AsyncMock(),
+    )
+
+    assert await worker.update_weights_from_collective_async() is True
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "update_weights_from_collective",
+        args=(None, False),
+    )
+    worker.llm.reset_encoder_cache.assert_not_awaited()
+
+
+@pytest.mark.vllm
 def test_vllm_worker_rejects_reload_refit_when_colocated():
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 

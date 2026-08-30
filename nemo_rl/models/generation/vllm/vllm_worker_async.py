@@ -1478,7 +1478,7 @@ class VllmAsyncGenerationWorkerImpl(
 
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_from_collective",
-                args=(refit_timeout_s, self.cfg["vllm_cfg"]["refit_with_reload_api"]),
+                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
             )
 
             if asyncio.iscoroutine(result_or_coro):

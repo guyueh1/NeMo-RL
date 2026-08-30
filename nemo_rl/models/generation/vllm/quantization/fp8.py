@@ -251,7 +251,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
-        "refit_with_reload_api": vllm_cfg["refit_with_reload_api"],
+        "refit_with_reload_api": vllm_cfg.get("refit_with_reload_api", False),
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
