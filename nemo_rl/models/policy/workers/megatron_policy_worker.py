@@ -65,6 +65,7 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import (
+    chunk_prefixed_key,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -782,7 +783,7 @@ class MegatronPolicyWorkerImpl(
             for key, value in chunk.state_dict().items():
                 if "._extra_state" not in key:
                     continue
-                prefixed_key = f"{chunk_idx}/{key}"
+                prefixed_key = chunk_prefixed_key(chunk_idx, key)
                 if isinstance(value, torch.Tensor):
                     extra_state[prefixed_key] = value.detach().clone()
                 else:
@@ -1925,8 +1926,7 @@ class MegatronPolicyWorkerImpl(
             else self.cfg["logprob_batch_size"]
         )
 
-        for m in self.model:
-            m.eval()
+        self._set_models_train_mode(False)
 
         # Logprobs run the same forward as training, so a batch that needs the
         # mask needs it here too -- otherwise these logprobs would be taken
@@ -2031,7 +2031,7 @@ class MegatronPolicyWorkerImpl(
                     and "._extra_state" not in state_dict_key
                 ):
                     continue
-                lookup_key = f"{chunk_idx}/{state_dict_key}"
+                lookup_key = chunk_prefixed_key(chunk_idx, state_dict_key)
                 if lookup_key not in source_state_dict:
                     if raise_if_key_missing:
                         raise ValueError(
@@ -2093,7 +2093,7 @@ class MegatronPolicyWorkerImpl(
                         item = item.detach().to(
                             device="cpu", non_blocking=True, copy=True
                         )
-                    model_state_dict[f"{chunk_idx}/{name}"] = item
+                    model_state_dict[chunk_prefixed_key(chunk_idx, name)] = item
 
             # Swap reference state into self.model. Use _apply_state_dict_to_model
             # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
@@ -2169,8 +2169,7 @@ class MegatronPolicyWorkerImpl(
             else self.cfg["logprob_batch_size"]
         )
 
-        for m in self.model:
-            m.eval()
+        self._set_models_train_mode(False)
 
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
 
@@ -3076,8 +3075,7 @@ class MegatronPolicyWorkerImpl(
         )
         self._log_gpu_mem("lp_prep_enter")
         self.model = self.move_model(self.model, "cuda", move_grads=False)
-        for m in self.model:
-            m.eval()
+        self._set_models_train_mode(False)
 
         if not keep_train_buffers:
             # offload grads to cpu
@@ -3291,8 +3289,7 @@ class MegatronPolicyWorkerImpl(
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
-        for m in self.model:
-            m.eval()
+        self._set_models_train_mode(False)
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 
@@ -3452,8 +3449,7 @@ class MegatronPolicyWorkerImpl(
             # For safety, if not in training loop, setting to eval.
             is_training = self.model[0].training
             if not is_training:
-                for model in self.model:
-                    model.eval()
+                self._set_models_train_mode(False)
 
             if self.should_disable_forward_pre_hook:
                 self.disable_forward_pre_hook()
@@ -3643,8 +3639,7 @@ class MegatronPolicyWorkerImpl(
         FP8_MAX_K = _get_env_float("FP8_MAX_K", 448.0)
         FP8_MAX_V = _get_env_float("FP8_MAX_V", 448.0)
 
-        for m in self.model:
-            m.eval()
+        self._set_models_train_mode(False)
 
         # Record local percentile amax for q/k/v of each layer
         layer_to_samples_q: dict[str, list[float]] = defaultdict(list)

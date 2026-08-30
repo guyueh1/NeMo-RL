@@ -17,6 +17,17 @@ from nemo_rl.models.policy import PolicyConfig
 
 
 def validate_megatron_generation_backend_config(config: PolicyConfig) -> None:
+    """Reject VPP when the Megatron generation backend is selected.
+
+    Args:
+        config: The policy config to validate.
+
+    Raises:
+        ValueError: If ``policy.generation.backend == "megatron"`` and VPP
+            (``virtual_pipeline_model_parallel_size`` or
+            ``pipeline_model_parallel_layout``) is configured, since the
+            Megatron generation backend does not yet support VPP.
+    """
     generation_cfg = config.get("generation")
     if generation_cfg is None or generation_cfg["backend"] != MEGATRON_BACKEND:
         return

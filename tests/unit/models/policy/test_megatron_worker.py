@@ -3711,6 +3711,56 @@ def test_worker_forward_pre_hooks_apply_to_all_model_chunks(monkeypatch):
         chunk.disable_forward_pre_hook.assert_called_once_with(param_sync=False)
 
 
+def test_worker_train_step_helpers_apply_to_all_model_chunks():
+    worker = _new_worker_impl()
+    chunks = [MagicMock(), MagicMock()]
+    no_sync_contexts = [MagicMock(), MagicMock()]
+    for chunk, context in zip(chunks, no_sync_contexts, strict=True):
+        chunk.no_sync.return_value = context
+    worker.model = chunks
+
+    worker._set_models_train_mode(True)
+    worker._zero_grad_buffer()
+    with worker._model_no_sync():
+        pass
+
+    for chunk in chunks:
+        chunk.train.assert_called_once_with(True)
+        chunk.zero_grad_buffer.assert_called_once_with()
+        chunk.no_sync.assert_called_once_with()
+    for context in no_sync_contexts:
+        context.__enter__.assert_called_once_with()
+        context.__exit__.assert_called_once()
+
+
+def test_worker_set_param_sync_func_broadcasts_and_accepts_per_chunk_list():
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = _new_worker_impl()
+    worker.model = [
+        SimpleNamespace(config=SimpleNamespace()),
+        SimpleNamespace(config=SimpleNamespace()),
+    ]
+
+    with patch.object(
+        worker_module,
+        "get_model_config",
+        side_effect=lambda model: model.config,
+    ):
+        broadcast_fn = MagicMock()
+        worker._set_param_sync_func(broadcast_fn)
+        for chunk in worker.model:
+            assert chunk.config.param_sync_func is broadcast_fn
+
+        fn0, fn1 = MagicMock(), MagicMock()
+        worker._set_param_sync_func([fn0, fn1])
+        assert worker.model[0].config.param_sync_func is fn0
+        assert worker.model[1].config.param_sync_func is fn1
+
+        with pytest.raises(ValueError):
+            worker._set_param_sync_func([fn0])
+
+
 def test_worker_apply_state_dict_updates_all_model_chunks():
     class Chunk0(torch.nn.Module):
         def __init__(self):

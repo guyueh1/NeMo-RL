@@ -45,6 +45,7 @@ from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     resolve_nvfp4_real_quant_mode,
 )
+from nemo_rl.models.megatron.common import chunk_prefixed_key
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -200,9 +201,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             for chunk_idx, chunk in enumerate(self.model):
                 for name, item in chunk.state_dict().items():
                     if "_quantizer." in name:
-                        self.reference_state_dict[f"{chunk_idx}/{name}"] = (
-                            item.detach().to(device="cpu", non_blocking=True, copy=True)
-                        )
+                        self.reference_state_dict[
+                            chunk_prefixed_key(chunk_idx, name)
+                        ] = item.detach().to(device="cpu", non_blocking=True, copy=True)
         if self.rank == 0:
             for chunk_idx, chunk in enumerate(self.model):
                 print(f"Quantized model chunk {chunk_idx}: {chunk}")
@@ -477,11 +478,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                             if name.endswith(("k_bmm_quantizer", "v_bmm_quantizer")):
                                 # Prefix with the VPP chunk index so local layer
                                 # names from different chunks cannot collide.
-                                key = (
-                                    name
-                                    if len(self.model) == 1
-                                    else f"chunk{chunk_idx}.{name}"
-                                )
+                                key = chunk_prefixed_key(chunk_idx, name)
                                 kv_amax[key] = module.amax.detach().cpu().clone()
         return {
             "total": total,

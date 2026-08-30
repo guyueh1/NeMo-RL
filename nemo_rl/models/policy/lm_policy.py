@@ -207,6 +207,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
         actual_world_size = cluster.world_size()
+        dp_size = actual_world_size // model_parallel_size
 
         if (
             not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
@@ -243,6 +244,56 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
                 f"Please adjust your cluster size or parallelism parameters."
             )
+
+        if megatron_enable:
+            megatron_cfg = config["megatron_cfg"]
+            vpp_size = megatron_cfg.get("virtual_pipeline_model_parallel_size") or 1
+            vpp_layout = megatron_cfg.get("pipeline_model_parallel_layout")
+            vpp_enabled = vpp_size > 1 or vpp_layout is not None
+            if vpp_enabled and not config["sequence_packing"]["enabled"]:
+
+                def validate_fixed_microbatch_count(
+                    *,
+                    batch_size_key: str,
+                    micro_batch_size_key: str,
+                    label: str,
+                ) -> None:
+                    global_batch_size = config[batch_size_key]
+                    micro_batch_size = config[micro_batch_size_key]
+                    assert global_batch_size % dp_size == 0, (
+                        "Virtual pipeline parallelism requires "
+                        f"{batch_size_key} ({global_batch_size}) to be divisible "
+                        f"by data_parallel_size ({dp_size}) for {label}."
+                    )
+                    per_dp_batch_size = global_batch_size // dp_size
+                    assert per_dp_batch_size % micro_batch_size == 0, (
+                        "Virtual pipeline parallelism requires the per-DP-rank "
+                        f"{label} batch size ({batch_size_key} / dp = "
+                        f"{global_batch_size} / {dp_size} = {per_dp_batch_size}) "
+                        f"to be divisible by {micro_batch_size_key} "
+                        f"({micro_batch_size})."
+                    )
+                    num_microbatches = per_dp_batch_size // micro_batch_size
+                    assert num_microbatches % pp_size == 0, (
+                        "Virtual pipeline parallelism requires the number of "
+                        f"{label} microbatches per data-parallel rank "
+                        f"({batch_size_key} / dp / {micro_batch_size_key} = "
+                        f"{global_batch_size} / {dp_size} / {micro_batch_size} = "
+                        f"{num_microbatches}) to be divisible by "
+                        f"pipeline_model_parallel_size ({pp_size})."
+                    )
+
+                validate_fixed_microbatch_count(
+                    batch_size_key="train_global_batch_size",
+                    micro_batch_size_key="train_micro_batch_size",
+                    label="training",
+                )
+                if config.get("logprob_batch_size") is not None:
+                    validate_fixed_microbatch_count(
+                        batch_size_key="train_global_batch_size",
+                        micro_batch_size_key="logprob_batch_size",
+                        label="logprob",
+                    )
 
         self.sharding_annotations = NamedSharding(
             layout=np.arange(cluster.world_size()).reshape(
@@ -360,9 +411,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 # and bin_count_multiple.
                 dp_size = self.sharding_annotations.get_axis_size("data_parallel")
                 vpp_size = (
-                    config["megatron_cfg"]["virtual_pipeline_model_parallel_size"] or 1
+                    config["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
+                    or 1
                 )
-                vpp_layout = config["megatron_cfg"]["pipeline_model_parallel_layout"]
+                vpp_layout = config["megatron_cfg"].get(
+                    "pipeline_model_parallel_layout"
+                )
                 make_num_microbatch_divisible_by = None
                 if vpp_size > 1 or vpp_layout is not None:
                     make_num_microbatch_divisible_by = dp_size * pp_size
@@ -377,27 +431,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
         else:
             self.use_sequence_packing = False
-            if config["megatron_cfg"]["enabled"]:
-                # Mirror the sequence-packing VPP check on the fixed-microbatch
-                # path: mcore's interleaved schedule requires the per-DP-rank
-                # microbatch count to be divisible by pp_size, and otherwise
-                # fails only after the model is built.
-                vpp_size = (
-                    config["megatron_cfg"]["virtual_pipeline_model_parallel_size"] or 1
-                )
-                vpp_layout = config["megatron_cfg"]["pipeline_model_parallel_layout"]
-                if vpp_size > 1 or vpp_layout is not None:
-                    dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-                    gbs = config["train_global_batch_size"]
-                    mbs = config["train_micro_batch_size"]
-                    num_microbatches = gbs // dp_size // mbs
-                    assert num_microbatches % pp_size == 0, (
-                        "Virtual pipeline parallelism requires the number of "
-                        "microbatches per data-parallel rank "
-                        f"(train_global_batch_size / dp / train_micro_batch_size = "
-                        f"{gbs} / {dp_size} / {mbs} = {num_microbatches}) to be "
-                        f"divisible by pipeline_model_parallel_size ({pp_size})."
-                    )
 
         self.cfg = config
 

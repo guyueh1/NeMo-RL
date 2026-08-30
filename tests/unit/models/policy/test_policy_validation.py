@@ -199,6 +199,31 @@ def test_megatron_generation_backend_rejects_virtual_pipeline_parallelism(
     mock_ray_worker_group.assert_not_called()
 
 
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_megatron_vpp_rejects_logprob_microbatch_count_not_divisible_by_pp(
+    mock_ray_worker_group,
+    monkeypatch,
+):
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "9.0")
+    config = create_megatron_config("test-model", tp=1, pp=2)
+    config["train_global_batch_size"] = 12
+    config["train_micro_batch_size"] = 3  # 4 train microbatches per DP rank.
+    config["logprob_batch_size"] = 4  # 3 logprob microbatches per DP rank.
+    config["megatron_cfg"]["virtual_pipeline_model_parallel_size"] = 2
+
+    with pytest.raises(
+        AssertionError,
+        match="logprob.*pipeline_model_parallel_size",
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=2),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    mock_ray_worker_group.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "world_size,tp,cp,should_pass,expected_error_type,description",
     [

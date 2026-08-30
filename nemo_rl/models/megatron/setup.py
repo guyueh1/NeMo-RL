@@ -70,6 +70,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.megatron.common import chunk_prefixed_key
 
 _HF_CONFIG_PATCHED = False
 
@@ -2173,7 +2174,7 @@ def setup_reference_model_state(
                         cpu_item = item
                     # Prefix with chunk index to avoid key collisions when multiple VPP
                     # chunks share identical local layer indices (e.g. decoder.layers.0).
-                    reference_state_dict[f"{chunk_idx}/{name}"] = cpu_item
+                    reference_state_dict[chunk_prefixed_key(chunk_idx, name)] = cpu_item
             print("Reference model loaded")
         else:
             print("Reference model not loaded")
