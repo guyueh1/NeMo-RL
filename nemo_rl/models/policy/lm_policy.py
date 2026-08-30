@@ -51,6 +51,7 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import (
     aggregate_per_sample_handles,
+    has_custom_pp_layout_or_interleaved_vpp,
     resolve_policy_worker_cls,
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -259,10 +260,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if megatron_enable:
             megatron_cfg = config["megatron_cfg"]
-            vpp_size = megatron_cfg.get("virtual_pipeline_model_parallel_size") or 1
-            vpp_layout = megatron_cfg.get("pipeline_model_parallel_layout")
-            vpp_enabled = vpp_size > 1 or vpp_layout is not None
-            if vpp_enabled and not config["sequence_packing"]["enabled"]:
+            if (
+                has_custom_pp_layout_or_interleaved_vpp(megatron_cfg)
+                and not config["sequence_packing"]["enabled"]
+            ):
 
                 def validate_fixed_microbatch_count(
                     *,
@@ -424,19 +425,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             if microbatch_order is not None:
                 self.sequence_packing_args["microbatch_order"] = microbatch_order
             if config["megatron_cfg"]["enabled"]:
-                # For Megatron backend, when virtual pipeline parallelism is enabled, the number of
-                # microbatches must be divisible by pp_size, so we need to pass the correct min_bin_count
-                # and bin_count_multiple.
+                # Custom PP layouts and interleaved VPP require the number of
+                # microbatches to be divisible by pp_size, so pass the matching
+                # min_bin_count and bin_count_multiple.
                 dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-                vpp_size = (
-                    config["megatron_cfg"].get("virtual_pipeline_model_parallel_size")
-                    or 1
-                )
-                vpp_layout = config["megatron_cfg"].get(
-                    "pipeline_model_parallel_layout"
-                )
                 make_num_microbatch_divisible_by = None
-                if vpp_size > 1 or vpp_layout is not None:
+                if has_custom_pp_layout_or_interleaved_vpp(config["megatron_cfg"]):
                     make_num_microbatch_divisible_by = dp_size * pp_size
                     self.sequence_packing_args["min_bin_count"] = (
                         make_num_microbatch_divisible_by
