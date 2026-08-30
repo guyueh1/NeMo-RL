@@ -71,19 +71,6 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     _install_missing_route_fallback_patch()
 
 
-def _iter_model_modules(model: Any) -> Iterable[Any]:
-    if isinstance(model, (list, tuple)):
-        for item in model:
-            yield from _iter_model_modules(item)
-        return
-
-    modules = getattr(model, "modules", None)
-    if callable(modules):
-        yield from modules()
-    else:
-        yield model
-
-
 def _iter_model_modules_with_mtp_ancestry(
     model: Any, *, beneath_mtp: bool = False
 ) -> Iterable[tuple[Any, bool]]:
@@ -107,12 +94,15 @@ def _iter_model_modules_with_mtp_ancestry(
 
 
 def _router_replay_exclude_mtp_enabled() -> bool:
-    return os.getenv(_ROUTER_REPLAY_EXCLUDE_MTP_ENV, "1").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    value = os.getenv(_ROUTER_REPLAY_EXCLUDE_MTP_ENV, "1").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {_ROUTER_REPLAY_EXCLUDE_MTP_ENV}={value!r}; expected one of "
+        "{'1','true','yes','on','0','false','no','off'}."
+    )
 
 
 def _unwrap_model_config(model: Any) -> Optional[Any]:
