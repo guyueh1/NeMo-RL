@@ -15,6 +15,7 @@ import ast
 import os
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -729,6 +730,86 @@ def test_prepare_for_generation_disables_param_gather_hook_before_wake(
         "wake_engine",
     ]
     assert model.config.flash_decode is False
+
+
+def test_setup_colocated_cuda_graph_managers_handles_vpp_model_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    class FakeGraphableModule:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.config = SimpleNamespace(name=name)
+            self.decoder = SimpleNamespace(cudagraph_manager="decoder-manager")
+
+        def modules(self) -> Iterator[object]:
+            yield self
+
+    chunks = [FakeGraphableModule("chunk0"), FakeGraphableModule("chunk1")]
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {
+                "cuda_graph_impl": "local",
+                "inference_cuda_graph_scope": None,
+            },
+        }
+    }
+    worker.model = chunks
+    worker.is_generation_colocated = True
+    worker._colocated_reshard_plan = None
+
+    unwrap_calls = []
+    set_attr_calls = []
+    toggle_calls = []
+
+    def fake_unwrap(model: FakeGraphableModule) -> FakeGraphableModule:
+        unwrap_calls.append(model.name)
+        return model
+
+    def fake_set_model_config_attribute(
+        module: FakeGraphableModule, attr: str, value: object
+    ) -> None:
+        set_attr_calls.append((module.name, attr, value))
+
+    def fake_toggle_cuda_graphs(module: FakeGraphableModule, set_to: str) -> None:
+        toggle_calls.append((module.name, set_to))
+
+    monkeypatch.setattr(megatron_worker, "GraphableMegatronModule", FakeGraphableModule)
+    monkeypatch.setattr(
+        megatron_worker,
+        "CudaGraphManager",
+        lambda config: f"manager-{config.name}",
+    )
+    monkeypatch.setattr(megatron_worker, "unwrap_model", fake_unwrap)
+    monkeypatch.setattr(
+        megatron_worker,
+        "normalize_inference_cuda_graph_scope",
+        lambda scope, impl: "normalized-scope",
+    )
+    monkeypatch.setattr(
+        megatron_worker, "set_model_config_attribute", fake_set_model_config_attribute
+    )
+    monkeypatch.setattr(megatron_worker, "toggle_cuda_graphs", fake_toggle_cuda_graphs)
+
+    worker._setup_colocated_cuda_graph_managers()
+
+    assert unwrap_calls == ["chunk0", "chunk1"]
+    assert chunks[0].cudagraph_manager == "manager-chunk0"
+    assert chunks[1].cudagraph_manager == "manager-chunk1"
+    assert not hasattr(chunks[0].decoder, "cudagraph_manager")
+    assert not hasattr(chunks[1].decoder, "cudagraph_manager")
+    assert set_attr_calls == [
+        ("chunk0", "cuda_graph_impl", "local"),
+        ("chunk0", "inference_cuda_graph_scope", "normalized-scope"),
+        ("chunk0", "cuda_graph_modules", []),
+        ("chunk1", "cuda_graph_impl", "local"),
+        ("chunk1", "inference_cuda_graph_scope", "normalized-scope"),
+        ("chunk1", "cuda_graph_modules", []),
+    ]
+    assert toggle_calls == [("chunk0", "none"), ("chunk1", "none")]
 
 
 def create_megatron_test_config(
