@@ -3781,7 +3781,7 @@ def test_policy_sequence_packing_vpp_sets_microbatch_bin_constraints(monkeypatch
         patch.object(lm_policy_module, "RayQueue", return_value=object()),
         patch.object(lm_policy_module, "RayWorkerBuilder"),
         patch.object(lm_policy_module, "RayWorkerGroup"),
-        patch.object(lm_policy_module, "get_default_hf_config", return_value={}),
+        patch.object(lm_policy_module, "get_hf_config", return_value={}),
         patch.object(
             lm_policy_module.FLOPTracker,
             "from_config",

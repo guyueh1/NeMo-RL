@@ -3429,11 +3429,13 @@ class MegatronPolicyWorkerImpl(
 
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
-        self.model = [
-            self.move_model(model, "cuda", move_grads=True, move_params=True)
-            for model in self.model
-        ]
-        for model in self.model:
+        self.model = map_model_chunks(
+            self.model,
+            lambda model: self.move_model(
+                model, "cuda", move_grads=True, move_params=True
+            ),
+        )
+        for model in self._model_chunks():
             model.train()
 
         # Training expects optimizer state on CUDA. Keep this unconditional rather
@@ -3763,7 +3765,7 @@ class MegatronPolicyWorkerImpl(
             # Ensure model is in eval mode for consistent saving, unless actively training
             # This is a common practice, though NeMo's save might handle this.
             # For safety, if not in training loop, setting to eval.
-            is_training = self.model[0].training
+            is_training = self._primary_model().training
             if not is_training:
                 self._set_models_train_mode(False)
 
@@ -3789,7 +3791,7 @@ class MegatronPolicyWorkerImpl(
                 self.enable_forward_pre_hook()
 
             if not is_training:  # Restore training state if it was changed
-                for model in self.model:
+                for model in self._model_chunks():
                     model.train()
 
         except Exception as e:
