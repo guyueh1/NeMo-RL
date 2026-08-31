@@ -309,9 +309,11 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     class _TrainableModel:
         def __init__(self) -> None:
             self.train_called = False
+            self.train_mode: bool | None = None
 
-        def train(self) -> None:
+        def train(self, mode: bool = True) -> None:
             self.train_called = True
+            self.train_mode = mode
 
     worker = object.__new__(MegatronValueWorkerImpl)
     model = _TrainableModel()
@@ -327,6 +329,7 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
     MegatronValueWorkerImpl.prepare_for_training(worker)
 
     assert model.train_called
+    assert model.train_mode is True
 
 
 @pytest.fixture
