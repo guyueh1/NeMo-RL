@@ -1188,7 +1188,7 @@ class TestPrepareForLpInference:
         first = w.move_model.call_args_list[0]
         assert first.args[1] == "cuda"
         assert first.kwargs == {"move_grads": False}
-        _primary_mock_model(w).eval.assert_called_once()
+        _primary_mock_model(w).train.assert_called_once_with(False)
 
     def test_keeps_buffers_across_an_open_step(self, mock_module_symbols):
         """The sequence the streaming pump actually produces: open a step, run a
