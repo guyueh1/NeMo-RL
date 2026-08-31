@@ -108,14 +108,17 @@ def test_get_values_suspends_activation_offload() -> None:
             self.do_offload = True
 
     manager = OffloadManager()
+    model_train_modes: list[bool] = []
     model_config = SimpleNamespace(fine_grained_activation_offloading=True)
-    model = SimpleNamespace(config=model_config, eval=lambda: None)
-    worker = SimpleNamespace(
-        cfg={"train_micro_batch_size": 1},
-        model=model,
-        _policy_like_cfg={},
-        mcore_state=SimpleNamespace(straggler_timer=None),
+    model = SimpleNamespace(
+        config=model_config,
+        train=lambda mode: model_train_modes.append(mode),
     )
+    worker = MegatronValueWorkerImpl.__new__(MegatronValueWorkerImpl)
+    worker.cfg = {"train_micro_batch_size": 1}
+    worker.model = model
+    worker._policy_like_cfg = {}
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
     observed_states: list[tuple[bool, bool]] = []
 
     def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
@@ -151,6 +154,7 @@ def test_get_values_suspends_activation_offload() -> None:
         result = MegatronValueWorkerImpl.get_values(worker, BatchedDataDict({}))
 
     torch.testing.assert_close(result["values"], torch.tensor([[1.0]]))
+    assert model_train_modes == [False]
     assert observed_states == [(False, False)]
     assert model_config.fine_grained_activation_offloading is True
     assert manager.do_offload is True
