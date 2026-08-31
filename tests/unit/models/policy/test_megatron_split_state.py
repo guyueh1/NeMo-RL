@@ -564,13 +564,14 @@ class TestFinish:
         w._first_train_step_param_sync_func = "ORIGINAL_PARAM_SYNC_FUNC"
         w.enable_forward_pre_hook = MagicMock()
         w.optimizer.step.return_value = (update_successful, 0.5, 0)
+        model = _primary_mock_model(w)
 
-        with patch(f"{WORKER_MOD}.get_model_config", return_value=w.model.config):
+        with patch(f"{WORKER_MOD}.get_model_config", return_value=model.config):
             w.finish_train_step()
 
         if update_successful:
             w.enable_forward_pre_hook.assert_called_once_with()
-            assert w.model.config.param_sync_func == "ORIGINAL_PARAM_SYNC_FUNC"
+            assert model.config.param_sync_func == "ORIGINAL_PARAM_SYNC_FUNC"
             assert w._first_train_step_forward_pre_hook_disabled is False
             assert w._first_train_step_param_sync_func is None
         else:
@@ -1187,7 +1188,7 @@ class TestPrepareForLpInference:
         first = w.move_model.call_args_list[0]
         assert first.args[1] == "cuda"
         assert first.kwargs == {"move_grads": False}
-        w.model[0].eval.assert_called_once()
+        _primary_mock_model(w).eval.assert_called_once()
 
     def test_keeps_buffers_across_an_open_step(self, mock_module_symbols):
         """The sequence the streaming pump actually produces: open a step, run a
