@@ -16,6 +16,7 @@ import os
 import tempfile
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -3827,9 +3828,19 @@ def test_worker_forward_pre_hooks_apply_to_all_model_chunks(monkeypatch):
 def test_worker_train_step_helpers_apply_to_all_model_chunks():
     worker = _new_worker_impl()
     chunks = [MagicMock(), MagicMock()]
-    no_sync_contexts = [MagicMock(), MagicMock()]
-    for chunk, context in zip(chunks, no_sync_contexts, strict=True):
-        chunk.no_sync.return_value = context
+    entered = []
+    exited = []
+
+    @contextmanager
+    def no_sync_context(chunk_idx: int):
+        entered.append(chunk_idx)
+        try:
+            yield
+        finally:
+            exited.append(chunk_idx)
+
+    for chunk_idx, chunk in enumerate(chunks):
+        chunk.no_sync.return_value = no_sync_context(chunk_idx)
     worker.model = chunks
 
     worker._set_models_train_mode(True)
@@ -3841,9 +3852,8 @@ def test_worker_train_step_helpers_apply_to_all_model_chunks():
         chunk.train.assert_called_once_with(True)
         chunk.zero_grad_buffer.assert_called_once_with()
         chunk.no_sync.assert_called_once_with()
-    for context in no_sync_contexts:
-        context.__enter__.assert_called_once_with()
-        context.__exit__.assert_called_once()
+    assert entered == [0, 1]
+    assert exited == [1, 0]
 
 
 def test_worker_set_param_sync_func_broadcasts_and_accepts_per_chunk_list():
