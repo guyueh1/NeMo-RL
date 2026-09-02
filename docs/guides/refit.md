@@ -28,9 +28,10 @@ weights through vLLM's native `reload_weights` API. The flag is off by default.
 The reload API path currently supports only `policy.generation.backend: vllm`,
 `policy.generation.colocated.enabled: false`, and
 `policy.generation.refit_transport: null`. It is explicitly unsupported with
-`nccl_reshard`, `policy.generation.real_quant: true`, sparse refit transports,
-and checkpoint-engine/NIXL transports. Eagle/MTP draft weights refitted from the
-trainer are not supported yet; use the legacy loader for those cases.
+`nccl_reshard`, ModelOpt quantization (`policy.generation.quant_cfg`), sparse
+refit transports, and checkpoint-engine/NIXL transports. Eagle/MTP draft
+weights refitted from the trainer are not supported yet; use the legacy loader
+for those cases.
 
 ## Constraints
 
@@ -47,7 +48,9 @@ trainer are not supported yet; use the legacy loader for those cases.
 Non-colocated SGLang generation is supported with a Megatron policy and
 `refit_transport: null`; it creates its own NCCL weight-update group. The NIXL
 restrictions are on the generation backend; both Megatron and DTensor policy
-workers can send weights. Sparse delta is currently limited to GRPO. NIXL is
+workers can send weights. vLLM refit also rejects grouped MoE MXFP8 expert
+slabs such as `mlp.experts.gate_up_proj` and `mlp.experts.down_proj`. Sparse
+delta is currently limited to GRPO. NIXL is
 initialized by the GRPO and distillation setup paths; PPO currently requires
 colocated generation.
 

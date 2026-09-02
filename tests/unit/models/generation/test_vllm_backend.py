@@ -1088,18 +1088,10 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
 
 
 @pytest.mark.vllm
-@pytest.mark.parametrize("refit_with_reload_api", [False, True])
-def test_worker_prepare_refit_info_preflights_reload_locally(
-    refit_with_reload_api,
-):
+def test_worker_prepare_refit_info_forwards_state_dict_info():
     from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 
     worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {
-        "vllm_cfg": {
-            "refit_with_reload_api": refit_with_reload_api,
-        }
-    }
     worker.llm = SimpleNamespace(collective_rpc=MagicMock())
     state_dict_info = {"model.weight": object()}
 
@@ -1111,92 +1103,43 @@ def test_worker_prepare_refit_info_preflights_reload_locally(
 
 
 @pytest.mark.vllm
-def test_worker_prepare_refit_info_rejects_reload_refit_with_draft_weights():
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+@pytest.mark.parametrize("refit_with_reload_api", [False, True])
+def test_generation_prepare_refit_info_rejects_mxfp8_grouped_moe(
+    monkeypatch,
+    refit_with_reload_api,
+):
+    from nemo_rl.models.generation.vllm import vllm_generation
 
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {
+    generation = vllm_generation.VllmGeneration.__new__(vllm_generation.VllmGeneration)
+    generation.cfg = {
         "vllm_cfg": {
-            "refit_with_reload_api": True,
+            "async_engine": False,
+            "refit_with_reload_api": refit_with_reload_api,
+            "precision": "fp8",
+            "is_mx": True,
         }
     }
-    worker.llm = SimpleNamespace(collective_rpc=MagicMock())
-
-    with pytest.raises(AssertionError, match="not supported yet.*draft weights"):
-        worker.prepare_refit_info({"draft.weight": object()})
-
-    worker.llm.collective_rpc.assert_not_called()
-
-
-@pytest.mark.vllm
-def test_worker_prepare_refit_info_rejects_reload_refit_with_cotrained_mtp():
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {
-        "vllm_cfg": {
-            "refit_with_reload_api": True,
-        },
-        "vllm_kwargs": {
-            "speculative_config": {
-                "method": "mtp",
-                "num_speculative_tokens": 1,
-            }
-        },
-        "_mtp_weights_from_refit": True,
-    }
-    worker.llm = SimpleNamespace(collective_rpc=MagicMock())
-
-    with pytest.raises(AssertionError, match="not supported yet.*draft weights"):
-        worker.prepare_refit_info({"model.weight": object()})
-
-    worker.llm.collective_rpc.assert_not_called()
-
-
-@pytest.mark.vllm
-def test_worker_prepare_refit_info_allows_reload_refit_with_disk_loaded_mtp():
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {
-        "vllm_cfg": {
-            "refit_with_reload_api": True,
-        },
-        "vllm_kwargs": {
-            "speculative_config": {
-                "method": "mtp",
-                "num_speculative_tokens": 1,
-            }
-        },
-        "_mtp_weights_from_refit": False,
-    }
-    worker.llm = SimpleNamespace(collective_rpc=MagicMock())
-    state_dict_info = {"model.weight": object()}
-
-    worker.prepare_refit_info(state_dict_info)
-
-    worker.llm.collective_rpc.assert_called_once_with(
-        "prepare_refit_info",
-        args=(state_dict_info,),
+    generation.worker_group = SimpleNamespace(
+        run_all_workers_single_data=MagicMock(return_value=["future"])
     )
+    monkeypatch.setattr(vllm_generation.ray, "get", MagicMock())
+
+    with pytest.raises(AssertionError, match="MXFP8 refit does not support"):
+        generation.prepare_refit_info(
+            {"model.layers.0.mlp.experts.gate_up_proj": object()}
+        )
+
+    generation.worker_group.run_all_workers_single_data.assert_not_called()
 
 
 @pytest.mark.vllm
 @pytest.mark.asyncio
-@pytest.mark.parametrize("refit_with_reload_api", [False, True])
-async def test_async_worker_prepare_refit_info_preflights_reload_locally(
-    refit_with_reload_api,
-):
+async def test_async_worker_prepare_refit_info_forwards_state_dict_info():
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {
-        "vllm_cfg": {
-            "refit_with_reload_api": refit_with_reload_api,
-        }
-    }
     worker.llm = SimpleNamespace(collective_rpc=AsyncMock())
     state_dict_info = {"model.weight": object()}
 
@@ -1229,187 +1172,6 @@ async def test_nccl_reshard_refit_resets_encoder_cache():
 
     assert await worker.nccl_reshard_refit_async() is True
     worker.llm.reset_encoder_cache.assert_awaited_once_with()
-
-
-@pytest.mark.vllm
-def test_vllm_worker_defaults_missing_reload_refit_flag_to_false(monkeypatch):
-    from nemo_rl.models.generation.vllm import vllm_worker
-
-    worker = vllm_worker.VllmGenerationWorkerImpl.__new__(
-        vllm_worker.VllmGenerationWorkerImpl
-    )
-    apply_patches = MagicMock()
-    monkeypatch.setattr(vllm_worker, "_apply_vllm_patches", apply_patches)
-
-    worker._init_config(
-        {
-            "model_name": "test-model",
-            "vllm_cfg": {
-                "tensor_parallel_size": 1,
-                "pipeline_parallel_size": 1,
-                "expert_parallel_size": 1,
-                "gpu_memory_utilization": 0.8,
-                "precision": "bfloat16",
-            },
-            "colocated": {"enabled": True},
-        },
-        bundle_indices=None,
-        fraction_of_gpus=1.0,
-        seed=None,
-        extra_env_vars=None,
-    )
-
-    assert worker.llm is None
-    assert worker.tokenizer is None
-    assert worker.rank == 0
-    assert worker.world_size == 1
-    apply_patches.assert_called_once()
-
-
-@pytest.mark.vllm
-def test_sync_weight_update_defaults_missing_reload_refit_flag_to_false():
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": False}}
-    worker.llm = SimpleNamespace(collective_rpc=MagicMock(return_value=[True]))
-
-    assert worker.update_weights_from_collective() is True
-    worker.llm.collective_rpc.assert_called_once_with(
-        "update_weights_from_collective",
-        args=(None, False),
-    )
-
-
-@pytest.mark.vllm
-@pytest.mark.asyncio
-async def test_async_weight_update_defaults_missing_reload_refit_flag_to_false():
-    from nemo_rl.models.generation.vllm.vllm_worker_async import (
-        VllmAsyncGenerationWorkerImpl,
-    )
-
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
-    worker.llm = SimpleNamespace(
-        collective_rpc=AsyncMock(return_value=[True]),
-        reset_encoder_cache=AsyncMock(),
-    )
-
-    assert await worker.update_weights_from_collective_async() is True
-    worker.llm.collective_rpc.assert_awaited_once_with(
-        "update_weights_from_collective",
-        args=(None, False),
-    )
-    worker.llm.reset_encoder_cache.assert_not_awaited()
-
-
-@pytest.mark.vllm
-def test_vllm_worker_rejects_reload_refit_when_colocated():
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-
-    with pytest.raises(AssertionError, match="not supported yet.*colocated"):
-        worker._init_config(
-            {
-                "vllm_cfg": {"refit_with_reload_api": True},
-                "colocated": {"enabled": True},
-            },
-            bundle_indices=None,
-            fraction_of_gpus=1.0,
-            seed=None,
-            extra_env_vars=None,
-        )
-
-
-@pytest.mark.vllm
-def test_vllm_worker_rejects_reload_refit_with_nccl_reshard():
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-
-    with pytest.raises(AssertionError, match="explicitly unsupported.*nccl_reshard"):
-        worker._init_config(
-            {
-                "vllm_cfg": {"refit_with_reload_api": True},
-                "colocated": {"enabled": False},
-                "refit_transport": "nccl_reshard",
-            },
-            bundle_indices=None,
-            fraction_of_gpus=1.0,
-            seed=None,
-            extra_env_vars=None,
-        )
-
-
-@pytest.mark.vllm
-@pytest.mark.parametrize("refit_transport", ["nixl", "custom.module:Engine"])
-def test_vllm_worker_rejects_reload_refit_with_checkpoint_engine_refit(
-    refit_transport,
-):
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-
-    with pytest.raises(
-        AssertionError,
-        match="not supported yet.*update_weights_from_checkpoint_engine",
-    ):
-        worker._init_config(
-            {
-                "vllm_cfg": {"refit_with_reload_api": True},
-                "colocated": {"enabled": False},
-                "refit_transport": refit_transport,
-            },
-            bundle_indices=None,
-            fraction_of_gpus=1.0,
-            seed=None,
-            extra_env_vars=None,
-        )
-
-
-@pytest.mark.vllm
-@pytest.mark.parametrize("refit_transport", ["vllm_s3_sparse", "vllm_zmq_sparse"])
-def test_vllm_worker_rejects_reload_refit_with_non_collective_transport(
-    refit_transport,
-):
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-
-    with pytest.raises(AssertionError, match="refit_transport"):
-        worker._init_config(
-            {
-                "vllm_cfg": {"refit_with_reload_api": True},
-                "colocated": {"enabled": False},
-                "refit_transport": refit_transport,
-            },
-            bundle_indices=None,
-            fraction_of_gpus=1.0,
-            seed=None,
-            extra_env_vars=None,
-        )
-
-
-@pytest.mark.vllm
-def test_vllm_worker_rejects_reload_refit_with_modelopt_real_quant():
-    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-
-    with pytest.raises(AssertionError, match="explicitly unsupported.*real_quant"):
-        worker._init_config(
-            {
-                "vllm_cfg": {"refit_with_reload_api": True},
-                "colocated": {"enabled": False},
-                "refit_transport": None,
-                "real_quant": True,
-            },
-            bundle_indices=None,
-            fraction_of_gpus=1.0,
-            seed=None,
-            extra_env_vars=None,
-        )
 
 
 @pytest.mark.vllm

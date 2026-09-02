@@ -111,29 +111,6 @@ def test_init_fp8_uses_mxfp8_quantization_config(
     assert "VLLM_USE_DEEP_GEMM_E8M0" not in fp8.os.environ
 
 
-def test_init_fp8_defaults_missing_reload_refit_flag_to_false(fp8_module, monkeypatch):
-    fp8 = fp8_module
-    monkeypatch.setattr(
-        fp8.AutoConfig,
-        "from_pretrained",
-        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
-    )
-    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _config: None)
-
-    fp8.init_fp8(
-        {
-            "precision": "fp8",
-            "kv_cache_dtype": "auto",
-            "async_engine": False,
-            "is_mx": True,
-        },
-        "dummy-model",
-        model_parallel_size=1,
-    )
-
-    assert fp8.global_fp8_config.refit_with_reload_api is False
-
-
 def test_init_fp8_passes_modelopt_ignore_patterns_without_hf_expansion(
     fp8_module, monkeypatch
 ):
@@ -1295,26 +1272,3 @@ def test_load_weights_expands_grouped_experts_for_fp8_layers(
             assert weight.shape == shape
             assert scale.shape == (shape[0] // 128, shape[1] // 128)
             _assert_dequant_close(weight, scale, source[eid])
-
-
-def test_load_weights_rejects_grouped_experts_for_mxfp8(fp8_module, monkeypatch):
-    """Grouped MoE expansion only implements blockwise FP8, not MXFP8."""
-    import torch
-
-    fp8 = fp8_module
-    fp8.global_fp8_config = types.SimpleNamespace(
-        use_weight_pow2_scale=False, is_mx=True
-    )
-    model = _grouped_expert_model(fp8, monkeypatch, torch.float8_e4m3fn)
-    model.load_weights = lambda pairs: pytest.fail("must raise before loading")
-
-    with pytest.raises(NotImplementedError, match="MXFP8"):
-        fp8.load_weights(
-            [
-                (
-                    "model.layers.0.mlp.experts.gate_up_proj",
-                    torch.randn(2, 512, 384).to(torch.bfloat16),
-                )
-            ],
-            types.SimpleNamespace(model=model),
-        )

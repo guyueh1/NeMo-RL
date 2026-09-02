@@ -34,6 +34,7 @@ from vllm.v1.engine.utils import CoreEngineProcManager
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
+from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
 
 logger = init_logger(__name__)
 
@@ -81,10 +82,6 @@ global_fp8_config: FP8Config = None
 fp8_state: FP8State = FP8State()
 
 fp8_patches_applied = False
-
-_GROUPED_MOE_MXFP8_REFIT_ERROR = (
-    "MXFP8 refit does not support grouped MoE expert weights."
-)
 
 original_run_engine_core = EngineCoreProc.run_engine_core
 original_init = CoreEngineProcManager.__init__
@@ -251,7 +248,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
         "use_fp8_weights": use_fp8_weights,
-        "refit_with_reload_api": vllm_cfg.get("refit_with_reload_api", False),
+        "refit_with_reload_api": vllm_cfg["refit_with_reload_api"],
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
@@ -506,10 +503,6 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
-def _is_grouped_moe_expert_weight(name: str) -> bool:
-    return name.endswith(("mlp.experts.gate_up_proj", "mlp.experts.down_proj"))
-
-
 def _is_fp8_grouped_moe_expert(name: str, model: Any) -> bool:
     experts_module = _get_module_from_param_name(model, name)
     return (
@@ -553,7 +546,7 @@ def get_quantized_weight_iterator(
         # load their per-block scales. Expand them into the per-expert FP8 (w13, w2 -> w1, w2, and w3)
         # layout, then reshape to 2D [num_experts, out_features, in_features] -> [num_experts*out_features, in_features]
         # so the block scales can be quantized and routed correctly.
-        if _is_grouped_moe_expert_weight(k):
+        if is_grouped_moe_expert_weight_name(k):
             # Quantize only if vLLM built this layer's experts as FP8. Experts
             # covered by ``ignored_layers`` (num_{first,last}_layers_in_bf16 /
             # quantization_ignored_layer_kws) are built unquantized, with bf16
@@ -562,8 +555,6 @@ def get_quantized_weight_iterator(
             # bf16 slab through instead; vLLM's fused expert mapping loads it
             # directly, same as a bf16 refit.
             if _is_fp8_grouped_moe_expert(k, model):
-                if global_fp8_config.is_mx:
-                    raise NotImplementedError(_GROUPED_MOE_MXFP8_REFIT_ERROR)
                 yield from _expand_grouped_moe_expert_to_fp8(k, v)
             else:
                 yield k, v
@@ -597,16 +588,6 @@ def load_weights(
     weights: Iterable[tuple[str, torch.Tensor]], model_runner: Any
 ) -> None:
     """Quantize weights for the legacy direct model-loading path."""
-    if global_fp8_config is not None and global_fp8_config.is_mx:
-        if not isinstance(weights, Sequence):
-            weights = list(weights)
-        model = model_runner.model
-        for k, _ in weights:
-            if _is_grouped_moe_expert_weight(k) and _is_fp8_grouped_moe_expert(
-                k, model
-            ):
-                raise NotImplementedError(_GROUPED_MOE_MXFP8_REFIT_ERROR)
-
     # Finally load the weights into vllm
     model_runner.model.load_weights(
         get_quantized_weight_iterator(
