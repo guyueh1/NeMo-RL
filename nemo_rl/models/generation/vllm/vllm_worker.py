@@ -79,6 +79,7 @@ from nemo_rl.weight_sync.checkpoint_engine_config import (
 logger = logging.getLogger(__name__)
 
 FP8_QUANTIZATION_IGNORE_DUMP_ENV = "NRL_DUMP_FP8_QUANTIZATION_IGNORE"
+FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV = "NRL_DUMP_FP8_QUANTIZATION_IGNORE_PATH"
 
 
 def _context_capped_max_new_tokens(
@@ -223,6 +224,15 @@ def _log_fp8_quantization_ignore_report(
             "ignore": list(quantization_config.get("ignore", [])),
         },
     }
+    dump_path = os.environ.get(FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV)
+    if dump_path:
+        os.makedirs(os.path.dirname(os.path.abspath(dump_path)), exist_ok=True)
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"NRL_FP8_QUANTIZATION_IGNORE_DUMP_FILE={dump_path}")
+        return
+
     print("NRL_FP8_QUANTIZATION_IGNORE_DUMP=" + json.dumps(payload, sort_keys=True))
 
 
