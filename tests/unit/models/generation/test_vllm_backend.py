@@ -1113,7 +1113,7 @@ async def test_async_weight_update_skips_encoder_cache_reset_when_disabled():
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True, "refit_with_reload_api": False}}
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
     worker.llm = SimpleNamespace(
         collective_rpc=AsyncMock(return_value=[True]),
         reset_encoder_cache=AsyncMock(),
@@ -1135,7 +1135,6 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
     worker.cfg = {
         "vllm_cfg": {
             "async_engine": True,
-            "refit_with_reload_api": False,
             "reset_encoder_cache_after_weight_update": True,
         }
     }

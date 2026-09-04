@@ -54,7 +54,7 @@ def _valid_nccl_reshard_config() -> SimpleNamespace:
             "generation": {
                 "backend": "vllm",
                 "colocated": {"enabled": False},
-                "vllm_cfg": {"refit_with_reload_api": False},
+                "vllm_cfg": {},
             },
             "megatron_cfg": {"enabled": True},
             "dtensor_cfg": {"enabled": False},
