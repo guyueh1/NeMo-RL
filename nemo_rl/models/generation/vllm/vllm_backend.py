@@ -1097,11 +1097,24 @@ class VllmInternalWorkerExtension:
                     return_iterator=True,
                 )
                 assert weight_iterator is not None
-                self.model_runner.reload_weights(
-                    weights_iterator=self._prepare_reload_weight_iterator(
-                        weight_iterator
-                    )
+                reload_weight_iterator = self._prepare_reload_weight_iterator(
+                    weight_iterator
                 )
+                try:
+                    self.model_runner.reload_weights(
+                        weights_iterator=reload_weight_iterator
+                    )
+                finally:
+                    iterators_to_close = [reload_weight_iterator]
+                    if reload_weight_iterator is not weight_iterator:
+                        iterators_to_close.append(weight_iterator)
+
+                    for iterator_to_close in iterators_to_close:
+                        close_weight_iterator = getattr(
+                            iterator_to_close, "close", None
+                        )
+                        if close_weight_iterator is not None:
+                            close_weight_iterator()
             else:
                 native_layerwise_refit = self._uses_native_layerwise_refit("collective")
                 with self._weight_update_lifecycle("collective") as finalize:

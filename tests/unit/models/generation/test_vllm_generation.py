@@ -1032,6 +1032,30 @@ def test_vllm_generation_rejects_unsupported_reload_refit_config(
         VllmGeneration(DummyCluster(), vllm_config)
 
 
+def test_vllm_generation_rejects_async_reload_refit_mtp_before_worker_start():
+    class DummyCluster:
+        num_gpus_per_node = 1
+
+        def world_size(self):
+            return 1
+
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"]["async_engine"] = True
+    vllm_config["vllm_cfg"]["refit_with_reload_api"] = True
+    vllm_config["vllm_kwargs"] = {
+        "speculative_config": {
+            "method": "mtp",
+            "num_speculative_tokens": 1,
+        }
+    }
+    vllm_config["_mtp_weights_from_refit"] = True
+
+    with pytest.raises(AssertionError, match="not supported yet.*MTP draft weights"):
+        VllmGeneration(DummyCluster(), vllm_config)
+
+
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     """Test vLLM policy generation capabilities."""
     # Test generation

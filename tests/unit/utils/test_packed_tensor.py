@@ -116,13 +116,52 @@ def test_packed_broadcast_consumer_returns_lazy_flattened_iterator(monkeypatch):
     assert batches_started == [True]
 
 
+def test_packed_broadcast_consumer_closes_abandoned_lazy_batches(monkeypatch):
+    class CloseableBatches:
+        def __init__(self):
+            self.batches = iter([[("a", "a-value"), ("b", "b-value")]])
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.batches)
+
+        def close(self):
+            self.closed = True
+
+    batches = CloseableBatches()
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor._packed_broadcast_consumer_batches",
+        lambda _iterator, _group, _src, **_kwargs: batches,
+    )
+
+    result = packed_broadcast_consumer(
+        iterator=iter(()),
+        group=object(),
+        src=0,
+        post_unpack_func=None,
+        return_iterator=True,
+    )
+
+    assert result is not None
+    assert next(result) == ("a", "a-value")
+    assert batches.closed is False
+
+    result.close()
+
+    assert batches.closed is True
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("return_iterator", [False, True])
 @pytest.mark.parametrize(
     ("producer_num_buffers", "consumer_num_buffers"),
     [(None, None), (2, 1)],
 )
 def test_packed_broadcast_producer_consumer_roundtrip(
-    producer_num_buffers, consumer_num_buffers
+    producer_num_buffers, consumer_num_buffers, return_iterator
 ):
     """Test that producer and consumer work together correctly."""
     # Create mock parameters
@@ -172,13 +211,20 @@ def test_packed_broadcast_producer_consumer_roundtrip(
                 unpacked_tensors[name] = tensor
 
         # Run consumer
-        packed_broadcast_consumer(
+        result = packed_broadcast_consumer(
             iterator=iter(state_dict_info.items()),
             group=consumer_group,
             src=0,
-            post_unpack_func=post_unpack_func,
+            post_unpack_func=None if return_iterator else post_unpack_func,
+            return_iterator=return_iterator,
             num_buffers=consumer_num_buffers,
         )
+        if return_iterator:
+            assert result is not None
+            for name, tensor in result:
+                unpacked_tensors[name] = tensor
+
+        assert consumer_group.current_index == 3
 
     # Verify all parameters were unpacked
     assert len(unpacked_tensors) == len(params)

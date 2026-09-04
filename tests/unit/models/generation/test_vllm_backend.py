@@ -842,6 +842,66 @@ def test_update_weights_from_collective_uses_native_reload_when_enabled(monkeypa
 
 
 @pytest.mark.vllm
+def test_update_weights_from_collective_reload_closes_abandoned_iterator(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    call_order = []
+    ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+
+    class CloseableIterator:
+        def __init__(self):
+            self.weights = iter(
+                [
+                    ("model.weight", "weight-value"),
+                    ("model.unused_weight", "unused-value"),
+                ]
+            )
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.weights)
+
+        def close(self):
+            call_order.append("close")
+            self.closed = True
+
+    weight_iterator = CloseableIterator()
+
+    def packed_broadcast_consumer(
+        iterator, group, src, post_unpack_func, return_iterator=False
+    ):
+        call_order.append("broadcast")
+        assert list(iterator) == [("model.weight", expected_state_info)]
+        assert group is ext.model_update_group
+        assert src == 0
+        assert post_unpack_func is None
+        assert return_iterator is True
+        return weight_iterator
+
+    def reload_weights(*, weights_iterator):
+        call_order.append("reload")
+        assert next(weights_iterator) == ("model.weight", "weight-value")
+
+    ext.model_runner.reload_weights = reload_weights
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: call_order.append("gc"))
+    monkeypatch.setattr(
+        vllm_backend.torch.cuda,
+        "empty_cache",
+        lambda: call_order.append("empty_cache"),
+    )
+
+    assert ext.update_weights_from_collective(refit_with_reload_api=True) is True
+    assert weight_iterator.closed is True
+    assert call_order == ["broadcast", "reload", "close", "gc", "empty_cache"]
+
+
+@pytest.mark.vllm
 def test_collective_fp8_uses_native_reload_iterator(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
     from nemo_rl.models.generation.vllm.quantization import fp8

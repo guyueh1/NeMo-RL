@@ -280,9 +280,14 @@ def packed_broadcast_consumer(
     if return_iterator:
 
         def weight_iterator() -> Iterator[tuple[str, torch.Tensor]]:
-            for batch in batches:
-                for weight in batch:
-                    yield weight
+            try:
+                for batch in batches:
+                    for weight in batch:
+                        yield weight
+            finally:
+                close_batches = getattr(batches, "close", None)
+                if close_batches is not None:
+                    close_batches()
 
         return weight_iterator()
 
