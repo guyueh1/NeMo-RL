@@ -456,7 +456,7 @@ class BaseVllmGenerationWorker:
         self.world_size = 1
 
     def _refit_with_reload_api_enabled(self) -> bool:
-        return self.cfg["vllm_cfg"]["refit_with_reload_api"]
+        return bool(self.cfg["vllm_cfg"].get("refit_with_reload_api"))
 
     @trace_fn(RLSpanGroup.MODEL_INIT, "rl.vllm.load_model")
     def _load_model(self, bundle_indices, seed):
