@@ -72,14 +72,16 @@ from nemo_rl.telemetry.setup import (
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+from nemo_rl.utils.quantization_logging import (
+    FP8_QUANTIZATION_IGNORE_DUMP_ENV,
+    FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV,
+    is_truthy_env_var,
+)
 from nemo_rl.weight_sync.checkpoint_engine_config import (
     checkpoint_engine_refit_config,
 )
 
 logger = logging.getLogger(__name__)
-
-FP8_QUANTIZATION_IGNORE_DUMP_ENV = "NRL_DUMP_FP8_QUANTIZATION_IGNORE"
-FP8_QUANTIZATION_IGNORE_DUMP_PATH_ENV = "NRL_DUMP_FP8_QUANTIZATION_IGNORE_PATH"
 
 
 def _context_capped_max_new_tokens(
@@ -237,8 +239,10 @@ def _log_fp8_quantization_ignore_report(
 
 
 def _should_log_fp8_quantization_ignore() -> bool:
-    enabled = os.environ.get(FP8_QUANTIZATION_IGNORE_DUMP_ENV, "").lower()
-    return enabled in ("1", "true", "yes", "on") and os.environ.get("RANK") == "0"
+    return (
+        is_truthy_env_var(FP8_QUANTIZATION_IGNORE_DUMP_ENV)
+        and os.environ.get("RANK") == "0"
+    )
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -622,17 +626,9 @@ class BaseVllmGenerationWorker:
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
-            if should_log_fp8_ignore:
-                fp8_kwargs, fp8_ignore_report = init_fp8(
-                    self.cfg["vllm_cfg"],
-                    self.model_name,
-                    model_parallel_size,
-                    return_ignore_report=True,
-                )
-            else:
-                fp8_kwargs = init_fp8(
-                    self.cfg["vllm_cfg"], self.model_name, model_parallel_size
-                )
+            fp8_kwargs, fp8_ignore_report = init_fp8(
+                self.cfg["vllm_cfg"], self.model_name, model_parallel_size
+            )
 
             # Merge (rather than replace) so fp8's quantization_config coexists
             # with user-supplied hf_overrides, which take precedence.

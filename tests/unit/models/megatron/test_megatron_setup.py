@@ -3741,6 +3741,7 @@ class TestDraftSetup:
         )
 
 
+@pytest.mark.mcore
 def test_patch_megatron_fp8_context_layer_quantization_logging(monkeypatch, caplog):
     from nemo_rl.models.megatron import setup
 
@@ -3776,6 +3777,97 @@ def test_patch_megatron_fp8_context_layer_quantization_logging(monkeypatch, capl
         "decision=QUANTIZED recipe=MXFP8"
     ) in caplog.text
     assert caplog.text.count("[LayerQuantization][Megatron] layer=1") == 1
+
+
+@pytest.mark.mcore
+def test_patch_megatron_fp8_context_layer_quantization_logging_is_idempotent(
+    monkeypatch,
+):
+    from nemo_rl.models.megatron import setup
+
+    fp8_utils = types.ModuleType("megatron.core.fp8_utils")
+
+    def get_fp8_context(config, layer_no=-1, is_init=False):
+        return ("context", layer_no, is_init)
+
+    fp8_utils.get_fp8_context = get_fp8_context
+    monkeypatch.setitem(sys.modules, fp8_utils.__name__, fp8_utils)
+    monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "true")
+
+    setup._patch_megatron_fp8_context_layer_quantization_logging()
+    wrapped_get_fp8_context = fp8_utils.get_fp8_context
+    setup._patch_megatron_fp8_context_layer_quantization_logging()
+
+    assert fp8_utils.get_fp8_context is wrapped_get_fp8_context
+
+
+@pytest.mark.mcore
+def test_patch_megatron_fp8_context_layer_quantization_logging_skips_init(
+    monkeypatch, caplog
+):
+    from nemo_rl.models.megatron import setup
+
+    fp8_utils = types.ModuleType("megatron.core.fp8_utils")
+    calls = []
+
+    def get_fp8_context(config, layer_no=-1, is_init=False):
+        calls.append((layer_no, is_init))
+        return ("context", layer_no, is_init)
+
+    fp8_utils.get_fp8_context = get_fp8_context
+    monkeypatch.setitem(sys.modules, fp8_utils.__name__, fp8_utils)
+    monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "yes")
+
+    setup._patch_megatron_fp8_context_layer_quantization_logging()
+
+    config = SimpleNamespace(fp8=True, fp8_param=True, fp8_recipe="mxfp8")
+    with caplog.at_level(logging.INFO, logger=setup.logger.name):
+        assert fp8_utils.get_fp8_context(config, layer_no=0, is_init=True) == (
+            "context",
+            0,
+            True,
+        )
+
+    assert calls == [(0, True)]
+    assert "[LayerQuantization][Megatron]" not in caplog.text
+
+
+@pytest.mark.mcore
+def test_patch_megatron_fp8_context_layer_quantization_logging_rank_fallback(
+    monkeypatch, caplog
+):
+    from nemo_rl.models.megatron import setup
+
+    fp8_utils = types.ModuleType("megatron.core.fp8_utils")
+
+    def get_fp8_context(config, layer_no=-1, is_init=False):
+        return ("context", layer_no, is_init)
+
+    fp8_utils.get_fp8_context = get_fp8_context
+    monkeypatch.setitem(sys.modules, fp8_utils.__name__, fp8_utils)
+    monkeypatch.setenv("NRL_LOG_LAYER_QUANTIZATION", "1")
+    monkeypatch.setattr(setup.torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(setup.torch.distributed, "is_initialized", lambda: True)
+
+    def raise_rank_error():
+        raise RuntimeError("rank unavailable")
+
+    monkeypatch.setattr(setup.torch.distributed, "get_rank", raise_rank_error)
+
+    setup._patch_megatron_fp8_context_layer_quantization_logging()
+
+    config = SimpleNamespace(fp8=True, fp8_param=False, fp8_recipe="mxfp8")
+    with caplog.at_level(logging.INFO, logger=setup.logger.name):
+        assert fp8_utils.get_fp8_context(config, layer_no=2) == (
+            "context",
+            2,
+            False,
+        )
+
+    assert (
+        "[LayerQuantization][Megatron] layer=2 scope=layer_context "
+        "decision=QUANTIZED recipe=MXFP8"
+    ) in caplog.text
 
 
 @pytest.mark.mcore

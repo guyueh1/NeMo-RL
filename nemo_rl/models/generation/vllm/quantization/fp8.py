@@ -38,6 +38,10 @@ from nemo_rl.models.generation.vllm.patches import (
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
+from nemo_rl.utils.quantization_logging import (
+    FP8_QUANTIZATION_IGNORE_DUMP_ENV,
+    is_truthy_env_var,
+)
 
 logger = init_logger(__name__)
 
@@ -87,6 +91,13 @@ fp8_patches_applied = False
 
 original_run_engine_core = EngineCoreProc.run_engine_core
 original_init = CoreEngineProcManager.__init__
+
+
+def _should_build_fp8_quantization_ignore_report() -> bool:
+    return (
+        is_truthy_env_var(FP8_QUANTIZATION_IGNORE_DUMP_ENV)
+        and os.environ.get("RANK") == "0"
+    )
 
 
 def my_init(*args, **kwargs):
@@ -218,7 +229,7 @@ def apply_fp8_patches(self, fp8_config):
     fp8_patches_applied = True
 
 
-def init_fp8(vllm_cfg, model_name, model_parallel_size, *, return_ignore_report=False):
+def init_fp8(vllm_cfg, model_name, model_parallel_size):
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
@@ -384,7 +395,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size, *, return_ignore_report=
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
 
-    if return_ignore_report:
+    ignore_report = None
+    if _should_build_fp8_quantization_ignore_report():
         pattern_matches = {}
         pattern_match_error = None
         if quantization_ignore_patterns:
@@ -435,9 +447,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size, *, return_ignore_report=
                 "ignore": list(fp8_block_quant_kwargs.get("ignore", [])),
             },
         }
-        return vllm_kwargs, ignore_report
-
-    return vllm_kwargs
+    return vllm_kwargs, ignore_report
 
 
 def is_fp8_model(vllm_config):

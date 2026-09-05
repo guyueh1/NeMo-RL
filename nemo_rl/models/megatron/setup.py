@@ -74,6 +74,10 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.utils.quantization_logging import (
+    LAYER_QUANTIZATION_LOG_ENV,
+    is_truthy_env_var,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +137,6 @@ def _patch_hf_config_double_instantiation():
     _HF_CONFIG_PATCHED = True
 
 
-_LAYER_QUANTIZATION_LOG_ENV = "NRL_LOG_LAYER_QUANTIZATION"
 _MEGATRON_FP8_CONTEXT_LAYER_QUANTIZATION_PATCH_ATTR = (
     "_nrl_layer_quantization_logging_patched"
 )
@@ -141,7 +144,7 @@ _MEGATRON_FP8_CONTEXT_LAYER_QUANTIZATION_PATCH_ATTR = (
 
 def _patch_megatron_fp8_context_layer_quantization_logging() -> None:
     """Log Megatron FP8/BF16 layer-context decisions without patching Megatron files."""
-    if os.environ.get(_LAYER_QUANTIZATION_LOG_ENV, "0") != "1":
+    if not is_truthy_env_var(LAYER_QUANTIZATION_LOG_ENV):
         return
 
     try:
@@ -150,15 +153,6 @@ def _patch_megatron_fp8_context_layer_quantization_logging() -> None:
         logger.warning(
             "Could not patch Megatron FP8 layer-quantization logging: %s",
             error,
-        )
-        return
-
-    if hasattr(fp8_utils, "LOG_LAYER_QUANTIZATION") and hasattr(
-        fp8_utils, "_LOGGED_LAYER_QUANTIZATION_DECISIONS"
-    ):
-        fp8_utils.LOG_LAYER_QUANTIZATION = True
-        logger.info(
-            "Megatron FP8 layer-quantization source logging is already present."
         )
         return
 

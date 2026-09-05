@@ -18,7 +18,11 @@ from functools import wraps
 from importlib.util import find_spec
 from typing import Any
 
-G_LAYER_QUANTIZATION_LOG_ENV = "NRL_LOG_LAYER_QUANTIZATION"
+from nemo_rl.utils.quantization_logging import (
+    LAYER_QUANTIZATION_LOG_ENV,
+    is_truthy_env_var,
+)
+
 G_MODELOPT_LAYER_QUANTIZATION_PATCH_ATTR = (
     "_nrl_modelopt_layer_quantization_logging_patched"
 )
@@ -144,7 +148,7 @@ def _patch_vllm_modelopt_layer_quantization_logging(
     logger: Any | None = None,
 ) -> None:
     """Log vLLM ModelOpt FP8/BF16 layer decisions without patching vLLM files."""
-    if os.environ.get(G_LAYER_QUANTIZATION_LOG_ENV, "0") != "1":
+    if not is_truthy_env_var(LAYER_QUANTIZATION_LOG_ENV):
         return
 
     if logger is None:
@@ -161,15 +165,6 @@ def _patch_vllm_modelopt_layer_quantization_logging(
         logger.warning(
             "Could not patch vLLM ModelOpt layer-quantization logging: %s",
             error,
-        )
-        return
-
-    if hasattr(modelopt, "LOG_LAYER_QUANTIZATION") and hasattr(
-        modelopt, "LAYER_QUANTIZATION_LOG_ENV"
-    ):
-        modelopt.LOG_LAYER_QUANTIZATION = True
-        logger.info(
-            "vLLM ModelOpt layer-quantization source logging is already present."
         )
         return
 
@@ -192,7 +187,9 @@ def _patch_vllm_modelopt_layer_quantization_logging(
         return "unquantized_method"
 
     def wrap_get_quant_method(cls: Any) -> bool:
-        if cls is None or getattr(cls, G_MODELOPT_LAYER_QUANTIZATION_PATCH_ATTR, False):
+        if cls is None or getattr(cls, "__dict__", {}).get(
+            G_MODELOPT_LAYER_QUANTIZATION_PATCH_ATTR, False
+        ):
             return False
 
         original_get_quant_method = getattr(cls, "get_quant_method", None)
