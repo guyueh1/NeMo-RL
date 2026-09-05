@@ -32,6 +32,9 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.patches import (
+    _patch_vllm_modelopt_layer_quantization_logging,
+)
 from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_flashinfer_scale_k,
 )
@@ -160,6 +163,8 @@ def apply_fp8_patches(self, fp8_config):
 
     # Apply weight-related patches only when using FP8 weights (precision=fp8)
     if global_fp8_config.use_fp8_weights:
+        _patch_vllm_modelopt_layer_quantization_logging(logger)
+
         # This patch is used to support torch.compile with vllm parameter subclasses, such as
         # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
         # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
