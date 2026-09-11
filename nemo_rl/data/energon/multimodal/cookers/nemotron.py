@@ -293,6 +293,12 @@ def _aux_store_and_path(
                 media_path = (
                     clean_path[len(prefix) :] if strip_matched_prefix else path
                 )
+                if (
+                    basename_missing_absolute
+                    and Path(media_path).is_absolute()
+                    and not Path(media_path).is_file()
+                ):
+                    media_path = PurePosixPath(media_path).name
                 return media_sources[aux_key], media_path
             except KeyError as error:
                 if not missing_aux_source_is_error:
@@ -531,8 +537,8 @@ def cook_nemotron_conversation(
     """Cook the Nemotron ``conversation[].fragments[]`` source schema."""
     payload = _decode_payload(sample)
     conversation = payload.get("conversation")
-    if not isinstance(conversation, list) or not conversation:
-        raise ValueError("Nemotron fragment conversations require a non-empty list.")
+    if not isinstance(conversation, list):
+        raise ValueError("Nemotron fragment conversations require a list.")
 
     messages: list[dict[str, Any]] = []
     media: list[MediaRef] = []

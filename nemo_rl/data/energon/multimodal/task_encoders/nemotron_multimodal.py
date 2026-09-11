@@ -45,7 +45,6 @@ from nemo_rl.data.energon.multimodal.task_encoders.nemotron_visual import (
     COMPACT_IMAGE_PLACEHOLDER,
     NemotronEncodedSFTSample,
     _NemotronVisualProcessorAdapter,
-    _expand_visual_placeholders,
     _normalize_assistant_thinking,
     _token_id,
     _tokenize_nemotron_sample,
@@ -821,7 +820,6 @@ class NemotronMultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
         inputs_by_message: defaultdict[int, defaultdict[str, list[PackedTensor]]] = (
             defaultdict(lambda: defaultdict(list))
         )
-        visual_occurrences: list[tuple[int, tuple[int, ...]]] = []
 
         # Apply the plans saved during pre-encoding, mirroring the Megatron
         # reference's postencode_sample: load the selected media and run
@@ -832,20 +830,12 @@ class NemotronMultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
             media_inputs, _ = self._process_media(ref, plan, pending_sample)
             for key, value in media_inputs.items():
                 inputs_by_message[plan.message_index][key].append(value)
-            visual_occurrences.append((plan.message_index, plan.embedding_widths))
 
         for plan in sample.audio_plans:
             ref = pending_sample.media[plan.media_index]
             for key, value in self._process_audio(ref, plan).items():
                 inputs_by_message[0][key].append(value)
 
-        image_token_id = _token_id(self.processor.tokenizer, "<image>")
-        _expand_visual_placeholders(
-            message_log,
-            visual_occurrences,
-            image_token_id=image_token_id,
-        )
-        expanded_length = sum(len(message["token_ids"]) for message in message_log)
         for message_index, keyed_inputs in inputs_by_message.items():
             message_log[message_index].update(
                 {
@@ -856,7 +846,7 @@ class NemotronMultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
         return EncodedSFTSample.derive_from(
             sample,
             message_log=message_log,
-            length=expanded_length,
+            length=sample.length,
             packing_cost=sample.packing_cost,
             loss_multiplier=sample.loss_multiplier,
             group_key=sample.group_key,
@@ -903,6 +893,7 @@ class NemotronMultiModalTaskEncoder(GenericSFTTaskEncoder):
         audio_clip_duration_seconds: float = 30.0,
         min_audio_duration_seconds: float = 0.1,
         max_audio_duration_seconds: float = 1800.0,
+        pack_shuffle_seed: int | None = None,
     ) -> None:
         if isinstance(adapter, NemotronMultiModalProcessorAdapter):
             omni_adapter = adapter
@@ -949,6 +940,7 @@ class NemotronMultiModalTaskEncoder(GenericSFTTaskEncoder):
             sequence_length_pad_multiple=sequence_length_pad_multiple,
             only_unmask_final=only_unmask_final,
             loss_mask_mode="precomputed",
+            pack_shuffle_seed=pack_shuffle_seed,
         )
         self._multimodal_adapter = omni_adapter
 

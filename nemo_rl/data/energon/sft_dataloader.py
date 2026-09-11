@@ -20,7 +20,7 @@ import json
 import os
 import traceback
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping as MappingABC
 from typing import Any, Iterator, Literal, Mapping, Protocol, cast
 
 import torch
@@ -362,6 +362,7 @@ def _task_encoder(
     adapter: Any,
     include_source_ids: bool,
     packing_algorithm: str | None,
+    packing_algorithm_options: Mapping[str, Any] | None,
     max_sequences_per_bin: int | None,
     max_sequence_length: int,
     sequence_length_pad_multiple: int,
@@ -391,6 +392,9 @@ def _task_encoder(
             packing_algorithm,
             max_sequence_length,
             max_sequences_per_bin=max_sequences_per_bin,
+            balanced_knapsack_delta=int(
+                (packing_algorithm_options or {}).get("balanced_knapsack_delta", 0)
+            ),
         )
         if loader_config.packing_buffer_size is not None
         and packing_algorithm is not None
@@ -409,6 +413,33 @@ def _task_encoder(
             **encoder_options,
         ),
     )
+
+
+def _task_encoder_packing_config(
+    loader_config: EnergonLoaderConfig,
+) -> tuple[str | None, int | None, dict[str, Any]]:
+    """Return optional physical packing settings from task_encoder.packing.
+
+    Older/equivalent configs sometimes carry Energon physical packing under
+    data.energon.task_encoder.packing rather than data.energon.packing_buffer_size.
+    Support both forms so the effective loader identity is explicit.
+    """
+    extra = getattr(loader_config.task_encoder, "model_extra", None) or {}
+    raw = extra.get("packing")
+    if raw is None:
+        return None, None, {}
+    if not isinstance(raw, MappingABC):
+        raise TypeError("data.energon.task_encoder.packing must be a mapping.")
+    name = raw.get("name")
+    if name is not None:
+        name = str(name)
+    buffer_size = raw.get("buffer_size")
+    if buffer_size is not None:
+        buffer_size = int(buffer_size)
+    options = raw.get("options") or {}
+    if not isinstance(options, MappingABC):
+        raise TypeError("data.energon.task_encoder.packing.options must be a mapping.")
+    return name, buffer_size, dict(options)
 
 
 def build_energon_sft_loader(
@@ -439,6 +470,27 @@ def build_energon_sft_loader(
 
     resolved_source = _source_config(source, name=split_role)
     loader_config = _loader_config(data_config["energon"])
+    (
+        task_packing_algorithm,
+        task_packing_buffer_size,
+        task_packing_options,
+    ) = _task_encoder_packing_config(loader_config)
+    if loader_config.packing_buffer_size is None and task_packing_buffer_size is not None:
+        loader_config.packing_buffer_size = task_packing_buffer_size
+    if packing_algorithm is None and task_packing_algorithm is not None:
+        packing_algorithm = task_packing_algorithm
+    if (
+        "max_sequence_length" in task_packing_options
+        and task_packing_options["max_sequence_length"] is not None
+    ):
+        max_sequence_length = int(task_packing_options["max_sequence_length"])
+    if (
+        "sequence_length_pad_multiple" in task_packing_options
+        and task_packing_options["sequence_length_pad_multiple"] is not None
+    ):
+        sequence_length_pad_multiple = int(
+            task_packing_options["sequence_length_pad_multiple"]
+        )
     if loader_config.nvdataset_cache_dir is not None:
         _set_nvdataset_cache_dir(loader_config.nvdataset_cache_dir)
     if loader_config.packing_buffer_size is not None and packing_algorithm is None:
@@ -456,6 +508,7 @@ def build_energon_sft_loader(
         adapter=adapter,
         include_source_ids=True,
         packing_algorithm=packing_algorithm,
+        packing_algorithm_options=task_packing_options,
         max_sequences_per_bin=max_sequences_per_bin,
         max_sequence_length=max_sequence_length,
         sequence_length_pad_multiple=sequence_length_pad_multiple,
@@ -478,15 +531,11 @@ def build_energon_sft_loader(
 
         dataset = get_train_dataset(
             resolved_source.path,
-            split_part=resolved_source.split,
             worker_config=worker_config,
             batch_size=batch_size,
-            batch_drop_last=True,
             packing_buffer_size=loader_config.packing_buffer_size,
             shuffle_buffer_size=(loader_config.shuffle_buffer_size),
-            shuffle_over_epochs_multiplier=1,
             max_samples_per_sequence=loader_config.max_samples_per_sequence,
-            virtual_epoch_length=resolved_source.virtual_epoch_length,
             task_encoder=task_encoder,
         )
     else:

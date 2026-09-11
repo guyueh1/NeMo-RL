@@ -32,6 +32,33 @@ from nemo_rl.data.packing import SequencePacker
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
+def _pad_token_id(tokenizer: PreTrainedTokenizerBase) -> int:
+    """Return the pad id used by Megatron's Nemotron multimodal tokenizer."""
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    decode = getattr(tokenizer, "decode", None)
+    if callable(convert) and callable(decode):
+        try:
+            is_nemotron6 = (
+                decode([10], clean_up_tokenization_spaces=False) == "<|im_start|>"
+                and decode([11], clean_up_tokenization_spaces=False) == "<|im_end|>"
+            )
+            unk_id = convert("<unk>")
+        except Exception:
+            is_nemotron6 = False
+            unk_id = None
+        if (
+            is_nemotron6
+            and type(unk_id) is int
+            and unk_id >= 0
+        ):
+            return int(unk_id)
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        raise ValueError("Packed SFT requires a tokenizer pad token.")
+    return int(pad_id)
+
+
 def _cost(sample: EncodedSFTSample, multiple: int) -> int:
     if sample.packing_cost < sample.length:
         raise ValueError(f"Invalid packing cost for sample {sample.sample_key!r}.")
@@ -94,8 +121,9 @@ def prepare_packed_sft_batch(
     loss_mask_mode: str | None = None,
 ) -> BatchedDataDict[Any]:
     """Create model tensors for a batch of physical Energon packs."""
-    if not packs or tokenizer.pad_token_id is None:
-        raise ValueError("Packed SFT requires packs and a tokenizer pad token.")
+    if not packs:
+        raise ValueError("Packed SFT requires packs.")
+    pad_token_id = _pad_token_id(tokenizer)
     if loss_mask_mode not in (None, "precomputed"):
         raise ValueError(f"Unsupported packed SFT loss_mask_mode={loss_mask_mode!r}.")
     if loss_mask_mode == "precomputed" and only_unmask_final:
@@ -106,6 +134,8 @@ def prepare_packed_sft_batch(
     if len(capacities) != 1:
         raise ValueError("All physical packs in a batch need one capacity.")
     capacity = capacities.pop()
+    if any(sum(pack.source_padded_lengths) > capacity for pack in packs):
+        raise ValueError("A physical pack exceeds its configured capacity.")
     packed_logs: list[list[dict[str, Any]]] = []
     boundaries: list[torch.Tensor | None] = []
     padded_boundaries: list[torch.Tensor | None] = []
@@ -146,7 +176,7 @@ def prepare_packed_sft_batch(
             if key not in {"token_ids", "token_loss_mask"}
             and isinstance(value, torch.Tensor)
         }
-        lengths: list[int] = []
+        packed_lengths: list[int] = []
         combined: list[dict[str, Any]] = []
         token_dtype = torch.long
         for log, sample, padded_length in zip(
@@ -156,8 +186,10 @@ def prepare_packed_sft_batch(
             if not isinstance(tokens, torch.Tensor) or tokens.numel() == 0:
                 raise TypeError("Packed SFT sources require token tensors.")
             token_dtype = tokens.dtype
-            length = tokens.shape[0]
-            lengths.append(length)
+            physical_padding = padded_length - sample.packing_cost
+            if physical_padding < 0:
+                raise ValueError("A source exceeds its padded packing length.")
+            packed_lengths.append(sample.packing_cost + physical_padding)
             for message in log:
                 message["token_loss_mask"] = (
                     message["token_loss_mask"] * sample.loss_multiplier
@@ -171,54 +203,41 @@ def prepare_packed_sft_batch(
                         ),
                     )
             log[0]["token_loss_mask"][0] = 0
-            padding = padded_length - length
-            if padding < 0:
-                raise ValueError("A source exceeds its padded length.")
-            if padding:
+            if physical_padding:
                 pad_message = {
                     "role": "padding",
                     "token_ids": torch.full(
-                        (padding,), tokenizer.pad_token_id, dtype=token_dtype
+                        (physical_padding,),
+                        pad_token_id,
+                        dtype=token_dtype,
                     ),
-                    "token_loss_mask": torch.zeros(padding, dtype=torch.float32),
+                    "token_loss_mask": torch.zeros(
+                        physical_padding, dtype=torch.float32
+                    ),
                 }
                 pad_message.update(
                     {
-                        key: torch.zeros((padding, *value.shape[1:]), dtype=value.dtype)
+                        key: torch.zeros(
+                            (physical_padding, *value.shape[1:]), dtype=value.dtype
+                        )
                         for key, value in templates.items()
                     }
                 )
                 log.append(pad_message)
             combined.extend(log)
-        tail = capacity - sum(pack.source_padded_lengths)
-        if tail:
-            tail_message = {
-                "role": "padding",
-                "token_ids": torch.full(
-                    (tail,), tokenizer.pad_token_id, dtype=token_dtype
-                ),
-                "token_loss_mask": torch.zeros(tail, dtype=torch.float32),
-            }
-            tail_message.update(
-                {
-                    key: torch.zeros((tail, *value.shape[1:]), dtype=value.dtype)
-                    for key, value in templates.items()
-                }
-            )
-            combined.append(tail_message)
         packed_logs.append(combined)
         boundaries.append(
             torch.tensor(
-                [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32
+                [0, *torch.tensor(packed_lengths).cumsum(0).tolist()],
+                dtype=torch.int32,
             )
         )
         padded = [0, *torch.tensor(pack.source_padded_lengths).cumsum(0).tolist()]
-        padded[-1] = capacity
         padded_boundaries.append(torch.tensor(padded, dtype=torch.int32))
         source_ids.append([sample.sample_key for sample in pack.samples])
 
     flat, input_lengths = batched_message_log_to_flat_message(
-        packed_logs, pad_value_dict={"token_ids": tokenizer.pad_token_id}
+        packed_logs, pad_value_dict={"token_ids": pad_token_id}
     )
     prepared = BatchedDataDict(
         {

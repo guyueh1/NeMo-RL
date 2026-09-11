@@ -271,6 +271,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         sequence_length_pad_multiple: int = 1,
         only_unmask_final: bool = False,
         loss_mask_mode: str | None = None,
+        pack_shuffle_seed: int | None = None,
     ) -> None:
         super().__init__(cooker_functions=cooker_functions)
         self.adapter = adapter
@@ -280,6 +281,7 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
         self.sequence_length_pad_multiple = sequence_length_pad_multiple
         self.only_unmask_final = only_unmask_final
         self.loss_mask_mode = loss_mask_mode
+        self.pack_shuffle_seed = pack_shuffle_seed
 
     @stateless
     def preencode_sample(self, sample: CanonicalSFTSample) -> EncodedSFTSample:
@@ -305,7 +307,10 @@ class GenericSFTTaskEncoder(BaseSFTTaskEncoder):
             packer=self.packer,
             sequence_length_pad_multiple=self.sequence_length_pad_multiple,
         )
-        random.shuffle(packs)
+        if self.pack_shuffle_seed is None:
+            random.shuffle(packs)
+        else:
+            random.Random(self.pack_shuffle_seed).shuffle(packs)
         return packs
 
     @stateless

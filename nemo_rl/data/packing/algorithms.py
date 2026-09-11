@@ -345,35 +345,35 @@ class BalancedGreedyKnapsackPacker(SequencePacker):
         self.balanced_knapsack_delta = balanced_knapsack_delta
 
     def _pack_implementation(self, sequence_lengths: List[int]) -> List[List[int]]:
-        self._validate_sequence_lengths(sequence_lengths)
         if not sequence_lengths:
             return []
-        count = math.ceil(sum(sequence_lengths) / self.bin_capacity)
-        bins: List[List[int]] = [
-            [] for _ in range(count + self.balanced_knapsack_delta)
-        ]
-        loads = [0] * len(bins)
-        for index in sorted(
-            range(len(sequence_lengths)),
-            key=sequence_lengths.__getitem__,
+        indexed_lengths = sorted(
+            ((length, index) for index, length in enumerate(sequence_lengths)),
+            key=lambda item: item[0],
             reverse=True,
-        ):
-            candidates = [
-                i
-                for i, load in enumerate(loads)
-                if load + sequence_lengths[index] <= self.bin_capacity
-                and (
-                    self.max_sequences_per_bin is None
-                    or len(bins[i]) < self.max_sequences_per_bin
-                )
-            ]
-            if not candidates:
+        )
+        count = math.ceil(sum(sequence_lengths) / self.bin_capacity)
+        bins: List[List[int]] = [[] for _ in range(count + self.balanced_knapsack_delta)]
+        loads = [0] * len(bins)
+        bin_index = 0
+        sample_index = 0
+        while sample_index < len(indexed_lengths):
+            length, original_index = indexed_lengths[sample_index]
+            if length > self.bin_capacity:
+                sample_index += 1
+                continue
+            has_sequence_room = (
+                self.max_sequences_per_bin is None
+                or len(bins[bin_index]) < self.max_sequences_per_bin
+            )
+            if loads[bin_index] + length <= self.bin_capacity and has_sequence_room:
+                bins[bin_index].append(original_index)
+                loads[bin_index] += length
+                sample_index += 1
+            else:
                 bins.append([])
                 loads.append(0)
-                candidates = [len(bins) - 1]
-            target = min(candidates, key=loads.__getitem__)
-            bins[target].append(index)
-            loads[target] += sequence_lengths[index]
+            bin_index = loads.index(min(loads))
         return [bin_indexes for bin_indexes in bins if bin_indexes]
 
 
@@ -759,6 +759,7 @@ def get_packer(
     min_bin_count: Optional[int] = None,
     bin_count_multiple: Optional[int] = None,
     max_sequences_per_bin: Optional[int] = None,
+    balanced_knapsack_delta: int = 0,
 ) -> SequencePacker:
     """Factory function to get a sequence packer based on the algorithm.
 
@@ -772,6 +773,8 @@ def get_packer(
         bin_count_multiple: The total number of bins must be a multiple of this value.
                            If None, no multiple constraint is enforced.
         max_sequences_per_bin: Optional cap on atomic items per bin.
+        balanced_knapsack_delta: Extra empty bins to start with for balanced
+            greedy knapsack packing. Ignored by other packers.
 
     Returns:
         A SequencePacker instance for the specified algorithm.
@@ -806,10 +809,12 @@ def get_packer(
             f"Available algorithms: {available_algorithms}"
         )
 
-    return packers[algorithm](
-        bin_capacity,
-        collect_metrics=collect_metrics,
-        min_bin_count=min_bin_count,
-        bin_count_multiple=bin_count_multiple,
-        max_sequences_per_bin=max_sequences_per_bin,
-    )
+    kwargs = {
+        "collect_metrics": collect_metrics,
+        "min_bin_count": min_bin_count,
+        "bin_count_multiple": bin_count_multiple,
+        "max_sequences_per_bin": max_sequences_per_bin,
+    }
+    if algorithm == PackingAlgorithm.BALANCED_GREEDY_KNAPSACK:
+        kwargs["balanced_knapsack_delta"] = balanced_knapsack_delta
+    return packers[algorithm](bin_capacity, **kwargs)

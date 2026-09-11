@@ -1403,24 +1403,12 @@ class _NemotronVisualProcessorAdapter:
         inputs_by_message: defaultdict[int, defaultdict[str, list[PackedTensor]]] = (
             defaultdict(lambda: defaultdict(list))
         )
-        visual_occurrences: list[tuple[int, tuple[int, ...]]] = []
         for plan in visual_plans:
             ref = pending_sample.media[plan.media_index]
             media_inputs, _ = self._process_media(ref, plan, pending_sample)
             for key, value in media_inputs.items():
                 inputs_by_message[plan.message_index][key].append(value)
-            visual_occurrences.append((plan.message_index, plan.embedding_widths))
 
-        # Expansion is driven by the saved plan alone, exactly as apply_params()
-        # is in the Megatron reference, so the expanded width cannot drift from
-        # the packing cost predicted for it.
-        image_token_id = _token_id(self.processor.tokenizer, "<image>")
-        _expand_visual_placeholders(
-            message_log,
-            visual_occurrences,
-            image_token_id=image_token_id,
-        )
-        expanded_length = sum(len(message["token_ids"]) for message in message_log)
         for message_index, keyed_inputs in inputs_by_message.items():
             message_log[message_index].update(
                 {
@@ -1431,7 +1419,7 @@ class _NemotronVisualProcessorAdapter:
         return sample.__class__.derive_from(
             sample,
             message_log=message_log,
-            length=expanded_length,
+            length=sample.length,
             packing_cost=sample.packing_cost,
             loss_multiplier=sample.loss_multiplier,
             group_key=sample.group_key,

@@ -54,6 +54,7 @@ class EnergonTaskEncoderOptions(BaseModel, extra="forbid"):
     audio_clip_duration_seconds: Annotated[float, Field(gt=0)] = 30.0
     min_audio_duration_seconds: Annotated[float, Field(gt=0)] = 0.1
     max_audio_duration_seconds: Annotated[float, Field(gt=0)] = 1800.0
+    pack_shuffle_seed: int | None = None
 
     @model_validator(mode="after")
     def _validate_audio_settings(self) -> "EnergonTaskEncoderOptions":
