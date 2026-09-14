@@ -134,6 +134,7 @@ def _fake_worker(mtp_num_layers):
     """A minimal stand-in for MegatronPolicyWorkerImpl for calling _collect_mtp_metrics."""
     model_config = SimpleNamespace(mtp_num_layers=mtp_num_layers)
     return SimpleNamespace(
+        mtp_enabled=mtp_num_layers > 0,
         model=SimpleNamespace(config=model_config),
         _get_model_config=lambda: model_config,
     )
