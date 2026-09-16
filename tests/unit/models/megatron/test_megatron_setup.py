@@ -3998,6 +3998,7 @@ def _assert_fp32_wrapped(output_layer: _FakeOutputLayer) -> None:
     assert output_layer.seen_dtypes == [(torch.float32, torch.float32)]
 
 
+@pytest.mark.mcore
 def test_apply_fp32_lm_head_wraps_plain_last_stage_chunk():
     from nemo_rl.models.megatron.setup import apply_fp32_lm_head
 
@@ -4010,6 +4011,7 @@ def test_apply_fp32_lm_head_wraps_plain_last_stage_chunk():
     _assert_fp32_wrapped(layer)
 
 
+@pytest.mark.mcore
 def test_apply_fp32_lm_head_tf32_path_produces_fp32_output():
     from nemo_rl.models.megatron.setup import apply_fp32_lm_head
 
@@ -4022,6 +4024,7 @@ def test_apply_fp32_lm_head_tf32_path_produces_fp32_output():
     _assert_fp32_wrapped(layer)
 
 
+@pytest.mark.mcore
 def test_apply_fp32_lm_head_is_idempotent():
     from nemo_rl.models.megatron.setup import apply_fp32_lm_head
 
@@ -4065,6 +4068,7 @@ def test_apply_fp32_lm_head_is_idempotent():
     ],
     ids=["vl_llava", "vl_language_model", "omni_thinker"],
 )
+@pytest.mark.mcore
 def test_apply_fp32_lm_head_resolves_nested_language_model(build):
     from nemo_rl.models.megatron.setup import apply_fp32_lm_head
 
@@ -4074,6 +4078,7 @@ def test_apply_fp32_lm_head_resolves_nested_language_model(build):
     _assert_fp32_wrapped(layer)
 
 
+@pytest.mark.mcore
 def test_apply_fp32_lm_head_raises_when_post_process_chunk_has_no_output_layer():
     from nemo_rl.models.megatron.setup import apply_fp32_lm_head
 
@@ -4085,6 +4090,7 @@ def test_apply_fp32_lm_head_raises_when_post_process_chunk_has_no_output_layer()
         apply_fp32_lm_head([chunk])
 
 
+@pytest.mark.mcore
 def test_apply_fp32_lm_head_skips_non_last_pipeline_stage():
     from nemo_rl.models.megatron.setup import apply_fp32_lm_head
 
