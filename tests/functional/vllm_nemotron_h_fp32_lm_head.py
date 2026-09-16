@@ -69,7 +69,7 @@ def main() -> None:
 
     tokenizer = get_tokenizer(config["tokenizer"])
     config = configure_generation_config(config, tokenizer, is_eval=True)
-    with tempfile.TemporaryDirectory(prefix="nrl-ray-") as ray_log_dir:
+    with tempfile.TemporaryDirectory(prefix="nrl-ray-", dir="/tmp") as ray_log_dir:
         init_ray(log_dir=ray_log_dir)
         cluster = RayVirtualCluster(
             bundle_ct_per_node_list=[1],
