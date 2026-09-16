@@ -57,6 +57,7 @@ except ImportError:
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
     VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+    VllmSpecificArgs,
     vllm_nemotron_h_fp32_lm_head_enabled,
 )
 
@@ -223,6 +224,7 @@ def validate_fp32_lm_head_config(
     vllm_cfg = generation_config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    vllm_cfg = cast(VllmSpecificArgs | dict[str, Any], vllm_cfg)
 
     env_vars = vllm_cfg.get("env_vars") or {}
     if VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR in env_vars:

@@ -929,9 +929,8 @@ def _apply_vllm_patches(
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
-    if (
-        nemotron_h_fp32_lm_head_enabled
-        and not _patch_vllm_nemotron_h_fp32_lm_head(patch_logger)
+    if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
+        patch_logger
     ):
         raise RuntimeError(
             "vllm_cfg.fp32_lm_head is enabled, but that flag currently maps to "
