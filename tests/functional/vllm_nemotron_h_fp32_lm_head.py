@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+import tempfile
 
 import ray
 
@@ -69,30 +69,31 @@ def main() -> None:
 
     tokenizer = get_tokenizer(config["tokenizer"])
     config = configure_generation_config(config, tokenizer, is_eval=True)
-    init_ray(log_dir=os.environ.get("RAY_TMPDIR"))
-    cluster = RayVirtualCluster(
-        bundle_ct_per_node_list=[1],
-        use_gpus=True,
-        max_colocated_worker_groups=1,
-        num_gpus_per_node=1,
-        name="vllm-nemotron-h-fp32-lm-head-functional",
-    )
-    vllm_generation = None
-    try:
-        vllm_generation = VllmGeneration(cluster, config)
-        output = vllm_generation.generate_text(
-            BatchedDataDict({"prompts": ["The capital of France is"]}),
-            greedy=True,
+    with tempfile.TemporaryDirectory(prefix="nrl-ray-") as ray_log_dir:
+        init_ray(log_dir=ray_log_dir)
+        cluster = RayVirtualCluster(
+            bundle_ct_per_node_list=[1],
+            use_gpus=True,
+            max_colocated_worker_groups=1,
+            num_gpus_per_node=1,
+            name="vllm-nemotron-h-fp32-lm-head-functional",
         )
-        texts = output["texts"]
-        assert len(texts) == 1
-        assert texts[0], "Nemotron-H vLLM generation returned an empty string"
-        print(f"[PASS] Nemotron-H fp32 lm_head generated text: {texts[0]!r}")
-    finally:
-        if vllm_generation is not None:
-            vllm_generation.shutdown()
-        cluster.shutdown()
-        ray.shutdown()
+        vllm_generation = None
+        try:
+            vllm_generation = VllmGeneration(cluster, config)
+            output = vllm_generation.generate_text(
+                BatchedDataDict({"prompts": ["The capital of France is"]}),
+                greedy=True,
+            )
+            texts = output["texts"]
+            assert len(texts) == 1
+            assert texts[0], "Nemotron-H vLLM generation returned an empty string"
+            print(f"[PASS] Nemotron-H fp32 lm_head generated text: {texts[0]!r}")
+        finally:
+            if vllm_generation is not None:
+                vllm_generation.shutdown()
+            cluster.shutdown()
+            ray.shutdown()
 
 
 if __name__ == "__main__":
