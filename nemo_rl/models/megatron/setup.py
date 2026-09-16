@@ -75,18 +75,14 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_FP32_LM_HEAD_ENV_VAR,
+    vllm_fp32_lm_head_enabled,
+)
 
 _HF_CONFIG_PATCHED = False
 
 _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
-_VLLM_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
-
-
-def _vllm_fp32_lm_head_enabled(vllm_cfg: Mapping[str, Any]) -> bool:
-    if vllm_cfg.get("fp32_lm_head"):
-        return True
-    env_vars = vllm_cfg.get("env_vars")
-    return env_vars is not None and str(env_vars.get(_VLLM_FP32_LM_HEAD_ENV_VAR)) == "1"
 
 
 def _patch_hf_config_double_instantiation():
@@ -626,15 +622,15 @@ def validate_fp32_lm_head_config(config: PolicyConfig) -> None:
     vllm_cfg = generation.get("vllm_cfg") or {}
     env_vars = vllm_cfg.get("env_vars")
     vllm_env_value = (
-        None if env_vars is None else env_vars.get(_VLLM_FP32_LM_HEAD_ENV_VAR)
+        None if env_vars is None else env_vars.get(VLLM_FP32_LM_HEAD_ENV_VAR)
     )
-    vllm_fp32 = _vllm_fp32_lm_head_enabled(vllm_cfg)
+    vllm_fp32 = vllm_fp32_lm_head_enabled(vllm_cfg)
     if trainer_fp32 != vllm_fp32:
         raise ValueError(
             "fp32 LM head must be enabled on both engines or neither: "
             f"megatron_cfg.fp32_lm_head={megatron_cfg.get('fp32_lm_head')!r} but "
             f"generation.vllm_cfg.fp32_lm_head={vllm_cfg.get('fp32_lm_head')!r} "
-            f"({_VLLM_FP32_LM_HEAD_ENV_VAR}={vllm_env_value!r}). "
+            f"({VLLM_FP32_LM_HEAD_ENV_VAR}={vllm_env_value!r}). "
             "A one-sided fp32 head "
             "increases the generation/training logprob mismatch instead of "
             "reducing it."
@@ -680,10 +676,10 @@ def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
     standalone forward.
 
     With ``use_tf32`` (megatron_cfg.fp32_lm_head: "tf32"), the fp32 head GEMM
-    runs with TF32 tensor cores. The inputs are exact bf16 values, so TF32's
-    10-bit input rounding loses nothing; accumulation and output stay fp32.
-    Numerically equivalent to full fp32 here, at near-bf16 tensor-core
-    throughput.
+    allows CUDA matmul to use TF32 tensor cores where available. The operands
+    originate as bf16 values, so TF32 preserves the input values while keeping
+    fp32 accumulation/output, but exact throughput and tolerance should be
+    validated on the target workload.
     """
     if not isinstance(model_chunks, (list, tuple)):
         model_chunks = [model_chunks]
