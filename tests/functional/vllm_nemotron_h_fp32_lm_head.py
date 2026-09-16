@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
+import ray
+
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
@@ -65,6 +69,7 @@ def main() -> None:
 
     tokenizer = get_tokenizer(config["tokenizer"])
     config = configure_generation_config(config, tokenizer, is_eval=True)
+    init_ray(log_dir=os.environ.get("RAY_TMPDIR"))
     cluster = RayVirtualCluster(
         bundle_ct_per_node_list=[1],
         use_gpus=True,
@@ -87,6 +92,7 @@ def main() -> None:
         if vllm_generation is not None:
             vllm_generation.shutdown()
         cluster.shutdown()
+        ray.shutdown()
 
 
 if __name__ == "__main__":
