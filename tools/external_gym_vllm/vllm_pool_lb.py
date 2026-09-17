@@ -72,6 +72,18 @@ log = logging.getLogger("vllm_pool_lb")
 # one until the next health probe clears it.
 RETRYABLE_UPSTREAM_STATUSES = {500, 502, 503, 504}
 
+# vLLM can stop passing its normal health probe while generation is paused.
+# Refit control requests must still reach a registered backend so it can reload
+# weights and resume. The rollout preflight currently requires exactly one
+# independent backend, so routing these paths to any registered backend is
+# unambiguous (native TP/PP/DP workers remain behind that one backend).
+REFIT_CONTROL_PATHS = {
+    "/pause",
+    "/collective_rpc",
+    "/reset_prefix_cache",
+    "/resume",
+}
+
 
 def _read_current_rss_mb() -> float | None:
     """Read the process's current resident memory from procfs."""
@@ -212,39 +224,47 @@ class BackendPool:
             await asyncio.sleep(self.health_interval)
 
     def pick(
-        self, exclude: set[str] | None = None, affinity_key: str | None = None
+        self,
+        exclude: set[str] | None = None,
+        affinity_key: str | None = None,
+        *,
+        allow_unhealthy: bool = False,
     ) -> Backend | None:
-        """Pick a healthy backend.
+        """Pick an eligible backend.
 
         If affinity_key is set, use consistent hashing to prefer the same backend
         for requests with the same prefix (enables vLLM prefix caching).
         Falls back to least-outstanding-requests if the preferred backend is
-        excluded or unhealthy.
+        excluded or unhealthy. ``allow_unhealthy`` is reserved for refit control
+        requests that must reach a backend while vLLM generation is paused.
         """
         exclude = exclude or set()
-        healthy = [
-            b for b in self.backends.values() if b.healthy and b.job_id not in exclude
+        eligible = [
+            b
+            for b in self.backends.values()
+            if (allow_unhealthy or b.healthy) and b.job_id not in exclude
         ]
-        if not healthy:
+        if not eligible:
             return None
 
-        if affinity_key and len(healthy) > 1:
+        if affinity_key and len(eligible) > 1:
             # Consistent hash: sort by hash(affinity_key + job_id) to get a
             # stable preference order. Pick the first one (preferred), but if
             # it's heavily loaded compared to the least-loaded, fall back.
             h = hashlib.md5(affinity_key.encode()).hexdigest()
             ranked = sorted(
-                healthy, key=lambda b: hashlib.md5((h + b.job_id).encode()).hexdigest()
+                eligible,
+                key=lambda b: hashlib.md5((h + b.job_id).encode()).hexdigest(),
             )
             preferred = ranked[0]
-            least_loaded = min(healthy, key=lambda b: b.inflight)
+            least_loaded = min(eligible, key=lambda b: b.inflight)
             # Use preferred backend unless it has 2x+ more inflight than the
             # least loaded — avoids hotspots when one prefix dominates.
             if preferred.inflight <= least_loaded.inflight * 2 + 10:
                 return preferred
             return least_loaded
 
-        return min(healthy, key=lambda b: b.inflight)
+        return min(eligible, key=lambda b: b.inflight)
 
     def summary(self) -> list[dict[str, str | bool | int]]:
         return [
@@ -419,6 +439,8 @@ class LoadBalancer:
         affinity_key = (
             self._extract_affinity_key(body) if request.method == "POST" else None
         )
+        request_path = request.path_qs.partition("?")[0]
+        allow_unhealthy = request_path in REFIT_CONTROL_PATHS
 
         tried: set[str] = set()
         last_error: Exception | None = None
@@ -431,7 +453,11 @@ class LoadBalancer:
         # of a wedged backend.
         MAX_RETRIES = 5
         for attempt in range(1, MAX_RETRIES + 1):
-            backend = self.pool.pick(exclude=tried, affinity_key=affinity_key)
+            backend = self.pool.pick(
+                exclude=tried,
+                affinity_key=affinity_key,
+                allow_unhealthy=allow_unhealthy,
+            )
             if backend is None:
                 log.warning(
                     "[proxy %s %s] no more healthy untried backends after %d attempt(s); giving up",

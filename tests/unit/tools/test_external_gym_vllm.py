@@ -329,6 +329,34 @@ async def test_proxy_returns_503_when_no_backend_is_available():
 
 
 @pytest.mark.asyncio
+async def test_refit_control_request_reaches_registered_backend_while_unhealthy():
+    pool = BackendPool("/tmp", "test")
+    paused = Backend("paused", "10.0.0.1", 8000)
+    paused.healthy = False
+    pool.backends = {paused.job_id: paused}
+    load_balancer = LoadBalancer(pool, 9213)
+    expected_response = web.Response(status=200, body=b"ok")
+    load_balancer._proxy_once = AsyncMock(return_value=expected_response)
+    request = MagicMock(spec=web.Request)
+    request.read = AsyncMock(return_value=b'{"method": "reload_weights"}')
+    request.method = "POST"
+    request.path_qs = "/collective_rpc"
+    request.headers = {}
+
+    response = await load_balancer.handle_proxy(request)
+
+    assert response is expected_response
+    load_balancer._proxy_once.assert_awaited_once_with(
+        paused,
+        "POST",
+        "/collective_rpc",
+        {},
+        b'{"method": "reload_weights"}',
+        request,
+    )
+
+
+@pytest.mark.asyncio
 async def test_health_reports_backend_counts():
     pool = BackendPool("/tmp", "test")
     healthy = Backend("healthy", "10.0.0.1", 8000)

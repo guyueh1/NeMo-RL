@@ -19,6 +19,25 @@
 
 set -euo pipefail
 
+# Some HSG-Park compute-node batch environments omit the site Slurm directory
+# from PATH even though the clients are installed under /cm/local/apps/slurm.
+# Discover it before the first scontrol/srun call and export it to ray.sub.
+if ! command -v scontrol >/dev/null 2>&1 || ! command -v srun >/dev/null 2>&1; then
+  for slurm_bin_dir in /cm/local/apps/slurm/*/bin; do
+    if [[ -x "${slurm_bin_dir}/scontrol" && -x "${slurm_bin_dir}/srun" ]]; then
+      export PATH="${slurm_bin_dir}:${PATH}"
+      break
+    fi
+  done
+fi
+for slurm_command in scontrol srun; do
+  if ! command -v "${slurm_command}" >/dev/null 2>&1; then
+    echo "[FATAL] ${slurm_command} is not available in the batch environment" >&2
+    exit 1
+  fi
+done
+unset slurm_bin_dir slurm_command
+
 : "${SLURM_JOB_ID:?This script must run inside a Slurm allocation}"
 : "${SLURM_HET_SIZE:?This script requires a Slurm heterogeneous job}"
 : "${SLURM_JOB_NODELIST_HET_GROUP_0:?Hetgroup 0 nodelist is required}"
