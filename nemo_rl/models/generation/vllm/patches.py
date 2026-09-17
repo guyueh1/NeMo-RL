@@ -655,11 +655,6 @@ from torch import nn"""
 
 import torch
 from torch import nn"""
-    functional_import_snippet = """import os
-
-import torch
-import torch.nn.functional as F
-from torch import nn"""
     new_import_snippet = old_fp32_import_snippet
     old_lm_head_snippet = """        self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -667,24 +662,6 @@ from torch import nn"""
             quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )"""
-    previous_lm_head_snippet = f"""        self._nrl_fp32_lm_head = (
-            os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1"
-        )
-        if self._nrl_fp32_lm_head:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                params_dtype=torch.float32,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )"""
     new_lm_head_snippet = f"""        self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -736,68 +713,15 @@ from torch import nn"""
             self.lm_head.quant_method.apply = _nrl_fp32_lm_head_apply"""
     old_snippet = """        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits"""
-    previous_compute_logits_snippet = """        if self._nrl_fp32_lm_head:
-            hidden_states = hidden_states.to(dtype=torch.float32)
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits"""
-    # Worker environments can persist across launches. Migrate an installed
-    # source file that still contains the previous lazy-deepcopy patch.
-    legacy_snippet = f"""        import os as _os
-
-        if _os.environ.get("{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR}", "0") == "1":
-            # NeMo-RL patch: fp32 LM head (MiniMax-M1-style). bf16 rounding of
-            # the logits is the dominant gen/train logprob mismatch source.
-            _fp32_head = getattr(self, "_nrl_lm_head_fp32", None)
-            if _fp32_head is None and not torch.cuda.is_current_stream_capturing():
-                # Skipped under graph capture: an allocation there lives in the
-                # graph's memory pool and is not valid for later eager replays.
-                # Capture output is discarded anyway, so bf16 is fine for it.
-                import copy as _copy
-
-                _fp32_head = _copy.deepcopy(self.lm_head).float()
-                # object.__setattr__ bypasses nn.Module.__setattr__: registering
-                # this as a submodule would add a vocab-sized parameter to
-                # named_parameters(), which the refit weight mapping is built from.
-                object.__setattr__(self, "_nrl_lm_head_fp32", _fp32_head)
-                self._nrl_lm_head_fp32_dirty = False
-                print(
-                    "[fp32_lm_head] built fp32 head in forward shape=%s"
-                    % (tuple(_fp32_head.weight.shape),),
-                    flush=True,
-                )
-            elif _fp32_head is not None and getattr(
-                self, "_nrl_lm_head_fp32_dirty", False
-            ):
-                # Refreshed in place: replacing the module would leave any
-                # captured CUDA graph pointing at the old storage.
-                _fp32_head.weight.data.copy_(self.lm_head.weight)
-                if getattr(_fp32_head, "bias", None) is not None:
-                    _fp32_head.bias.data.copy_(self.lm_head.bias)
-                self._nrl_lm_head_fp32_dirty = False
-                print("[fp32_lm_head] refreshed cached head in forward", flush=True)
-            if _fp32_head is not None:
-                return self.logits_processor(_fp32_head, hidden_states.float())
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits"""
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if (
             new_import_snippet in content
             and new_lm_head_snippet in content
             and new_logits_processor_snippet in content
-            and previous_compute_logits_snippet not in content
         ):
             logger.info("NemotronH fp32 LM head patch already present.")
             return True
-
-        if legacy_snippet in content:
-            content = content.replace(legacy_snippet, old_snippet, 1)
-        if previous_compute_logits_snippet in content:
-            content = content.replace(previous_compute_logits_snippet, old_snippet, 1)
-        if previous_lm_head_snippet in content:
-            content = content.replace(previous_lm_head_snippet, old_lm_head_snippet, 1)
-        if functional_import_snippet in content:
-            content = content.replace(functional_import_snippet, new_import_snippet, 1)
 
         if new_import_snippet not in content:
             if old_fp32_import_snippet in content:
