@@ -375,6 +375,23 @@ def test_nemotron_h_fp32_lm_head_patch_is_idempotent(
     assert patched_nemotron_h_source.read_text() == before
 
 
+def test_nemotron_h_fp32_lm_head_patch_warns_on_unknown_source(
+    tmp_path, monkeypatch, caplog
+):
+    source = tmp_path / "nemotron_h.py"
+    source.write_text("class NemotronHForCausalLM:\n    pass\n")
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+
+    with caplog.at_level(logging.WARNING):
+        applied = patches._patch_vllm_nemotron_h_fp32_lm_head(
+            logging.getLogger(__name__)
+        )
+
+    assert applied is False
+    assert source.read_text() == "class NemotronHForCausalLM:\n    pass\n"
+    assert "NemotronH fp32 LM head import anchor not found exactly once" in caplog.text
+
+
 @pytest.mark.vllm
 def test_nemotron_h_fp32_lm_head_patch_anchor_still_matches_installed_vllm(
     tmp_path, monkeypatch
