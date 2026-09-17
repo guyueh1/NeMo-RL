@@ -375,6 +375,26 @@ def test_nemotron_h_fp32_lm_head_patch_is_idempotent(
     assert patched_nemotron_h_source.read_text() == before
 
 
+@pytest.mark.vllm
+def test_nemotron_h_fp32_lm_head_patch_anchor_still_matches_installed_vllm(
+    tmp_path, monkeypatch
+):
+    """Pin the vLLM 0.25.1 Nemotron-H source shape used by the patch."""
+    copied = tmp_path / "nemotron_h.py"
+    with open(patches._get_vllm_file("model_executor/models/nemotron_h.py")) as f:
+        copied.write_text(f.read())
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+
+    applied = patches._patch_vllm_nemotron_h_fp32_lm_head(logging.getLogger(__name__))
+
+    assert applied is True
+    content = copied.read_text()
+    assert "self._nrl_fp32_lm_head = (" in content
+    assert "def _nrl_fp32_lm_head_forward(" in content
+    assert content.index("import os\n") < content.index("import torch\n")
+    ast.parse(content)
+
+
 def _install_fake_vllm_modules(monkeypatch):
     vllm_module = types.ModuleType("vllm")
     envs_module = types.ModuleType("vllm.envs")
@@ -450,6 +470,20 @@ def test_apply_vllm_patches_ignores_ambient_fp32_lm_head_env_toggle(monkeypatch)
     assert fp32_patch_calls == []
     assert patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR not in os.environ
     assert captured_extra_env_vars == [None]
+
+
+def test_apply_vllm_patches_raises_when_nemotron_h_fp32_lm_head_patch_fails(
+    monkeypatch,
+):
+    _install_fake_vllm_modules(monkeypatch)
+    monkeypatch.delenv(patches.VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, raising=False)
+    _stub_non_fp32_vllm_patches(monkeypatch, [])
+    monkeypatch.setattr(
+        patches, "_patch_vllm_nemotron_h_fp32_lm_head", lambda _logger: False
+    )
+
+    with pytest.raises(RuntimeError, match="could not be applied"):
+        patches._apply_vllm_patches("py", nemotron_h_fp32_lm_head=True)
 
 
 @pytest.mark.parametrize(

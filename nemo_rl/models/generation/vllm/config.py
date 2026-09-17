@@ -29,10 +29,6 @@ VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
 VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
 VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
-# Backward-compatible alias for already-patched workers and older imports. The
-# value stays unchanged because it is internal patch plumbing, not a user-facing
-# configuration surface.
-VLLM_FP32_LM_HEAD_ENV_VAR = VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR
 REFITTABLE_FP8_KV_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
 
 

@@ -1176,6 +1176,37 @@ class TestApplyPrecisionConfig:
             _apply_precision_config(model_cfg, config, torch.float32)
             assert model_cfg.pipeline_dtype == expected_dtype
 
+    def test_fp32_lm_head_sets_logit_dtype(self):
+        """The fp32 LM-head knob maps to Megatron-Bridge provider logit_dtype."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False, logit_dtype=None)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp32_lm_head": True,
+            }
+        }
+
+        _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+        assert model_cfg.logit_dtype is torch.float32
+
+    def test_fp32_lm_head_requires_provider_logit_dtype(self):
+        """Fail loudly when the Bridge provider cannot emit fp32 logits."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "fp32_lm_head": True,
+            }
+        }
+
+        with pytest.raises(ValueError, match="logit_dtype"):
+            _apply_precision_config(model_cfg, config, torch.bfloat16)
+
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     def test_loads_te_precision_config_when_configured(
         self, mock_load_recipe, tmp_path
@@ -3970,132 +4001,6 @@ class TestDraftSetup:
             restored_chunk.draft_model.weight,
             owner_chunk.draft_model.weight,
         )
-
-
-# ---------------------------------------------------------------------------
-# apply_fp32_lm_head: output_layer resolution through multimodal wrappers
-# ---------------------------------------------------------------------------
-
-
-class _FakeOutputLayer(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.ones(4, 2, dtype=torch.bfloat16), requires_grad=False
-        )
-        self.seen_dtypes: list[tuple[torch.dtype, torch.dtype]] = []
-
-    def forward(self, input_, *args, weight=None, **kwargs):
-        w = weight if weight is not None else self.weight
-        self.seen_dtypes.append((input_.dtype, w.dtype))
-        return input_ @ w.t()
-
-
-def _assert_fp32_wrapped(output_layer: _FakeOutputLayer) -> None:
-    assert getattr(output_layer.forward, "_nrl_fp32_lm_head_patched") is True
-    out = output_layer.forward(torch.ones(3, 2, dtype=torch.bfloat16))
-    assert out.dtype == torch.float32
-    assert output_layer.seen_dtypes == [(torch.float32, torch.float32)]
-
-
-@pytest.mark.mcore
-def test_apply_fp32_lm_head_wraps_plain_last_stage_chunk():
-    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
-
-    # Float16Module/DDP-style `.module` nesting around a GPTModel-like chunk.
-    layer = _FakeOutputLayer()
-    chunk = SimpleNamespace(
-        module=SimpleNamespace(output_layer=layer, post_process=True)
-    )
-    apply_fp32_lm_head([chunk])
-    _assert_fp32_wrapped(layer)
-
-
-@pytest.mark.mcore
-def test_apply_fp32_lm_head_tf32_path_produces_fp32_output():
-    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
-
-    layer = _FakeOutputLayer()
-    chunk = SimpleNamespace(
-        module=SimpleNamespace(output_layer=layer, post_process=True)
-    )
-    apply_fp32_lm_head([chunk], use_tf32=True)
-    assert getattr(layer.forward, "_nrl_fp32_lm_head_use_tf32") is True
-    _assert_fp32_wrapped(layer)
-
-
-@pytest.mark.mcore
-def test_apply_fp32_lm_head_is_idempotent():
-    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
-
-    layer = _FakeOutputLayer()
-    chunk = SimpleNamespace(
-        module=SimpleNamespace(output_layer=layer, post_process=True)
-    )
-    apply_fp32_lm_head([chunk])
-    first_forward = layer.forward
-
-    apply_fp32_lm_head([chunk])
-
-    assert layer.forward is first_forward
-    assert getattr(layer.forward, "_nrl_fp32_lm_head_use_tf32") is False
-    _assert_fp32_wrapped(layer)
-
-
-@pytest.mark.parametrize(
-    "build",
-    [
-        # NemotronVLModel with an LLaVA wrapper: .llava_model.language_model
-        lambda layer: SimpleNamespace(
-            post_process=True,
-            llava_model=SimpleNamespace(
-                language_model=SimpleNamespace(output_layer=layer, post_process=True)
-            ),
-        ),
-        # NemotronVLModel without LLaVA: .language_model
-        lambda layer: SimpleNamespace(
-            post_process=True,
-            llava_model=None,
-            language_model=SimpleNamespace(output_layer=layer, post_process=True),
-        ),
-        # NemotronOmniModel: .thinker.language_model
-        lambda layer: SimpleNamespace(
-            post_process=True,
-            thinker=SimpleNamespace(
-                language_model=SimpleNamespace(output_layer=layer, post_process=True)
-            ),
-        ),
-    ],
-    ids=["vl_llava", "vl_language_model", "omni_thinker"],
-)
-@pytest.mark.mcore
-def test_apply_fp32_lm_head_resolves_nested_language_model(build):
-    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
-
-    layer = _FakeOutputLayer()
-    chunk = SimpleNamespace(module=build(layer))
-    apply_fp32_lm_head([chunk])
-    _assert_fp32_wrapped(layer)
-
-
-@pytest.mark.mcore
-def test_apply_fp32_lm_head_raises_when_post_process_chunk_has_no_output_layer():
-    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
-
-    # A post_process chunk with no reachable output_layer must not be mistaken
-    # for a non-last pipeline stage: that leaves the trainer in bf16 while
-    # generation runs fp32.
-    chunk = SimpleNamespace(module=SimpleNamespace(post_process=True))
-    with pytest.raises(ValueError, match="no output_layer was found"):
-        apply_fp32_lm_head([chunk])
-
-
-@pytest.mark.mcore
-def test_apply_fp32_lm_head_skips_non_last_pipeline_stage():
-    from nemo_rl.models.megatron.setup import apply_fp32_lm_head
-
-    chunk = SimpleNamespace(module=SimpleNamespace(post_process=False))
-    apply_fp32_lm_head([chunk])  # no output_layer, not post_process: no-op
 
 
 @pytest.mark.mcore

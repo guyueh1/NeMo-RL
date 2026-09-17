@@ -175,6 +175,12 @@ def _is_nemotron_h_model_config(model_config: object) -> bool:
     return any(
         architecture in _NEMOTRON_H_ARCHITECTURES
         for architecture in _get_config_architectures(model_config)
+    ) or any(
+        _is_nemotron_h_model_config(inner)
+        for inner in (
+            getattr(model_config, attr, None) for attr in ("llm_config", "text_config")
+        )
+        if inner is not None
     )
 
 
@@ -194,17 +200,14 @@ def validate_fp32_lm_head_config(
     model_config: object | None = None,
 ) -> None:
     """Reject fp32 LM-head settings that the selected backends cannot match."""
-    generation_config = config.get("generation")
-    if generation_config is None:
-        return
-
-    generation_backend = generation_config["backend"]
     megatron_cfg = config.get("megatron_cfg")
     megatron_fp32_value = (
         megatron_cfg.get("fp32_lm_head")
         if megatron_enabled and megatron_cfg is not None
         else None
     )
+    if megatron_fp32_value not in (None, True, False):
+        raise ValueError("policy.megatron_cfg.fp32_lm_head must be true or false.")
     megatron_fp32 = bool(megatron_fp32_value)
 
     if (
@@ -218,6 +221,11 @@ def validate_fp32_lm_head_config(
             "output_layer). Disable one of them."
         )
 
+    generation_config = config.get("generation")
+    if generation_config is None:
+        return
+
+    generation_backend = generation_config["backend"]
     if generation_backend != "vllm":
         return
 

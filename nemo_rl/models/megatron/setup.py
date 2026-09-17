@@ -79,8 +79,6 @@ from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_c
 _HF_CONFIG_PATCHED = False
 
 _NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT = "expanded_sequence_v1"
-_FP32_LM_HEAD_PATCHED_ATTR = "_nrl_fp32_lm_head_patched"
-_FP32_LM_HEAD_USE_TF32_ATTR = "_nrl_fp32_lm_head_use_tf32"
 
 
 def _patch_hf_config_double_instantiation():
@@ -598,94 +596,6 @@ def _resolve_iter_dir_from_root(
     if not iter_subdirs:
         raise FileNotFoundError(not_found_msg)
     return os.path.join(path, iter_subdirs[-1])
-
-
-def _resolve_output_layer_owner(chunk: Any) -> Any:
-    """Return the module that owns ``output_layer`` for a Megatron model chunk."""
-    module = chunk
-    while hasattr(module, "module"):
-        module = module.module
-    for _ in range(4):
-        if getattr(module, "output_layer", None) is not None:
-            break
-        for attr in ("thinker", "llava_model", "language_model"):
-            inner = getattr(module, attr, None)
-            if inner is not None:
-                module = inner
-                break
-        else:
-            break
-    return module
-
-
-def apply_fp32_lm_head(model_chunks: list, use_tf32: bool = False) -> None:
-    """Run the LM output-layer GEMM in fp32 (MiniMax-M1-style, arXiv:2506.13585).
-
-    bf16 rounding of the logits (magnitude ~15-30, bf16 ulp 0.125-0.25) is the
-    dominant contributor to generation/training logprob mismatch
-    (train/token_mult_prob_error). Upcasting the head input and weight to fp32
-    removes that rounding. The casts are part of the autograd graph, so
-    training gradients flow to the bf16 weight through the fp32 cast.
-
-    Note: has no effect on the fused linear+CE path
-    (megatron_cfg.use_fused_linear_logprobs), which bypasses output_layer's
-    standalone forward.
-
-    With ``use_tf32`` (megatron_cfg.fp32_lm_head: "tf32"), the fp32 head GEMM
-    allows CUDA matmul to use TF32 tensor cores where available. The operands
-    originate as bf16 values, so TF32 preserves the input values while keeping
-    fp32 accumulation/output, but exact throughput and tolerance should be
-    validated on the target workload.
-    """
-    if not isinstance(model_chunks, (list, tuple)):
-        model_chunks = [model_chunks]
-    for chunk in model_chunks:
-        module = _resolve_output_layer_owner(chunk)
-        output_layer = getattr(module, "output_layer", None)
-        if output_layer is None:
-            # A post-process chunk should own the LM head; silently wrapping
-            # nothing leaves trainer/generator precision mismatched.
-            if getattr(module, "post_process", False) or getattr(
-                chunk, "post_process", False
-            ):
-                raise ValueError(
-                    "fp32_lm_head is enabled but no output_layer was found on a "
-                    f"post_process model chunk of type {type(module).__name__} "
-                    f"(chunk type {type(chunk).__name__}). The trainer would run "
-                    "the LM head in bf16 while generation runs fp32, which is "
-                    "worse than disabling both."
-                )
-            continue
-        if getattr(output_layer.forward, _FP32_LM_HEAD_PATCHED_ATTR, False):
-            continue
-        original_forward = output_layer.forward
-
-        def _fp32_forward(
-            input_,
-            *args,
-            weight=None,
-            _orig_forward=original_forward,
-            _layer=output_layer,
-            _tf32=use_tf32,
-            **kwargs,
-        ):
-            w = weight if weight is not None else _layer.weight
-            if not _tf32:
-                return _orig_forward(input_.float(), *args, weight=w.float(), **kwargs)
-            prev = torch.backends.cuda.matmul.allow_tf32
-            torch.backends.cuda.matmul.allow_tf32 = True
-            try:
-                return _orig_forward(input_.float(), *args, weight=w.float(), **kwargs)
-            finally:
-                torch.backends.cuda.matmul.allow_tf32 = prev
-
-        setattr(_fp32_forward, _FP32_LM_HEAD_PATCHED_ATTR, True)
-        setattr(_fp32_forward, _FP32_LM_HEAD_USE_TF32_ATTR, use_tf32)
-        output_layer.forward = _fp32_forward
-        print(
-            "[fp32_lm_head] output layer will compute logits in fp32"
-            + (" (tf32 tensor cores)" if use_tf32 else "")
-        )
 
 
 def _resolve_peft_restore_dir(restore_from: str) -> str:
@@ -1565,6 +1475,15 @@ def _apply_precision_config(
         "float16": torch.float16,
     }
     model_cfg.pipeline_dtype = dtype_map[config["megatron_cfg"]["pipeline_dtype"]]
+    if config["megatron_cfg"].get("fp32_lm_head"):
+        if not hasattr(model_cfg, "logit_dtype"):
+            raise ValueError(
+                "policy.megatron_cfg.fp32_lm_head requires a Megatron-Bridge "
+                "provider that exposes logit_dtype; "
+                f"{type(model_cfg).__name__} does not."
+            )
+        # Megatron-LM emits fp32 logits from a bf16 x bf16 tensor-core GEMM.
+        model_cfg.logit_dtype = torch.float32
 
     te_precision_config_file = config["megatron_cfg"].get("te_precision_config_file")
     if te_precision_config_file is not None:

@@ -232,10 +232,9 @@ def construct_policy_with_mocks(
         )
 
 
-@pytest.mark.parametrize("trainer_fp32", [True, "tf32"])
-def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head(trainer_fp32):
+def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head():
     config = create_megatron_config("test-model", tp=1)
-    config["megatron_cfg"]["fp32_lm_head"] = trainer_fp32
+    config["megatron_cfg"]["fp32_lm_head"] = True
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     policy = construct_policy_with_mocks(config)
@@ -259,10 +258,30 @@ def test_policy_warns_when_vllm_fp32_lm_head_model_is_not_nemotron_h():
     assert policy.worker_group is not None
 
 
+def test_policy_accepts_nested_nemotron_h_model_config():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    policy = construct_policy_with_mocks(
+        config,
+        model_config=SimpleNamespace(
+            architectures=["NemotronH_Nano_VL_V2"],
+            model_type="NemotronH_Nano_VL_V2",
+            llm_config=SimpleNamespace(
+                architectures=["NemotronHForCausalLM"],
+                model_type="nemotron_h",
+            ),
+        ),
+    )
+
+    assert policy.worker_group is not None
+
+
 @pytest.mark.parametrize(
     ("trainer_fp32", "vllm_fp32"),
     [
-        ("tf32", False),
+        (True, False),
         (False, True),
     ],
 )
@@ -333,7 +352,7 @@ def test_policy_rejects_fp32_lm_head_env_var_toggle():
 
 def test_policy_rejects_megatron_fp32_lm_head_with_fused_logprobs():
     config = create_megatron_config("test-model", tp=1)
-    config["megatron_cfg"]["fp32_lm_head"] = "tf32"
+    config["megatron_cfg"]["fp32_lm_head"] = True
     config["megatron_cfg"]["use_fused_linear_logprobs"] = True
     set_vllm_generation(config, {"fp32_lm_head": True})
 
@@ -350,9 +369,41 @@ def test_policy_rejects_megatron_fp32_lm_head_with_fused_logprobs():
     worker_group.assert_not_called()
 
 
-def test_policy_accepts_megatron_fp32_lm_head_with_megatron_generation():
+def test_validate_fp32_lm_head_rejects_fused_logprobs_without_generation():
+    from nemo_rl.models.policy.utils import validate_fp32_lm_head_config
+
+    config = create_megatron_config("test-model", tp=1)
+    del config["generation"]
+    config["megatron_cfg"]["fp32_lm_head"] = True
+    config["megatron_cfg"]["use_fused_linear_logprobs"] = True
+
+    with pytest.raises(ValueError, match="use_fused_linear_logprobs"):
+        validate_fp32_lm_head_config(
+            config, megatron_enabled=True, dtensor_enabled=False
+        )
+
+
+def test_policy_rejects_non_bool_megatron_fp32_lm_head():
     config = create_megatron_config("test-model", tp=1)
     config["megatron_cfg"]["fp32_lm_head"] = "tf32"
+    set_vllm_generation(config, {"fp32_lm_head": True})
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="true or false"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+def test_policy_accepts_megatron_fp32_lm_head_with_megatron_generation():
+    config = create_megatron_config("test-model", tp=1)
+    config["megatron_cfg"]["fp32_lm_head"] = True
     config["generation"]["backend"] = "megatron"
 
     policy = construct_policy_with_mocks(config)
