@@ -71,8 +71,9 @@ The generated fields are:
 | `POOL_MODEL` | yes | — | Checkpoint path under `EXTERNAL_VLLM_SHARED_ROOT` or Hugging Face model ID. |
 | `POOL_CONTAINER` | yes | — | Container used by this pool's replicas. |
 | `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM, Ray, and NeMo RL's compatibility patch. |
-| `POOL_REPLICAS` | yes | — | Number of independent DP=1 servers. |
+| `POOL_REPLICAS` | yes | — | Number of independent servers registered behind the load balancer. |
 | `POOL_TENSOR_PARALLEL_SIZE` | yes | — | Tensor parallel size per server. |
+| `POOL_DATA_PARALLEL_SIZE` | no | `1` | Native vLLM data parallel size inside each server. DP ranks share one API endpoint. |
 | `POOL_LB_PORT` | yes | — | Unique load-balancer port on the Ray head node. |
 | `POOL_URL_PLACEHOLDER` | yes | — | Token in `COMMAND` replaced by this pool's `/v1` URL. |
 | `POOL_GROUP_ID` | no | `inline-<pool>-<job-id>` | Registry namespace; set with `--group-id` only when an explicit stable namespace is needed. |
@@ -85,15 +86,18 @@ The generated fields are:
 | `POOL_VLLM_ARGS` | no | empty | Newline-separated vLLM CLI arguments, one argv entry per line. |
 
 Registration validates required fields, positive topology values, TCP port
-ranges, TP divisibility, and duplicate ports/placeholders before `sbatch`.
+ranges, TP divisibility, and duplicate ports/placeholders before `sbatch`. Each
+native DP rank occupies `POOL_TENSOR_PARALLEL_SIZE / GPUS_PER_NODE` whole nodes.
 `EXTERNAL_VLLM_NUM_NODES` is exported as the node total computed from all
 registered pools. Call `validate_external_vllm_submission` after constructing
 `COMMAND` to check its placeholders, shared paths, tool files, and requested
 external node count before submitting the allocation.
 
 The interface uses one-argument-per-line encoding internally, preserving JSON
-configs and paths containing spaces without `eval`. The wrapper itself supplies `--tensor-parallel-size`,
-`--distributed-executor-backend ray`, `--port`, and `--served-model-name`.
+configs and paths containing spaces without `eval`. The wrapper itself supplies
+`--tensor-parallel-size`, native Ray data-parallel arguments when
+`POOL_DATA_PARALLEL_SIZE > 1`, `--distributed-executor-backend ray`, `--port`,
+and `--served-model-name`.
 Everything model-specific—including attention, reasoning/tool parsers, expert
 parallelism, MoE backend, cache settings, and loader settings—belongs in the
 launcher's pool definition. A pool's reasoning-parser setting must also agree

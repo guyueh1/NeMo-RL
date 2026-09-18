@@ -612,6 +612,13 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "import aiohttp" not in source
     assert 'export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"' in source
     assert 'export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"' in source
+    assert (
+        'export "${pool}_DATA_PARALLEL_SIZE=${data_parallel_sizes[${pool}]}"' in source
+    )
+    assert '--data-parallel-size "${DATA_PARALLEL_SIZE}"' in source
+    assert "--data-parallel-size-local 1" in source
+    assert "--data-parallel-backend ray" in source
+    assert "--api-server-count 1" in source
     assert 'SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
     assert 'scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}"' in source
     assert 'for pool in "${pool_names[@]}"' in source
@@ -678,6 +685,7 @@ def test_pool_config_interface_registers_an_arbitrary_third_pool():
         printf 'env=%s\n' "$SAFETY_ENV_VARS"
         printf 'args=%s\n' "$(tr '\n' ',' <<< "$SAFETY_VLLM_ARGS")"
         printf 'group=%s\n' "$SAFETY_GROUP_ID"
+        printf 'dp=%s\n' "$SAFETY_DATA_PARALLEL_SIZE"
         printf 'nodes=%s\n' "$EXTERNAL_VLLM_NUM_NODES"
         """
     )
@@ -694,6 +702,7 @@ def test_pool_config_interface_registers_an_arbitrary_third_pool():
         "env=NCCL_MNNVL_ENABLE=0",
         "args=--dtype,bfloat16,--attention-backend,FLASH_ATTN,",
         "group=safety-pool",
+        "dp=1",
         "nodes=2",
     ]
 
@@ -706,6 +715,11 @@ def test_pool_config_interface_registers_an_arbitrary_third_pool():
             "--tensor-parallel-size",
             "0",
             "TEST_TENSOR_PARALLEL_SIZE must be a positive integer",
+        ),
+        (
+            "--data-parallel-size",
+            "0",
+            "TEST_DATA_PARALLEL_SIZE must be a positive integer",
         ),
         ("--lb-port", "99999999", "TEST_LB_PORT must be at most 65535"),
         ("--vllm-port", "0", "TEST_VLLM_PORT must be a positive integer"),
@@ -799,6 +813,28 @@ def test_pool_registration_rejects_partial_nodes_and_unsafe_group_id():
     assert "must be divisible by GPUS_PER_NODE=4" in partial.stderr
     assert unsafe_group.returncode == 2
     assert "TEST_GROUP_ID may contain only" in unsafe_group.stderr
+
+
+def test_pool_registration_counts_native_data_parallel_nodes():
+    script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
+    program = textwrap.dedent(
+        f"""
+        set -euo pipefail
+        source {script}
+        register_external_vllm_pool ROLLOUT \
+          --model model --container image --python /opt/python \
+          --replicas 1 --tensor-parallel-size 4 --data-parallel-size 4 \
+          --lb-port 9210 --url-placeholder __ROLLOUT_URL__
+        printf 'dp=%s\n' "$ROLLOUT_DATA_PARALLEL_SIZE"
+        printf 'nodes=%s\n' "$EXTERNAL_VLLM_NUM_NODES"
+        """
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", program], capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout.splitlines() == ["dp=4", "nodes=4"]
 
 
 def test_submission_validation_checks_placeholders_paths_and_node_total():

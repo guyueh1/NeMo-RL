@@ -113,6 +113,7 @@ declare -A containers=()
 declare -A vllm_pythons=()
 declare -A replicas=()
 declare -A tensor_parallel_sizes=()
+declare -A data_parallel_sizes=()
 declare -A nodes_per_replica=()
 declare -A node_offsets=()
 declare -A node_counts=()
@@ -150,6 +151,7 @@ for pool in "${pool_names[@]}"; do
   vllm_pythons["${pool}"]=$(require_pool_value "${pool}" VLLM_PYTHON)
   replicas["${pool}"]=$(require_pool_value "${pool}" REPLICAS)
   tensor_parallel_sizes["${pool}"]=$(require_pool_value "${pool}" TENSOR_PARALLEL_SIZE)
+  data_parallel_sizes["${pool}"]=$(pool_value "${pool}" DATA_PARALLEL_SIZE 1)
   served_model_names["${pool}"]=$(pool_value "${pool}" SERVED_MODEL_NAME model)
   backend_ports["${pool}"]=$(pool_value "${pool}" VLLM_PORT 8000)
   lb_ports["${pool}"]=$(require_pool_value "${pool}" LB_PORT)
@@ -169,15 +171,17 @@ for pool in "${pool_names[@]}"; do
   export "${pool}_VLLM_PYTHON=${vllm_pythons[${pool}]}"
   export "${pool}_REPLICAS=${replicas[${pool}]}"
   export "${pool}_TENSOR_PARALLEL_SIZE=${tensor_parallel_sizes[${pool}]}"
+  export "${pool}_DATA_PARALLEL_SIZE=${data_parallel_sizes[${pool}]}"
   export "${pool}_SERVED_MODEL_NAME=${served_model_names[${pool}]}"
   export "${pool}_VLLM_PORT=${backend_ports[${pool}]}"
   export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"
   export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"
 
-  for numeric_suffix in REPLICAS TENSOR_PARALLEL_SIZE VLLM_PORT LB_PORT STARTUP_TIMEOUT; do
+  for numeric_suffix in REPLICAS TENSOR_PARALLEL_SIZE DATA_PARALLEL_SIZE VLLM_PORT LB_PORT STARTUP_TIMEOUT; do
     case "${numeric_suffix}" in
       REPLICAS) numeric_value="${replicas[${pool}]}" ;;
       TENSOR_PARALLEL_SIZE) numeric_value="${tensor_parallel_sizes[${pool}]}" ;;
+      DATA_PARALLEL_SIZE) numeric_value="${data_parallel_sizes[${pool}]}" ;;
       VLLM_PORT) numeric_value="${backend_ports[${pool}]}" ;;
       LB_PORT) numeric_value="${lb_ports[${pool}]}" ;;
       STARTUP_TIMEOUT) numeric_value="${startup_timeouts[${pool}]}" ;;
@@ -212,7 +216,7 @@ for pool in "${pool_names[@]}"; do
 
   # Each private Ray cluster owns whole nodes. This makes its fixed Ray port safe
   # to reuse across replicas because no two replicas ever share a host.
-  nodes_per_replica["${pool}"]=$((tensor_parallel_sizes[${pool}] / GPUS_PER_NODE))
+  nodes_per_replica["${pool}"]=$((tensor_parallel_sizes[${pool}] * data_parallel_sizes[${pool}] / GPUS_PER_NODE))
   node_counts["${pool}"]=$((replicas[${pool}] * nodes_per_replica[${pool}]))
   node_offsets["${pool}"]="${total_external_nodes}"
   total_external_nodes=$((total_external_nodes + node_counts[${pool}]))
@@ -294,7 +298,7 @@ done
 echo "[INFO] Heterogeneous-job external-vLLM topology"
 echo "[INFO]   Hetgroup 0, NeMo RL Ray: ${#ray_nodes[@]} nodes (${SLURM_JOB_NODELIST_HET_GROUP_0})"
 for pool in "${pool_names[@]}"; do
-  echo "[INFO]   Hetgroup 1, ${display_names[${pool}]}: ${node_counts[${pool}]} nodes, ${replicas[${pool}]} TP=${tensor_parallel_sizes[${pool}]} replicas"
+  echo "[INFO]   Hetgroup 1, ${display_names[${pool}]}: ${node_counts[${pool}]} nodes, ${replicas[${pool}]} TP=${tensor_parallel_sizes[${pool}]}/DP=${data_parallel_sizes[${pool}]} replicas"
 done
 
 declare -a service_step_pids=()
@@ -372,10 +376,12 @@ MODEL=$(pool_value MODEL)
 VLLM_PYTHON=$(pool_value VLLM_PYTHON)
 VLLM_HTTP_PORT=$(pool_value VLLM_PORT)
 TENSOR_PARALLEL_SIZE=$(pool_value TENSOR_PARALLEL_SIZE)
+DATA_PARALLEL_SIZE=$(pool_value DATA_PARALLEL_SIZE)
 SERVED_MODEL_NAME=$(pool_value SERVED_MODEL_NAME)
 DISPLAY_NAME=$(pool_value DISPLAY_NAME)
 [[ -n "${SERVED_MODEL_NAME}" ]] || SERVED_MODEL_NAME=model
 [[ -n "${DISPLAY_NAME}" ]] || DISPLAY_NAME="${POOL_PREFIX}"
+[[ -n "${DATA_PARALLEL_SIZE}" ]] || DATA_PARALLEL_SIZE=1
 
 source "${EXTERNAL_VLLM_TOOLS_DIR}/vllm_backend_registry.sh"
 
@@ -452,10 +458,21 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     [[ -n "${argument}" ]] && vllm_args+=("${argument}")
   done <<< "$(pool_value VLLM_ARGS)"
 
-  echo "[${REPLICA_ID}] Starting ${DISPLAY_NAME} vLLM server at TP=${TENSOR_PARALLEL_SIZE}/DP=1"
+  data_parallel_args=()
+  if (( DATA_PARALLEL_SIZE > 1 )); then
+    data_parallel_args+=(
+      --data-parallel-size "${DATA_PARALLEL_SIZE}"
+      --data-parallel-size-local 1
+      --data-parallel-backend ray
+      --api-server-count 1
+    )
+  fi
+
+  echo "[${REPLICA_ID}] Starting ${DISPLAY_NAME} vLLM server at TP=${TENSOR_PARALLEL_SIZE}/DP=${DATA_PARALLEL_SIZE}"
   "${VLLM_PYTHON}" "${EXTERNAL_VLLM_TOOLS_DIR}/serve_vllm_on_ray.py" serve "${MODEL}" \
     --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
     --distributed-executor-backend ray \
+    "${data_parallel_args[@]}" \
     --port "${VLLM_HTTP_PORT}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
     "${vllm_args[@]}" \

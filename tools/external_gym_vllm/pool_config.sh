@@ -66,7 +66,7 @@ _external_vllm_require_port() {
 
 _external_vllm_recompute_node_count() {
   local gpus_per_node="${GPUS_PER_NODE:-4}"
-  local pool replicas_var tensor_parallel_size_var
+  local pool replicas_var tensor_parallel_size_var data_parallel_size_var
   local total=0
   local -a pools=()
 
@@ -74,7 +74,8 @@ _external_vllm_recompute_node_count() {
   for pool in "${pools[@]}"; do
     replicas_var="${pool}_REPLICAS"
     tensor_parallel_size_var="${pool}_TENSOR_PARALLEL_SIZE"
-    total=$((total + ${!replicas_var} * ${!tensor_parallel_size_var} / gpus_per_node))
+    data_parallel_size_var="${pool}_DATA_PARALLEL_SIZE"
+    total=$((total + ${!replicas_var} * ${!tensor_parallel_size_var} * ${!data_parallel_size_var} / gpus_per_node))
   done
   EXTERNAL_VLLM_NUM_NODES="${total}"
   export EXTERNAL_VLLM_NUM_NODES
@@ -119,6 +120,7 @@ register_external_vllm_pool() {
   local python=""
   local replicas=""
   local tensor_parallel_size=""
+  local data_parallel_size="1"
   local lb_port=""
   local url_placeholder=""
   local group_id=""
@@ -135,6 +137,7 @@ register_external_vllm_pool() {
       --python) python="${2:?value required for $1}"; shift 2 ;;
       --replicas) replicas="${2:?value required for $1}"; shift 2 ;;
       --tensor-parallel-size) tensor_parallel_size="${2:?value required for $1}"; shift 2 ;;
+      --data-parallel-size) data_parallel_size="${2:?value required for $1}"; shift 2 ;;
       --lb-port) lb_port="${2:?value required for $1}"; shift 2 ;;
       --url-placeholder) url_placeholder="${2:?value required for $1}"; shift 2 ;;
       --group-id) group_id="${2:?value required for $1}"; shift 2 ;;
@@ -163,6 +166,8 @@ register_external_vllm_pool() {
   _external_vllm_require_positive_integer "${pool}_REPLICAS" "${replicas}" || return
   _external_vllm_require_positive_integer \
     "${pool}_TENSOR_PARALLEL_SIZE" "${tensor_parallel_size}" || return
+  _external_vllm_require_positive_integer \
+    "${pool}_DATA_PARALLEL_SIZE" "${data_parallel_size}" || return
   _external_vllm_require_port "${pool}_LB_PORT" "${lb_port}" || return
   _external_vllm_require_port "${pool}_VLLM_PORT" "${vllm_port}" || return
   _external_vllm_require_positive_integer \
@@ -203,6 +208,7 @@ register_external_vllm_pool() {
   _external_vllm_set "${pool}" VLLM_PYTHON "${python}"
   _external_vllm_set "${pool}" REPLICAS "${replicas}"
   _external_vllm_set "${pool}" TENSOR_PARALLEL_SIZE "${tensor_parallel_size}"
+  _external_vllm_set "${pool}" DATA_PARALLEL_SIZE "${data_parallel_size}"
   _external_vllm_set "${pool}" LB_PORT "${lb_port}"
   _external_vllm_set "${pool}" URL_PLACEHOLDER "${url_placeholder}"
   _external_vllm_set "${pool}" SERVED_MODEL_NAME "${served_model_name}"
