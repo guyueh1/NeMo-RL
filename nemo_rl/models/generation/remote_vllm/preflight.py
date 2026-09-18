@@ -40,7 +40,8 @@ def preflight_remote_vllm_service(
     # only one replica. Native vLLM TP/PP/DP workers remain one backend here.
     if health is not None and isinstance(health.get("total_backends"), int):
         total_backends = health["total_backends"]
-        if total_backends != 1:
+        control_fanout = health.get("control_fanout") is True
+        if total_backends != 1 and not control_fanout:
             raise RuntimeError(
                 "External vLLM refit requires exactly one engine deployment "
                 "behind the configured URL; the load balancer reports "

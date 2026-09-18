@@ -70,10 +70,13 @@ The generated fields are:
 |---|---:|---|---|
 | `POOL_MODEL` | yes | — | Checkpoint path under `EXTERNAL_VLLM_SHARED_ROOT` or Hugging Face model ID. |
 | `POOL_CONTAINER` | yes | — | Container used by this pool's replicas. |
-| `POOL_VLLM_PYTHON` | yes | — | Python executable containing vLLM, Ray, and NeMo RL's compatibility patch. |
+| `POOL_VLLM_PYTHON` | conditional | — | Python containing vLLM, Ray, and NeMo RL; required by `nemo-rl-ray` mode. |
+| `POOL_LAUNCH_MODE` | no | `nemo-rl-ray` | `nemo-rl-ray` uses the compatibility launcher and private Ray cluster; `native` invokes stock vLLM with multiprocessing. |
+| `POOL_VLLM_EXECUTABLE` | no | `vllm` | vLLM executable used by `native` mode. |
 | `POOL_REPLICAS` | yes | — | Number of independent servers registered behind the load balancer. |
 | `POOL_TENSOR_PARALLEL_SIZE` | yes | — | Tensor parallel size per server. |
 | `POOL_DATA_PARALLEL_SIZE` | no | `1` | Native vLLM data parallel size inside each server. DP ranks share one API endpoint. |
+| `POOL_PREFILL_REPLICAS` | no | `0` | Number of leading replicas used as NIXL prefill producers. The remaining replicas are decode consumers. Requires data parallel size 1. |
 | `POOL_LB_PORT` | yes | — | Unique load-balancer port on the Ray head node. |
 | `POOL_URL_PLACEHOLDER` | yes | — | Token in `COMMAND` replaced by this pool's `/v1` URL. |
 | `POOL_GROUP_ID` | no | `inline-<pool>-<job-id>` | Registry namespace; set with `--group-id` only when an explicit stable namespace is needed. |
@@ -98,6 +101,14 @@ configs and paths containing spaces without `eval`. The wrapper itself supplies
 `--tensor-parallel-size`, native Ray data-parallel arguments when
 `POOL_DATA_PARALLEL_SIZE > 1`, `--distributed-executor-backend ray`, `--port`,
 and `--served-model-name`.
+
+For experimental prefill/decode disaggregation, set `--prefill-replicas` to a
+positive number smaller than `--replicas`. The wrapper gives the leading
+replicas the NIXL producer role and the rest the consumer role. Its public
+proxy performs vLLM's two-request KV-transfer handshake and broadcasts pause,
+reload, cache-reset, and resume operations to every engine. For example,
+`--replicas 4 --tensor-parallel-size 4 --prefill-replicas 2` creates two TP4
+prefill engines and two TP4 decode engines behind one OpenAI-compatible URL.
 Everything model-specific—including attention, reasoning/tool parsers, expert
 parallelism, MoE backend, cache settings, and loader settings—belongs in the
 launcher's pool definition. A pool's reasoning-parser setting must also agree
@@ -166,7 +177,7 @@ container. Therefore `BASE_LOG_DIR`, `EXTERNAL_VLLM_TOOLS_DIR_HOST`, and
 absolute local model paths must be under that root. A Hugging Face model ID is
 also accepted.
 
-Each pool container must provide:
+In the default `nemo-rl-ray` mode, each pool container must provide:
 
 - its configured `POOL_VLLM_PYTHON`;
 - importable `nemo_rl`, `ray`, and `vllm` packages in that environment; and
@@ -175,6 +186,12 @@ Each pool container must provide:
 `serve_vllm_on_ray.py` applies NeMo RL's vLLM compatibility patches before it
 imports the vLLM API server. `CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
+
+In `native` mode, the container only needs the configured vLLM executable and
+`curl`. This mode bypasses NeMo RL imports and the private Ray cluster, uses
+vLLM's multiprocessing executor, and therefore requires each replica to fit on
+one full node with data parallel size 1. Different pools may select different
+modes and container images in the same heterogeneous job.
 
 ## Slurm submission
 

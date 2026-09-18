@@ -89,7 +89,7 @@ def test_backend_pool_reads_only_ready_registry_entries(tmp_path):
 
     pool = BackendPool(str(tmp_path), "test")
 
-    assert pool._read_registry() == {"ready-backend": ("10.0.0.1", 8000)}
+    assert pool._read_registry() == {"ready-backend": ("10.0.0.1", 8000, "standard")}
 
 
 def test_read_registry_skips_bad_line_without_dropping_later_entries(tmp_path):
@@ -107,8 +107,22 @@ def test_read_registry_skips_bad_line_without_dropping_later_entries(tmp_path):
     pool = BackendPool(str(tmp_path), "test")
 
     assert pool._read_registry() == {
-        "good-1": ("10.0.0.1", 8000),
-        "good-2": ("10.0.0.3", 8002),
+        "good-1": ("10.0.0.1", 8000, "standard"),
+        "good-2": ("10.0.0.3", 8002, "standard"),
+    }
+
+
+def test_backend_pool_reads_prefill_and_decode_roles(tmp_path):
+    (tmp_path / ".registry_test").write_text(
+        "prefill 10.0.0.1 8000 123 ready prefill\n"
+        "decode 10.0.0.2 8000 123 ready decode\n"
+    )
+
+    pool = BackendPool(str(tmp_path), "test")
+
+    assert pool._read_registry() == {
+        "prefill": ("10.0.0.1", 8000, "prefill"),
+        "decode": ("10.0.0.2", 8000, "decode"),
     }
 
 
@@ -125,6 +139,16 @@ def test_backend_pool_picks_least_loaded_healthy_backend():
 
     first.healthy = False
     assert pool.pick(exclude={"second"}) is None
+
+
+def test_backend_pool_can_pick_by_pd_role():
+    pool = BackendPool("/tmp", "test")
+    prefill = Backend("prefill", "10.0.0.1", 8000, "prefill")
+    decode = Backend("decode", "10.0.0.2", 8000, "decode")
+    pool.backends = {prefill.job_id: prefill, decode.job_id: decode}
+
+    assert pool.pick(role="prefill") is prefill
+    assert pool.pick(role="decode") is decode
 
 
 def test_affinity_key_is_stable_and_ignores_invalid_json():
@@ -357,6 +381,79 @@ async def test_refit_control_request_reaches_registered_backend_while_unhealthy(
 
 
 @pytest.mark.asyncio
+async def test_disaggregated_generation_passes_prefill_metadata_to_decode():
+    pool = BackendPool("/tmp", "test")
+    prefill = Backend("prefill", "10.0.0.1", 8000, "prefill")
+    decode = Backend("decode", "10.0.0.2", 8000, "decode")
+    pool.backends = {prefill.job_id: prefill, decode.job_id: decode}
+    load_balancer = LoadBalancer(pool, 9213, "disaggregated-prefill")
+    metadata = {"remote_engine_id": "engine", "remote_block_ids": [1, 2]}
+    load_balancer._request_json = AsyncMock(
+        return_value={"kv_transfer_params": metadata}
+    )
+    expected_response = web.Response(status=200, body=b"stream")
+    load_balancer._proxy_once = AsyncMock(return_value=expected_response)
+    request = MagicMock(spec=web.Request)
+    request.read = AsyncMock(
+        return_value=json.dumps(
+            {
+                "model": "policy",
+                "messages": [{"role": "user", "content": "prompt"}],
+                "max_tokens": 32,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+        ).encode()
+    )
+    request.method = "POST"
+    request.path_qs = "/v1/chat/completions"
+    request.headers = {"X-Request-Id": "request-1", "Content-Length": "999"}
+
+    response = await load_balancer.handle_proxy(request)
+
+    assert response is expected_response
+    prefill_call = load_balancer._request_json.await_args
+    assert prefill_call.args[0] is prefill
+    assert prefill_call.args[2]["X-Request-Id"] == "request-1"
+    assert "Content-Length" not in prefill_call.args[2]
+    assert prefill_call.args[3]["max_tokens"] == 1
+    assert prefill_call.args[3]["stream"] is False
+    assert "stream_options" not in prefill_call.args[3]
+    decode_call = load_balancer._proxy_once.await_args
+    assert decode_call.args[0] is decode
+    assert json.loads(decode_call.args[4])["kv_transfer_params"] == metadata
+    assert decode_call.args[3]["X-Request-Id"] == "request-1"
+
+
+@pytest.mark.asyncio
+async def test_disaggregated_refit_control_fans_out_to_every_backend():
+    pool = BackendPool("/tmp", "test")
+    prefill = Backend("prefill", "10.0.0.1", 8000, "prefill")
+    decode = Backend("decode", "10.0.0.2", 8000, "decode")
+    prefill.healthy = False
+    decode.healthy = False
+    pool.backends = {prefill.job_id: prefill, decode.job_id: decode}
+    load_balancer = LoadBalancer(pool, 9213, "disaggregated-prefill")
+    load_balancer._proxy_once = AsyncMock(
+        side_effect=[web.Response(status=200), web.Response(status=200)]
+    )
+    request = MagicMock(spec=web.Request)
+    request.read = AsyncMock(return_value=b'{"method": "reload_weights"}')
+    request.method = "POST"
+    request.path_qs = "/collective_rpc"
+    request.headers = {}
+
+    response = await load_balancer.handle_proxy(request)
+
+    assert response.status == 200
+    assert load_balancer._proxy_once.await_count == 2
+    assert {call.args[0] for call in load_balancer._proxy_once.await_args_list} == {
+        prefill,
+        decode,
+    }
+
+
+@pytest.mark.asyncio
 async def test_health_reports_backend_counts():
     pool = BackendPool("/tmp", "test")
     healthy = Backend("healthy", "10.0.0.1", 8000)
@@ -371,6 +468,24 @@ async def test_health_reports_backend_counts():
     assert payload["status"] == "ok"
     assert payload["healthy_backends"] == 1
     assert payload["total_backends"] == 2
+    assert payload["control_fanout"] is False
+
+
+@pytest.mark.asyncio
+async def test_disaggregated_health_advertises_roles_and_control_fanout():
+    pool = BackendPool("/tmp", "test")
+    pool.backends = {
+        "prefill": Backend("prefill", "10.0.0.1", 8000, "prefill"),
+        "decode": Backend("decode", "10.0.0.2", 8000, "decode"),
+    }
+
+    response = await LoadBalancer(pool, 9213, "disaggregated-prefill").handle_health(
+        MagicMock(spec=web.Request)
+    )
+    payload = json.loads(response.body)
+
+    assert payload["control_fanout"] is True
+    assert payload["role_counts"] == {"standard": 0, "prefill": 1, "decode": 1}
 
 
 def test_registry_shell_helpers_add_replace_remove(tmp_path):
@@ -619,6 +734,12 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "--data-parallel-size-local 1" in source
     assert "--data-parallel-backend ray" in source
     assert "--api-server-count 1" in source
+    assert 'server_command=("${VLLM_EXECUTABLE}" serve)' in source
+    assert "distributed_backend=mp" in source
+    assert (
+        'VLLM_NIXL_SIDE_CHANNEL_HOST="${VLLM_NIXL_SIDE_CHANNEL_HOST:-${HEAD_IP}}"'
+        in source
+    )
     assert 'SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST_HET_GROUP_0}"' in source
     assert 'scontrol show hostnames "${SLURM_JOB_NODELIST_HET_GROUP_1}"' in source
     assert 'for pool in "${pool_names[@]}"' in source
@@ -835,6 +956,76 @@ def test_pool_registration_counts_native_data_parallel_nodes():
     )
 
     assert result.stdout.splitlines() == ["dp=4", "nodes=4"]
+
+
+def test_pool_registration_counts_disaggregated_prefill_nodes():
+    script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
+    program = textwrap.dedent(
+        f"""
+        set -euo pipefail
+        source {script}
+        register_external_vllm_pool ROLLOUT \
+          --model model --container image --python /opt/python \
+          --replicas 4 --tensor-parallel-size 4 --prefill-replicas 2 \
+          --lb-port 9210 --url-placeholder __ROLLOUT_URL__
+        printf 'prefill=%s\n' "$ROLLOUT_PREFILL_REPLICAS"
+        printf 'nodes=%s\n' "$EXTERNAL_VLLM_NUM_NODES"
+        """
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", program], capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout.splitlines() == ["prefill=2", "nodes=4"]
+
+
+def test_pool_registration_supports_native_vllm_image_without_nemo_python():
+    script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
+    program = textwrap.dedent(
+        f"""
+        set -euo pipefail
+        source {script}
+        register_external_vllm_pool ROLLOUT \
+          --model model --container vllm-nightly.sqsh \
+          --launch-mode native --vllm-executable /usr/local/bin/vllm \
+          --replicas 4 --tensor-parallel-size 4 --prefill-replicas 2 \
+          --lb-port 9210 --url-placeholder __ROLLOUT_URL__
+        printf 'mode=%s\n' "$ROLLOUT_LAUNCH_MODE"
+        printf 'python=%s\n' "$ROLLOUT_VLLM_PYTHON"
+        printf 'executable=%s\n' "$ROLLOUT_VLLM_EXECUTABLE"
+        printf 'nodes=%s\n' "$EXTERNAL_VLLM_NUM_NODES"
+        """
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", program], capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout.splitlines() == [
+        "mode=native",
+        "python=",
+        "executable=/usr/local/bin/vllm",
+        "nodes=4",
+    ]
+
+
+def test_pool_registration_rejects_multinode_native_replica():
+    script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
+    program = textwrap.dedent(
+        f"""
+        source {script}
+        register_external_vllm_pool ROLLOUT \
+          --model model --container image --launch-mode native \
+          --replicas 1 --tensor-parallel-size 8 \
+          --lb-port 9210 --url-placeholder __ROLLOUT_URL__
+        """
+    )
+
+    result = subprocess.run(["bash", "-c", program], capture_output=True, text=True)
+
+    assert result.returncode == 2
+    assert "native mode requires one full node per replica" in result.stderr
 
 
 def test_submission_validation_checks_placeholders_paths_and_node_total():

@@ -111,9 +111,12 @@ declare -A display_names=()
 declare -A models=()
 declare -A containers=()
 declare -A vllm_pythons=()
+declare -A launch_modes=()
+declare -A vllm_executables=()
 declare -A replicas=()
 declare -A tensor_parallel_sizes=()
 declare -A data_parallel_sizes=()
+declare -A prefill_replicas=()
 declare -A nodes_per_replica=()
 declare -A node_offsets=()
 declare -A node_counts=()
@@ -148,10 +151,13 @@ for pool in "${pool_names[@]}"; do
   display_names["${pool}"]=$(pool_value "${pool}" DISPLAY_NAME "${pool}")
   models["${pool}"]=$(require_pool_value "${pool}" MODEL)
   containers["${pool}"]=$(require_pool_value "${pool}" CONTAINER)
-  vllm_pythons["${pool}"]=$(require_pool_value "${pool}" VLLM_PYTHON)
+  launch_modes["${pool}"]=$(pool_value "${pool}" LAUNCH_MODE nemo-rl-ray)
+  vllm_pythons["${pool}"]=$(pool_value "${pool}" VLLM_PYTHON)
+  vllm_executables["${pool}"]=$(pool_value "${pool}" VLLM_EXECUTABLE vllm)
   replicas["${pool}"]=$(require_pool_value "${pool}" REPLICAS)
   tensor_parallel_sizes["${pool}"]=$(require_pool_value "${pool}" TENSOR_PARALLEL_SIZE)
   data_parallel_sizes["${pool}"]=$(pool_value "${pool}" DATA_PARALLEL_SIZE 1)
+  prefill_replicas["${pool}"]=$(pool_value "${pool}" PREFILL_REPLICAS 0)
   served_model_names["${pool}"]=$(pool_value "${pool}" SERVED_MODEL_NAME model)
   backend_ports["${pool}"]=$(pool_value "${pool}" VLLM_PORT 8000)
   lb_ports["${pool}"]=$(require_pool_value "${pool}" LB_PORT)
@@ -169,9 +175,12 @@ for pool in "${pool_names[@]}"; do
   export "${pool}_MODEL=${models[${pool}]}"
   export "${pool}_CONTAINER=${containers[${pool}]}"
   export "${pool}_VLLM_PYTHON=${vllm_pythons[${pool}]}"
+  export "${pool}_LAUNCH_MODE=${launch_modes[${pool}]}"
+  export "${pool}_VLLM_EXECUTABLE=${vllm_executables[${pool}]}"
   export "${pool}_REPLICAS=${replicas[${pool}]}"
   export "${pool}_TENSOR_PARALLEL_SIZE=${tensor_parallel_sizes[${pool}]}"
   export "${pool}_DATA_PARALLEL_SIZE=${data_parallel_sizes[${pool}]}"
+  export "${pool}_PREFILL_REPLICAS=${prefill_replicas[${pool}]}"
   export "${pool}_SERVED_MODEL_NAME=${served_model_names[${pool}]}"
   export "${pool}_VLLM_PORT=${backend_ports[${pool}]}"
   export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"
@@ -195,6 +204,42 @@ for pool in "${pool_names[@]}"; do
       exit 1
     fi
   done
+  case "${launch_modes[${pool}]}" in
+    nemo-rl-ray)
+      if [[ -z "${vllm_pythons[${pool}]}" ]]; then
+        echo "[FATAL] ${pool}_VLLM_PYTHON is required in nemo-rl-ray mode" >&2
+        exit 1
+      fi
+      ;;
+    native)
+      if [[ -z "${vllm_executables[${pool}]}" ]]; then
+        echo "[FATAL] ${pool}_VLLM_EXECUTABLE is required in native mode" >&2
+        exit 1
+      fi
+      if (( tensor_parallel_sizes[${pool}] != GPUS_PER_NODE || data_parallel_sizes[${pool}] != 1 )); then
+        echo "[FATAL] ${pool} native mode requires one full node per replica and data parallel size 1" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "[FATAL] ${pool}_LAUNCH_MODE must be 'nemo-rl-ray' or 'native'" >&2
+      exit 1
+      ;;
+  esac
+  if [[ ! "${prefill_replicas[${pool}]}" =~ ^[0-9]+$ ]]; then
+    echo "[FATAL] ${pool}_PREFILL_REPLICAS must be a nonnegative integer" >&2
+    exit 1
+  fi
+  if (( prefill_replicas[${pool}] > 0 )); then
+    if (( prefill_replicas[${pool}] >= replicas[${pool}] )); then
+      echo "[FATAL] ${pool}_PREFILL_REPLICAS must be less than ${pool}_REPLICAS" >&2
+      exit 1
+    fi
+    if (( data_parallel_sizes[${pool}] != 1 )); then
+      echo "[FATAL] ${pool}_DATA_PARALLEL_SIZE must be 1 with prefill/decode disaggregation" >&2
+      exit 1
+    fi
+  fi
   if (( tensor_parallel_sizes[${pool}] % GPUS_PER_NODE != 0 )); then
     echo "[FATAL] ${pool}_TENSOR_PARALLEL_SIZE must be divisible by GPUS_PER_NODE" >&2
     exit 1
@@ -361,6 +406,7 @@ set -euo pipefail
 
 : "${POOL_PREFIX:?POOL_PREFIX is required}"
 : "${REPLICA_ID:?REPLICA_ID is required}"
+: "${REPLICA_INDEX:?REPLICA_INDEX is required}"
 : "${EXTERNAL_VLLM_TOOLS_DIR:?EXTERNAL_VLLM_TOOLS_DIR is required}"
 : "${EXTERNAL_VLLM_STATE_DIR:?EXTERNAL_VLLM_STATE_DIR is required}"
 : "${EXTERNAL_VLLM_GROUP_ID:?EXTERNAL_VLLM_GROUP_ID is required}"
@@ -374,14 +420,29 @@ pool_value() {
 
 MODEL=$(pool_value MODEL)
 VLLM_PYTHON=$(pool_value VLLM_PYTHON)
+LAUNCH_MODE=$(pool_value LAUNCH_MODE)
+VLLM_EXECUTABLE=$(pool_value VLLM_EXECUTABLE)
 VLLM_HTTP_PORT=$(pool_value VLLM_PORT)
 TENSOR_PARALLEL_SIZE=$(pool_value TENSOR_PARALLEL_SIZE)
 DATA_PARALLEL_SIZE=$(pool_value DATA_PARALLEL_SIZE)
+PREFILL_REPLICAS=$(pool_value PREFILL_REPLICAS)
 SERVED_MODEL_NAME=$(pool_value SERVED_MODEL_NAME)
 DISPLAY_NAME=$(pool_value DISPLAY_NAME)
 [[ -n "${SERVED_MODEL_NAME}" ]] || SERVED_MODEL_NAME=model
 [[ -n "${DISPLAY_NAME}" ]] || DISPLAY_NAME="${POOL_PREFIX}"
 [[ -n "${DATA_PARALLEL_SIZE}" ]] || DATA_PARALLEL_SIZE=1
+[[ -n "${PREFILL_REPLICAS}" ]] || PREFILL_REPLICAS=0
+[[ -n "${LAUNCH_MODE}" ]] || LAUNCH_MODE=nemo-rl-ray
+[[ -n "${VLLM_EXECUTABLE}" ]] || VLLM_EXECUTABLE=vllm
+
+BACKEND_ROLE=standard
+if (( PREFILL_REPLICAS > 0 )); then
+  if (( REPLICA_INDEX < PREFILL_REPLICAS )); then
+    BACKEND_ROLE=prefill
+  else
+    BACKEND_ROLE=decode
+  fi
+fi
 
 source "${EXTERNAL_VLLM_TOOLS_DIR}/vllm_backend_registry.sh"
 
@@ -405,7 +466,9 @@ cleanup_replica() {
   if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     registry_remove "${REPLICA_ID}" || true
   fi
-  ray stop 2>/dev/null || true
+  if [[ "${LAUNCH_MODE}" == "nemo-rl-ray" ]]; then
+    ray stop 2>/dev/null || true
+  fi
 }
 trap cleanup_replica EXIT
 trap 'trap - EXIT; cleanup_replica; exit 143' TERM INT
@@ -422,21 +485,23 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   fi
 
   echo "${HEAD_IP}" > "${HEAD_IP_FILE}"
-  echo "[${REPLICA_ID}] Starting private Ray head at ${HEAD_IP}:${RAY_PORT}"
-  ray start \
-    --head \
-    --node-ip-address="${HEAD_IP}" \
-    --port="${RAY_PORT}" \
-    --ray-client-server-port="${RAY_CLIENT_SERVER_PORT}" \
-    --min-worker-port="${MIN_WORKER_PORT}" \
-    --max-worker-port="${MAX_WORKER_PORT}" \
-    --node-manager-port="$((NODE_MANAGER_PORT + 1))" \
-    --object-manager-port="$((OBJECT_MANAGER_PORT + 1))" \
-    --runtime-env-agent-port="$((RUNTIME_ENV_AGENT_PORT + 1))" \
-    --dashboard-agent-grpc-port="$((DASHBOARD_AGENT_GRPC_PORT + 1))" \
-    --dashboard-agent-listen-port="$((DASHBOARD_AGENT_LISTEN_PORT + 1))" \
-    --metrics-export-port="$((METRICS_EXPORT_PORT + 1))" \
-    --disable-usage-stats
+  if [[ "${LAUNCH_MODE}" == "nemo-rl-ray" ]]; then
+    echo "[${REPLICA_ID}] Starting private Ray head at ${HEAD_IP}:${RAY_PORT}"
+    ray start \
+      --head \
+      --node-ip-address="${HEAD_IP}" \
+      --port="${RAY_PORT}" \
+      --ray-client-server-port="${RAY_CLIENT_SERVER_PORT}" \
+      --min-worker-port="${MIN_WORKER_PORT}" \
+      --max-worker-port="${MAX_WORKER_PORT}" \
+      --node-manager-port="$((NODE_MANAGER_PORT + 1))" \
+      --object-manager-port="$((OBJECT_MANAGER_PORT + 1))" \
+      --runtime-env-agent-port="$((RUNTIME_ENV_AGENT_PORT + 1))" \
+      --dashboard-agent-grpc-port="$((DASHBOARD_AGENT_GRPC_PORT + 1))" \
+      --dashboard-agent-listen-port="$((DASHBOARD_AGENT_LISTEN_PORT + 1))" \
+      --metrics-export-port="$((METRICS_EXPORT_PORT + 1))" \
+      --disable-usage-stats
+  fi
 
   while IFS= read -r assignment; do
     [[ -n "${assignment}" ]] || continue
@@ -468,20 +533,55 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     )
   fi
 
-  echo "[${REPLICA_ID}] Starting ${DISPLAY_NAME} vLLM server at TP=${TENSOR_PARALLEL_SIZE}/DP=${DATA_PARALLEL_SIZE}"
-  "${VLLM_PYTHON}" "${EXTERNAL_VLLM_TOOLS_DIR}/serve_vllm_on_ray.py" serve "${MODEL}" \
+  kv_transfer_args=()
+  if [[ "${BACKEND_ROLE}" == "prefill" ]]; then
+    export VLLM_NIXL_SIDE_CHANNEL_HOST="${VLLM_NIXL_SIDE_CHANNEL_HOST:-${HEAD_IP}}"
+    export VLLM_NIXL_SIDE_CHANNEL_PORT="${VLLM_NIXL_SIDE_CHANNEL_PORT:-5557}"
+    export UCX_NET_DEVICES="${UCX_NET_DEVICES:-all}"
+    kv_transfer_args+=(
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'
+    )
+  elif [[ "${BACKEND_ROLE}" == "decode" ]]; then
+    export VLLM_NIXL_SIDE_CHANNEL_HOST="${VLLM_NIXL_SIDE_CHANNEL_HOST:-${HEAD_IP}}"
+    export VLLM_NIXL_SIDE_CHANNEL_PORT="${VLLM_NIXL_SIDE_CHANNEL_PORT:-5557}"
+    export UCX_NET_DEVICES="${UCX_NET_DEVICES:-all}"
+    kv_transfer_args+=(
+      --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer"}'
+    )
+  fi
+
+  server_command=()
+  distributed_backend=ray
+  if [[ "${LAUNCH_MODE}" == "native" ]]; then
+    server_command=("${VLLM_EXECUTABLE}" serve)
+    distributed_backend=mp
+  else
+    server_command=("${VLLM_PYTHON}" "${EXTERNAL_VLLM_TOOLS_DIR}/serve_vllm_on_ray.py" serve)
+  fi
+
+  echo "[${REPLICA_ID}] Starting ${DISPLAY_NAME} ${BACKEND_ROLE} vLLM server with ${LAUNCH_MODE} at TP=${TENSOR_PARALLEL_SIZE}/DP=${DATA_PARALLEL_SIZE}"
+  "${server_command[@]}" "${MODEL}" \
     --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
-    --distributed-executor-backend ray \
+    --distributed-executor-backend "${distributed_backend}" \
     "${data_parallel_args[@]}" \
+    "${kv_transfer_args[@]}" \
     --port "${VLLM_HTTP_PORT}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
     "${vllm_args[@]}" \
     > "${LOG_FILE}" 2>&1 &
   VLLM_PID=$!
 
-  while ! "${VLLM_PYTHON}" -c \
-    'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).close()' \
-    "http://${HEAD_IP}:${VLLM_HTTP_PORT}/health" >/dev/null 2>&1; do
+  health_url="http://${HEAD_IP}:${VLLM_HTTP_PORT}/health"
+  server_is_healthy() {
+    if [[ "${LAUNCH_MODE}" == "native" ]]; then
+      curl --fail --silent --show-error --max-time 2 "${health_url}" >/dev/null
+    else
+      "${VLLM_PYTHON}" -c \
+        'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).close()' \
+        "${health_url}" >/dev/null
+    fi
+  }
+  while ! server_is_healthy 2>/dev/null; do
     if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
       echo "[${REPLICA_ID}] ERROR: vLLM exited before becoming healthy" >&2
       exit 1
@@ -489,8 +589,8 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     sleep 5
   done
 
-  registry_add "${REPLICA_ID}" "${HEAD_IP}" "${VLLM_HTTP_PORT}"
-  echo "[${REPLICA_ID}] Registered healthy backend ${HEAD_IP}:${VLLM_HTTP_PORT}"
+  registry_add "${REPLICA_ID}" "${HEAD_IP}" "${VLLM_HTTP_PORT}" "${BACKEND_ROLE}"
+  echo "[${REPLICA_ID}] Registered healthy ${BACKEND_ROLE} backend ${HEAD_IP}:${VLLM_HTTP_PORT}"
   if wait "${VLLM_PID}"; then
     vllm_status=0
   else
@@ -502,6 +602,10 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
   fi
   exit "${vllm_status}"
 else
+  if [[ "${LAUNCH_MODE}" == "native" ]]; then
+    echo "[${REPLICA_ID}] ERROR: native mode does not support multi-node replicas" >&2
+    exit 1
+  fi
   for _ in $(seq 1 120); do
     [[ -s "${HEAD_IP_FILE}" ]] && break
     sleep 1
@@ -575,7 +679,7 @@ for pool in "${pool_names[@]}"; do
       --nodes="${nodes_per_replica[${pool}]}" \
       --ntasks="${nodes_per_replica[${pool}]}" \
       --ntasks-per-node=1 \
-      --export="ALL,POOL_PREFIX=${pool},REPLICA_ID=${replica_id},EXTERNAL_VLLM_TOOLS_DIR=${EXTERNAL_VLLM_TOOLS_DIR_HOST},EXTERNAL_VLLM_STATE_DIR=${state_dirs[${pool}]},EXTERNAL_VLLM_GROUP_ID=${group_ids[${pool}]},HEAD_IP_FILE=${head_ip_file},LOG_FILE=${vllm_log}" \
+      --export="ALL,POOL_PREFIX=${pool},REPLICA_ID=${replica_id},REPLICA_INDEX=${replica_index},EXTERNAL_VLLM_TOOLS_DIR=${EXTERNAL_VLLM_TOOLS_DIR_HOST},EXTERNAL_VLLM_STATE_DIR=${state_dirs[${pool}]},EXTERNAL_VLLM_GROUP_ID=${group_ids[${pool}]},HEAD_IP_FILE=${head_ip_file},LOG_FILE=${vllm_log}" \
       --output="${pool_log_dirs[${pool}]}/replica_${replica_index}_%t.log" \
       bash -c "${VLLM_SERVER_BODY}" &
     service_step_pids+=("$!")
@@ -585,6 +689,10 @@ done
 
 ray_head_ip=$(resolve_node_ip "${ray_head_node}")
 for pool in "${pool_names[@]}"; do
+  lb_mode=load-balance
+  if (( prefill_replicas[${pool}] > 0 )); then
+    lb_mode=disaggregated-prefill
+  fi
   pool_urls["${pool}"]="http://${ray_head_ip}:${lb_ports[${pool}]}/v1"
   echo "[INFO] Starting ${display_names[${pool}]} load balancer at ${pool_urls[${pool}]}"
   srun \
@@ -603,7 +711,7 @@ for pool in "${pool_names[@]}"; do
     --ntasks=1 \
     --cpus-per-task=2 \
     --output="${pool_log_dirs[${pool}]}/load_balancer.log" \
-    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
+    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}' '${lb_mode}'" &
   lb_step_pids+=("$!")
   lb_step_labels+=("${display_names[${pool}]} load balancer")
 done

@@ -55,6 +55,14 @@ _external_vllm_require_positive_integer() {
   fi
 }
 
+_external_vllm_require_nonnegative_integer() {
+  local field="$1" value="$2"
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: ${field} must be a nonnegative integer (got '${value}')" >&2
+    return 2
+  fi
+}
+
 _external_vllm_require_port() {
   local field="$1" value="$2"
   _external_vllm_require_positive_integer "${field}" "${value}" || return
@@ -118,9 +126,12 @@ register_external_vllm_pool() {
   local model=""
   local container=""
   local python=""
+  local launch_mode="nemo-rl-ray"
+  local vllm_executable="vllm"
   local replicas=""
   local tensor_parallel_size=""
   local data_parallel_size="1"
+  local prefill_replicas="0"
   local lb_port=""
   local url_placeholder=""
   local group_id=""
@@ -135,9 +146,12 @@ register_external_vllm_pool() {
       --model) model="${2:?value required for $1}"; shift 2 ;;
       --container) container="${2:?value required for $1}"; shift 2 ;;
       --python) python="${2:?value required for $1}"; shift 2 ;;
+      --launch-mode) launch_mode="${2:?value required for $1}"; shift 2 ;;
+      --vllm-executable) vllm_executable="${2:?value required for $1}"; shift 2 ;;
       --replicas) replicas="${2:?value required for $1}"; shift 2 ;;
       --tensor-parallel-size) tensor_parallel_size="${2:?value required for $1}"; shift 2 ;;
       --data-parallel-size) data_parallel_size="${2:?value required for $1}"; shift 2 ;;
+      --prefill-replicas) prefill_replicas="${2:?value required for $1}"; shift 2 ;;
       --lb-port) lb_port="${2:?value required for $1}"; shift 2 ;;
       --url-placeholder) url_placeholder="${2:?value required for $1}"; shift 2 ;;
       --group-id) group_id="${2:?value required for $1}"; shift 2 ;;
@@ -153,13 +167,31 @@ register_external_vllm_pool() {
   done
 
   local field value
-  for field in model container python replicas tensor_parallel_size lb_port url_placeholder; do
+  for field in model container replicas tensor_parallel_size lb_port url_placeholder; do
     value="${!field}"
     if [[ -z "${value}" ]]; then
       echo "ERROR: ${field//_/-} is required for external vLLM pool ${pool}" >&2
       return 2
     fi
   done
+  case "${launch_mode}" in
+    nemo-rl-ray)
+      if [[ -z "${python}" ]]; then
+        echo "ERROR: python is required for external vLLM pool ${pool} in nemo-rl-ray mode" >&2
+        return 2
+      fi
+      ;;
+    native)
+      if [[ -z "${vllm_executable}" ]]; then
+        echo "ERROR: vllm-executable is required for external vLLM pool ${pool} in native mode" >&2
+        return 2
+      fi
+      ;;
+    *)
+      echo "ERROR: ${pool}_LAUNCH_MODE must be 'nemo-rl-ray' or 'native'" >&2
+      return 2
+      ;;
+  esac
 
   local gpus_per_node="${GPUS_PER_NODE:-4}"
   _external_vllm_require_positive_integer "GPUS_PER_NODE" "${gpus_per_node}" || return
@@ -168,6 +200,8 @@ register_external_vllm_pool() {
     "${pool}_TENSOR_PARALLEL_SIZE" "${tensor_parallel_size}" || return
   _external_vllm_require_positive_integer \
     "${pool}_DATA_PARALLEL_SIZE" "${data_parallel_size}" || return
+  _external_vllm_require_nonnegative_integer \
+    "${pool}_PREFILL_REPLICAS" "${prefill_replicas}" || return
   _external_vllm_require_port "${pool}_LB_PORT" "${lb_port}" || return
   _external_vllm_require_port "${pool}_VLLM_PORT" "${vllm_port}" || return
   _external_vllm_require_positive_integer \
@@ -175,6 +209,21 @@ register_external_vllm_pool() {
   if (( tensor_parallel_size % gpus_per_node != 0 )); then
     echo "ERROR: ${pool}_TENSOR_PARALLEL_SIZE must be divisible by GPUS_PER_NODE=${gpus_per_node}" >&2
     return 2
+  fi
+  if [[ "${launch_mode}" == "native" ]] &&
+    (( tensor_parallel_size != gpus_per_node || data_parallel_size != 1 )); then
+    echo "ERROR: ${pool} native mode requires one full node per replica and data parallel size 1" >&2
+    return 2
+  fi
+  if (( prefill_replicas > 0 )); then
+    if (( prefill_replicas >= replicas )); then
+      echo "ERROR: ${pool}_PREFILL_REPLICAS must be less than ${pool}_REPLICAS" >&2
+      return 2
+    fi
+    if (( data_parallel_size != 1 )); then
+      echo "ERROR: ${pool}_DATA_PARALLEL_SIZE must be 1 with prefill/decode disaggregation" >&2
+      return 2
+    fi
   fi
   if [[ -n "${group_id}" && ! "${group_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "ERROR: ${pool}_GROUP_ID may contain only letters, digits, '.', '_', and '-'" >&2
@@ -206,9 +255,12 @@ register_external_vllm_pool() {
   _external_vllm_set "${pool}" MODEL "${model}"
   _external_vllm_set "${pool}" CONTAINER "${container}"
   _external_vllm_set "${pool}" VLLM_PYTHON "${python}"
+  _external_vllm_set "${pool}" LAUNCH_MODE "${launch_mode}"
+  _external_vllm_set "${pool}" VLLM_EXECUTABLE "${vllm_executable}"
   _external_vllm_set "${pool}" REPLICAS "${replicas}"
   _external_vllm_set "${pool}" TENSOR_PARALLEL_SIZE "${tensor_parallel_size}"
   _external_vllm_set "${pool}" DATA_PARALLEL_SIZE "${data_parallel_size}"
+  _external_vllm_set "${pool}" PREFILL_REPLICAS "${prefill_replicas}"
   _external_vllm_set "${pool}" LB_PORT "${lb_port}"
   _external_vllm_set "${pool}" URL_PLACEHOLDER "${url_placeholder}"
   _external_vllm_set "${pool}" SERVED_MODEL_NAME "${served_model_name}"

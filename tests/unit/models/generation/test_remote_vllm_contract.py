@@ -123,6 +123,34 @@ def test_preflight_rejects_multiple_independent_lb_backends(
         preflight_remote_vllm_service(_config())
 
 
+def test_preflight_accepts_multiple_backends_with_control_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = iter(
+        [
+            _Response(
+                {
+                    "status": "ok",
+                    "healthy_backends": 4,
+                    "total_backends": 4,
+                    "control_fanout": True,
+                }
+            ),
+            _Response({"data": [{"id": "policy"}]}),
+            _Response({"model_config": {"max_model_len": 4096}}),
+        ]
+    )
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda request, timeout: next(responses),
+    )
+
+    info = preflight_remote_vllm_service(_config())
+
+    assert info.model == "policy"
+
+
 def test_reload_uses_collective_rpc_with_weights_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
