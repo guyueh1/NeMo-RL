@@ -40,12 +40,15 @@ class RemoteVllmRefitConfig(BaseModel, extra="forbid"):
 class RemoteVllmServiceConfig(BaseModel, extra="forbid"):
     """Connection and control settings for one external vLLM deployment.
 
-    ``base_url`` may include the OpenAI ``/v1`` prefix. Control paths are
-    resolved against the URL origin so the same endpoint can be handed to
-    NeMo-Gym and used for vLLM's development endpoints.
+    ``base_url`` may include the OpenAI ``/v1`` prefix. ``control_base_url``
+    can point at a separate control-plane fan-out proxy when the generation
+    endpoint is a router that does not expose vLLM's development endpoints.
+    When omitted, control requests use ``base_url`` for compatibility with a
+    single vLLM server or the original NeMo RL proxy deployment.
     """
 
     base_url: str = Field(min_length=1)
+    control_base_url: str | None = None
     served_model_name: str = Field(min_length=1)
     max_model_len: PositiveInt
     health_path: str = "/health"
@@ -62,8 +65,10 @@ class RemoteVllmServiceConfig(BaseModel, extra="forbid"):
 
     @model_validator(mode="after")
     def validate_urls_and_timeouts(self) -> "RemoteVllmServiceConfig":
-        if not self.base_url.startswith(("http://", "https://")):
-            raise ValueError("base_url must start with http:// or https://")
+        for field_name in ("base_url", "control_base_url"):
+            url = getattr(self, field_name)
+            if url is not None and not url.startswith(("http://", "https://")):
+                raise ValueError(f"{field_name} must start with http:// or https://")
         path_fields = (
             "health_path",
             "models_path",
@@ -80,6 +85,11 @@ class RemoteVllmServiceConfig(BaseModel, extra="forbid"):
         if self.connect_timeout_s > self.request_timeout_s:
             raise ValueError("connect_timeout_s cannot exceed request_timeout_s")
         return self
+
+    @property
+    def effective_control_base_url(self) -> str:
+        """Return the endpoint used for pause/refit/reset/resume operations."""
+        return self.control_base_url or self.base_url
 
 
 class RemoteVllmServiceInfo(BaseModel, extra="forbid"):

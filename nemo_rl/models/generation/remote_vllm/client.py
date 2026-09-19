@@ -59,8 +59,12 @@ class RemoteVllmClient:
         query: dict[str, str] | None = None,
         body: dict[str, Any] | None = None,
         timeout_s: float | None = None,
+        control: bool = False,
     ) -> bytes:
-        url = service_url(self.config.base_url, path)
+        base_url = (
+            self.config.effective_control_base_url if control else self.config.base_url
+        )
+        url = service_url(base_url, path)
         if query:
             url = f"{url}?{urllib.parse.urlencode(query)}"
         headers = self._headers()
@@ -87,24 +91,40 @@ class RemoteVllmClient:
                 f"Could not reach external vLLM at {request.full_url}: {error.reason}"
             ) from error
 
-    def get_json(self, path: str, *, timeout_s: float | None = None) -> dict[str, Any]:
-        payload = self.request("GET", path, timeout_s=timeout_s)
+    def get_json(
+        self,
+        path: str,
+        *,
+        timeout_s: float | None = None,
+        control: bool = False,
+    ) -> dict[str, Any]:
+        payload = self.request("GET", path, timeout_s=timeout_s, control=control)
+        base_url = (
+            self.config.effective_control_base_url if control else self.config.base_url
+        )
         try:
             decoded = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise RuntimeError(
                 f"External vLLM returned invalid JSON from "
-                f"{service_url(self.config.base_url, path)}"
+                f"{service_url(base_url, path)}"
             ) from error
         if not isinstance(decoded, dict):
             raise RuntimeError(
                 f"External vLLM returned a non-object from "
-                f"{service_url(self.config.base_url, path)}"
+                f"{service_url(base_url, path)}"
             )
         return decoded
 
-    def health(self, *, timeout_s: float | None = None) -> dict[str, Any] | None:
-        payload = self.request("GET", self.config.health_path, timeout_s=timeout_s)
+    def health(
+        self,
+        *,
+        timeout_s: float | None = None,
+        control: bool = False,
+    ) -> dict[str, Any] | None:
+        payload = self.request(
+            "GET", self.config.health_path, timeout_s=timeout_s, control=control
+        )
         if not payload:
             return None
         try:
@@ -123,6 +143,7 @@ class RemoteVllmClient:
                 "mode": mode,
                 "clear_cache": str(clear_cache).lower(),
             },
+            control=True,
         )
 
     def reload_weights(self, weights_path: str) -> None:
@@ -134,10 +155,11 @@ class RemoteVllmClient:
                 "kwargs": {"weights_path": weights_path},
             },
             timeout_s=self.config.refit.timeout_s,
+            control=True,
         )
 
     def reset_prefix_cache(self) -> None:
-        self.request("POST", self.config.reset_prefix_cache_path)
+        self.request("POST", self.config.reset_prefix_cache_path, control=True)
 
     def resume(self) -> None:
-        self.request("POST", self.config.resume_path)
+        self.request("POST", self.config.resume_path, control=True)

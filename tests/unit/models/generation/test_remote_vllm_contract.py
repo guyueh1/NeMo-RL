@@ -57,6 +57,11 @@ def test_remote_service_config_rejects_non_http_base_url() -> None:
         _config(base_url="rollout.test:9210/v1")
 
 
+def test_remote_service_config_rejects_non_http_control_base_url() -> None:
+    with pytest.raises(ValidationError, match="control_base_url must start"):
+        _config(control_base_url="rollout.test:9211/v1")
+
+
 def test_remote_service_config_requires_shared_absolute_checkpoint_path() -> None:
     with pytest.raises(ValidationError, match="checkpoint_dir must be an absolute"):
         _config(refit={"checkpoint_dir": "relative/hf-exports"})
@@ -170,6 +175,41 @@ def test_reload_uses_collective_rpc_with_weights_path(
         "method": "reload_weights",
         "kwargs": {"weights_path": "/shared/hf-exports/version_00000001"},
     }
+
+
+def test_generation_and_control_can_use_separate_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_urls: list[str] = []
+
+    def urlopen(request: urllib.request.Request, timeout: float) -> _Response:
+        requested_urls.append(request.full_url)
+        if request.full_url == "http://router.test:9210/health":
+            return _Response()
+        if request.full_url == "http://control.test:9211/health":
+            return _Response({"total_backends": 4, "control_fanout": True})
+        if request.full_url == "http://router.test:9210/v1/models":
+            return _Response({"data": [{"id": "policy"}]})
+        if request.full_url == "http://control.test:9211/server_info":
+            return _Response({"model_config": {"max_model_len": 4096}})
+        return _Response({"status": "ok"})
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    config = _config(
+        base_url="http://router.test:9210/v1",
+        control_base_url="http://control.test:9211/v1",
+    )
+
+    preflight_remote_vllm_service(config)
+    RemoteVllmClient(config).reload_weights("/shared/hf-exports/version_00000001")
+
+    assert requested_urls == [
+        "http://router.test:9210/health",
+        "http://control.test:9211/health",
+        "http://router.test:9210/v1/models",
+        "http://control.test:9211/server_info",
+        "http://control.test:9211/collective_rpc",
+    ]
 
 
 def test_pause_keeps_inflight_requests_and_clears_their_cache(
