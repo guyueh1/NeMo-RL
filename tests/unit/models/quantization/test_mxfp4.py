@@ -3,6 +3,9 @@
 import pytest
 import torch
 
+from nemo_rl.models.generation.vllm.quantization.mxfp4_moe import (
+    quantize_mxfp4_weight,
+)
 from nemo_rl.models.quantization.mxfp4 import (
     fake_quantize_mxfp4,
     is_routed_moe_weight_name,
@@ -49,6 +52,28 @@ def test_fake_quantize_mxfp4_preserves_results_across_chunks(monkeypatch) -> Non
 def test_fake_quantize_mxfp4_rejects_unaligned_weights() -> None:
     with pytest.raises(ValueError, match="last dimension"):
         fake_quantize_mxfp4(torch.ones(2, 31))
+
+
+def test_native_mxfp4_pack_matches_fake_quant_numerics() -> None:
+    weight = torch.linspace(-12, 12, 64, dtype=torch.float32).reshape(2, 32)
+
+    packed, encoded_scale = quantize_mxfp4_weight(weight)
+
+    low = packed & 0xF
+    high = packed >> 4
+    codes = torch.stack((low, high), dim=-1).reshape_as(weight)
+    magnitude = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+    )[(codes & 0x7).long()]
+    values = torch.where((codes & 0x8) != 0, -magnitude, magnitude)
+    scale = torch.exp2(encoded_scale.to(torch.float32) - 127).repeat_interleave(
+        32, dim=-1
+    )
+
+    torch.testing.assert_close(values * scale, fake_quantize_mxfp4(weight))
+    assert packed.dtype == torch.uint8
+    assert packed.shape == (2, 16)
+    assert encoded_scale.shape == (2, 1)
 
 
 @pytest.mark.parametrize(

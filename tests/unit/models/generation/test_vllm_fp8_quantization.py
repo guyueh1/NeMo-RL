@@ -867,6 +867,37 @@ def test_init_fp8_rejects_mxfp4_fake_quant_without_mxfp8(fp8_module):
         )
 
 
+def test_init_fp8_rejects_native_mxfp4_without_reload(fp8_module):
+    with pytest.raises(ValueError, match="requires refit_with_reload_api=True"):
+        fp8_module.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "is_mx": True,
+                "mxfp4_moe_weight_native": True,
+                "refit_with_reload_api": False,
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
+def test_init_fp8_rejects_both_mxfp4_moe_modes(fp8_module):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        fp8_module.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "is_mx": True,
+                "mxfp4_moe_weight_fake_quant": True,
+                "mxfp4_moe_weight_native": True,
+                "refit_with_reload_api": True,
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
 def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
     fp8 = fp8_module
     weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)

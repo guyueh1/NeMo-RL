@@ -75,6 +75,9 @@ class VllmSpecificArgs(TypedDict):
     # Before MXFP8 refit packing, round routed MoE FC1/FC2 weights through
     # block-32 MXFP4. Runtime weights and activations remain MXFP8.
     mxfp4_moe_weight_fake_quant: NotRequired[bool]
+    # Store routed MoE FC1/FC2 weights as packed block-32 MXFP4 and execute
+    # them with dynamic MXFP8 activations through FlashInfer CUTLASS.
+    mxfp4_moe_weight_native: NotRequired[bool]
     # Deprecated in 0.8. Use quantization_ignore_patterns instead.
     quantization_ignored_layer_kws: NotRequired[list[str]]
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.

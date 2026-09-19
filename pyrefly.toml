@@ -247,6 +247,7 @@ project-includes = [
   "nemo_rl/models/generation/vllm/patches.py",
   "nemo_rl/models/generation/vllm/quantization/deepseek_v4_fp8.py",
   "nemo_rl/models/generation/vllm/quantization/fp8_train_utils.py",
+  "nemo_rl/models/generation/vllm/quantization/mxfp4_moe.py",
   "nemo_rl/models/generation/vllm/quantization/mxfp8_utils.py",
   "nemo_rl/models/quantization/mxfp4.py",
   "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py",

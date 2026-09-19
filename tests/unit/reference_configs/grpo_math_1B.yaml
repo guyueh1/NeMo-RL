@@ -434,6 +434,7 @@ policy:
       async_engine: false
       precision: ${policy.precision}
       mxfp4_moe_weight_fake_quant: false
+      mxfp4_moe_weight_native: false
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}

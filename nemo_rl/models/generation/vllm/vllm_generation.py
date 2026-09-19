@@ -111,14 +111,17 @@ def _record_vllm_generation_metrics(
 
 class VllmGeneration(GenerationInterface):
     def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Request logical weights when MXFP4 fake quantization needs them.
+        """Request logical weights when either MXFP4 refit mode needs them.
 
         An MXFP8-param Megatron policy otherwise exports its physical FP8 payload
-        and scale siblings.  The MXFP4 prototype must instead receive the logical
-        values so vLLM can apply MXFP4 fake quantization before its normal MXFP8
-        receiver-side packing.
+        and scale siblings. MXFP4 refit must instead receive logical values so
+        vLLM can either fake-quantize before MXFP8 packing or store native packed
+        MXFP4 expert weights.
         """
-        if self.cfg["vllm_cfg"].get("mxfp4_moe_weight_fake_quant", False):
+        vllm_cfg = self.cfg["vllm_cfg"]
+        if vllm_cfg.get("mxfp4_moe_weight_fake_quant") or vllm_cfg.get(
+            "mxfp4_moe_weight_native"
+        ):
             return "logical_weights"
         return "hf_export"
 
@@ -127,6 +130,21 @@ class VllmGeneration(GenerationInterface):
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
+        vllm_cfg = generation_config.get("vllm_cfg") or {}
+        if vllm_cfg.get("mxfp4_moe_weight_native"):
+            moe_backend = (generation_config.get("vllm_kwargs") or {}).get(
+                "moe_backend"
+            )
+            assert moe_backend == "flashinfer_cutlass_afp8", (
+                "policy.generation.vllm_cfg.mxfp4_moe_weight_native=true requires "
+                "policy.generation.vllm_kwargs.moe_backend="
+                "'flashinfer_cutlass_afp8'."
+            )
+            assert vllm_cfg.get("expert_parallel_size", 1) == 1, (
+                "Native MXFP4/MXFP8 FlashInfer CUTLASS refit currently requires "
+                "expert_parallel_size=1 because vLLM 0.25.1 swizzles MXFP8 "
+                "scales before expert-parallel all-to-all."
+            )
 
     @staticmethod
     def init_cluster_placement_groups(

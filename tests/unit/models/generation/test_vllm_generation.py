@@ -523,6 +523,9 @@ def test_vllm_generation_requests_logical_refit_payload_for_mxfp4() -> None:
     generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_fake_quant": True}}
     assert generation.get_refit_payload_mode() == "logical_weights"
 
+    generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_native": True}}
+    assert generation.get_refit_payload_mode() == "logical_weights"
+
     generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_fake_quant": False}}
     assert generation.get_refit_payload_mode() == "hf_export"
 
@@ -1488,6 +1491,41 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     master_config = types.SimpleNamespace(policy={"generation": vllm_config})
 
     VllmGeneration.validate_settings(master_config)
+
+
+@pytest.mark.parametrize(
+    ("vllm_updates", "error_match"),
+    [
+        (
+            {"vllm_kwargs": {"moe_backend": "flashinfer_trtllm_afp8"}},
+            "requires.*flashinfer_cutlass_afp8",
+        ),
+        (
+            {"vllm_cfg": {"expert_parallel_size": 2}},
+            "requires expert_parallel_size=1",
+        ),
+    ],
+)
+def test_vllm_validate_settings_rejects_unsupported_native_mxfp4(
+    vllm_updates, error_match
+):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"].update(
+        {
+            "refit_with_reload_api": True,
+            "mxfp4_moe_weight_native": True,
+            "expert_parallel_size": 1,
+        }
+    )
+    vllm_config["vllm_kwargs"] = {"moe_backend": "flashinfer_cutlass_afp8"}
+    for key, value in vllm_updates.items():
+        vllm_config[key].update(value)
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    with pytest.raises(AssertionError, match=error_match):
+        VllmGeneration.validate_settings(master_config)
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):

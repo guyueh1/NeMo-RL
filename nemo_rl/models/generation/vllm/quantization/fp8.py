@@ -78,6 +78,7 @@ class FP8Config:
     is_deepseek_v4: bool = False
     refit_with_reload_api: bool = False
     mxfp4_moe_weight_fake_quant: bool = False
+    mxfp4_moe_weight_native: bool = False
 
 
 @dataclass()
@@ -169,6 +170,13 @@ def apply_fp8_patches(self, fp8_config):
 
     global_fp8_config = fp8_config
 
+    if global_fp8_config.mxfp4_moe_weight_native:
+        from nemo_rl.models.generation.vllm.quantization.mxfp4_moe import (
+            register_nemo_mxfp4_moe_mxfp8,
+        )
+
+        register_nemo_mxfp4_moe_mxfp8()
+
     # Apply patches conditionally based on configuration
     # Only apply weight patches if using FP8 weights
     # Only apply KV cache patches if using FP8 KV cache
@@ -251,6 +259,18 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         raise ValueError("is_mx=True requires precision='fp8'")
     if vllm_cfg.get("mxfp4_moe_weight_fake_quant") and not vllm_cfg.get("is_mx"):
         raise ValueError("mxfp4_moe_weight_fake_quant=True requires is_mx=True")
+    native_mxfp4_moe = bool(vllm_cfg.get("mxfp4_moe_weight_native"))
+    if native_mxfp4_moe and not vllm_cfg.get("is_mx"):
+        raise ValueError("mxfp4_moe_weight_native=True requires is_mx=True")
+    if native_mxfp4_moe and vllm_cfg.get("mxfp4_moe_weight_fake_quant"):
+        raise ValueError(
+            "mxfp4_moe_weight_native and mxfp4_moe_weight_fake_quant are "
+            "mutually exclusive"
+        )
+    if native_mxfp4_moe and not vllm_cfg.get("refit_with_reload_api"):
+        raise ValueError(
+            "mxfp4_moe_weight_native=True requires refit_with_reload_api=True"
+        )
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
@@ -335,6 +355,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "mxfp4_moe_weight_fake_quant": bool(
             vllm_cfg.get("mxfp4_moe_weight_fake_quant")
         ),
+        "mxfp4_moe_weight_native": native_mxfp4_moe,
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
@@ -437,8 +458,18 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
+    quantization_method = "fp8"
+    if native_mxfp4_moe:
+        from nemo_rl.models.generation.vllm.quantization.mxfp4_moe import (
+            NEMO_MXFP4_MOE_MXFP8,
+            register_nemo_mxfp4_moe_mxfp8,
+        )
+
+        register_nemo_mxfp4_moe_mxfp8()
+        quantization_method = NEMO_MXFP4_MOE_MXFP8
+
     vllm_kwargs = {
-        "quantization": "fp8",
+        "quantization": quantization_method,
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
