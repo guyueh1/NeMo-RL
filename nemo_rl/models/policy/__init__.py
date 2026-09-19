@@ -337,6 +337,9 @@ class Fp8Config(TypedDict):
     # cycle. Useful for FP8 training runs that observe growing reserved GPU memory
     # after offload.
     force_clear_fp8_caches: NotRequired[bool]
+    # Before each routed-expert FC1/FC2 forward, round the logical weight
+    # through block-32 MXFP4 and copy it back into its MXFP8 parameter storage.
+    mxfp4_moe_weight_fake_quant: NotRequired[bool]
 
 
 # Type exists to be lax if not specified

@@ -518,6 +518,15 @@ def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
     )
 
 
+def test_vllm_generation_requests_logical_refit_payload_for_mxfp4() -> None:
+    generation = VllmGeneration.__new__(VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_fake_quant": True}}
+    assert generation.get_refit_payload_mode() == "logical_weights"
+
+    generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_fake_quant": False}}
+    assert generation.get_refit_payload_mode() == "hf_export"
+
+
 def test_vllm_generation_rejects_partial_refit_pause_and_resume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

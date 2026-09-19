@@ -354,11 +354,9 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             refit_payload_mode=self._generation.get_refit_payload_mode(),
         )
 
-        # nccl_reshard_refit_info holds MeshInfo rank tensors created under
-        # Megatron, whose pickles resolve a Megatron-patched storage loader and
-        # therefore need `import megatron` on unpickle. Convert them to plain
-        # lists here; the vLLM worker rebuilds them in
-        # `restore_refit_info_placements()`.
+        # The Megatron worker already sanitizes this before the first Ray
+        # boundary. Keep this conversion idempotently at the backend boundary
+        # as well, so custom policy implementations receive the same safety.
         wire_refit_info = make_nccl_reshard_refit_info_wire_safe(
             nccl_reshard_refit_info
         )

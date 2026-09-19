@@ -43,6 +43,10 @@ from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
     pad_w13_intermediate,
 )
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
+from nemo_rl.models.quantization.mxfp4 import (
+    fake_quantize_mxfp4,
+    is_routed_moe_weight_name,
+)
 
 logger = init_logger(__name__)
 
@@ -73,6 +77,7 @@ class FP8Config:
     is_mx: bool = False
     is_deepseek_v4: bool = False
     refit_with_reload_api: bool = False
+    mxfp4_moe_weight_fake_quant: bool = False
 
 
 @dataclass()
@@ -244,6 +249,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     if vllm_cfg.get("is_mx") and not use_fp8_weights:
         raise ValueError("is_mx=True requires precision='fp8'")
+    if vllm_cfg.get("mxfp4_moe_weight_fake_quant") and not vllm_cfg.get("is_mx"):
+        raise ValueError("mxfp4_moe_weight_fake_quant=True requires is_mx=True")
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
@@ -325,6 +332,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "use_fp8_weights": use_fp8_weights,
         "is_deepseek_v4": getattr(config, "model_type", None) == "deepseek_v4",
         "refit_with_reload_api": bool(vllm_cfg.get("refit_with_reload_api")),
+        "mxfp4_moe_weight_fake_quant": bool(
+            vllm_cfg.get("mxfp4_moe_weight_fake_quant")
+        ),
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
@@ -592,7 +602,9 @@ def _is_fp8_grouped_moe_expert(name: str, model: Any) -> bool:
     )
 
 
-def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_mxfp8_weight(
+    weight: torch.Tensor, *, fake_quant_mxfp4: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a checkpoint-layout weight for MXFP8 weight loading and refit.
 
     FlashInfer represents all-zero blocks with E8M0 scale byte 0. Replace those
@@ -604,6 +616,8 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
         mxfp8_e4m3_quantize,
     )
 
+    if fake_quant_mxfp4:
+        weight = fake_quantize_mxfp4(weight)
     value, scale = mxfp8_e4m3_quantize(weight)
     value = value.reshape(weight.shape)
     scale = scale.reshape(*weight.shape[:-1], weight.shape[-1] // 32)
@@ -645,7 +659,13 @@ def get_quantized_weight_iterator(
         is_mx = global_fp8_config.is_mx
         # Cast the weight into fp8 and its scale factor
         if is_mx:
-            param_lp, param_scale = quantize_mxfp8_weight(v)
+            if (
+                global_fp8_config.mxfp4_moe_weight_fake_quant
+                and is_routed_moe_weight_name(k)
+            ):
+                param_lp, param_scale = quantize_mxfp8_weight(v, fake_quant_mxfp4=True)
+            else:
+                param_lp, param_scale = quantize_mxfp8_weight(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
                 v.to(torch.float),

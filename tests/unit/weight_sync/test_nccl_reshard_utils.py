@@ -154,8 +154,29 @@ def test_check_nccl_reshard_refit_support_rejects_blockwise_fp8_to_mxfp8() -> No
         "fp8_recipe": "blockwise",
     }
 
-    with pytest.raises(ValueError, match="does not support blockwise-FP8 storage"):
+    with pytest.raises(ValueError, match="does not support FP8 policy storage"):
         check_nccl_reshard_refit_support(config)
+
+
+def test_check_nccl_reshard_refit_support_accepts_mxfp8_policy_for_mxfp4_refit() -> (
+    None
+):
+    config = _valid_nccl_reshard_config()
+    config.policy["generation"]["vllm_cfg"].update(
+        {
+            "precision": "fp8",
+            "is_mx": True,
+            "mxfp4_moe_weight_fake_quant": True,
+        }
+    )
+    config.policy["megatron_cfg"]["fp8_cfg"] = {
+        "enabled": True,
+        "fp8_param": True,
+        "fp8_recipe": "mxfp8",
+        "mxfp4_moe_weight_fake_quant": True,
+    }
+
+    check_nccl_reshard_refit_support(config)
 
 
 @pytest.mark.parametrize(

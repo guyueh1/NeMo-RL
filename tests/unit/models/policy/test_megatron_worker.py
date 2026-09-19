@@ -460,6 +460,35 @@ def test_refit_destination_uses_common_worker_interface(
     assert set_device.call_args_list == [call(3), call(3)]
 
 
+def test_nccl_reshard_source_returns_wire_safe_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker.is_refit_destination = False
+    original = {"layer_names": ["model.layers.0"]}
+    wire_safe = {"layer_names": ["model.layers.0"], "wire_safe": True}
+    worker._prepare_source_nccl_reshard_refit_info = MagicMock(return_value=original)
+    sanitize = MagicMock(return_value=wire_safe)
+    monkeypatch.setattr(
+        megatron_policy_worker,
+        "make_nccl_reshard_refit_info_wire_safe",
+        sanitize,
+    )
+
+    result = worker.prepare_nccl_reshard_refit_info(
+        train_parallelism={"tp_size": 1},
+        gen_parallelism={"tp_size": 1},
+        train_world_size=1,
+        gen_world_size=1,
+        refit_payload_mode="logical_weights",
+    )
+
+    assert result is wire_safe
+    sanitize.assert_called_once_with(original)
+
+
 def test_m2n_destination_refreshes_flashinfer_after_misc_import(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -72,6 +72,9 @@ class VllmSpecificArgs(TypedDict):
     cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
+    # Before MXFP8 refit packing, round routed MoE FC1/FC2 weights through
+    # block-32 MXFP4. Runtime weights and activations remain MXFP8.
+    mxfp4_moe_weight_fake_quant: NotRequired[bool]
     # Deprecated in 0.8. Use quantization_ignore_patterns instead.
     quantization_ignored_layer_kws: NotRequired[list[str]]
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.

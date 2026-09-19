@@ -688,6 +688,8 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
         #   BF16 train  ↔ BF16 gen   (default, tested)
         #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
         #   BF16 storage → MXFP8 gen  (receiver quantizes the resharded BF16 shard)
+        #   MXFP8 storage → logical BF16 → MXFP4 → MXFP8 gen
+        #     (the explicitly gated MXFP4 fake-quant prototype)
         # FP8→BF16 has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
@@ -719,12 +721,23 @@ def check_nccl_reshard_refit_support(master_config: Any) -> None:
             if gen_precision == "fp8":
                 if fp8_param:
                     if vllm_cfg.get("is_mx"):
-                        violations.append(
-                            "policy.generation.vllm_cfg.is_mx=True does not support "
-                            "blockwise-FP8 storage from "
-                            "policy.megatron_cfg.fp8_cfg.fp8_param; use BF16 training "
-                            "storage for receiver-side MXFP8 quantization."
-                        )
+                        if vllm_cfg.get("mxfp4_moe_weight_fake_quant"):
+                            if fp8_recipe != "mxfp8":
+                                violations.append(
+                                    "policy.generation.vllm_cfg."
+                                    "mxfp4_moe_weight_fake_quant=True with "
+                                    "policy.megatron_cfg.fp8_cfg.fp8_param=True "
+                                    "requires fp8_recipe='mxfp8' for logical-weight "
+                                    f"export (got {fp8_recipe!r})."
+                                )
+                        else:
+                            violations.append(
+                                "policy.generation.vllm_cfg.is_mx=True does not "
+                                "support FP8 policy storage unless "
+                                "mxfp4_moe_weight_fake_quant=True requests "
+                                "logical-weight export; otherwise use BF16 training "
+                                "storage for receiver-side MXFP8 quantization."
+                            )
                     elif fp8_recipe != "blockwise":
                         violations.append(
                             "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "

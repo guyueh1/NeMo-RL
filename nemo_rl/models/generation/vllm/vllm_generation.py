@@ -43,6 +43,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitPayloadMode,
 )
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -109,6 +110,18 @@ def _record_vllm_generation_metrics(
 
 
 class VllmGeneration(GenerationInterface):
+    def get_refit_payload_mode(self) -> RefitPayloadMode:
+        """Request logical weights when MXFP4 fake quantization needs them.
+
+        An MXFP8-param Megatron policy otherwise exports its physical FP8 payload
+        and scale siblings.  The MXFP4 prototype must instead receive the logical
+        values so vLLM can apply MXFP4 fake quantization before its normal MXFP8
+        receiver-side packing.
+        """
+        if self.cfg["vllm_cfg"].get("mxfp4_moe_weight_fake_quant", False):
+            return "logical_weights"
+        return "hf_export"
+
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""

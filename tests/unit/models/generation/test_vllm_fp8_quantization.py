@@ -849,6 +849,24 @@ def test_init_fp8_rejects_mxfp8_without_fp8_precision(
         )
 
 
+def test_init_fp8_rejects_mxfp4_fake_quant_without_mxfp8(fp8_module):
+    fp8 = fp8_module
+
+    with pytest.raises(
+        ValueError, match="mxfp4_moe_weight_fake_quant=True requires is_mx=True"
+    ):
+        fp8.init_fp8(
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "auto",
+                "is_mx": False,
+                "mxfp4_moe_weight_fake_quant": True,
+            },
+            "dummy-model",
+            model_parallel_size=1,
+        )
+
+
 def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeypatch):
     fp8 = fp8_module
     weight = torch.zeros(2, 3, 32, dtype=torch.bfloat16)
@@ -873,6 +891,36 @@ def test_quantize_mxfp8_weight_restores_grouped_expert_shape(fp8_module, monkeyp
     assert torch.equal(
         scale.flatten(), torch.tensor([1, 2, 1, 127, 255, 5], dtype=torch.uint8)
     )
+
+
+def test_quantize_mxfp8_weight_can_fake_quantize_mxfp4_first(fp8_module, monkeypatch):
+    fp8 = fp8_module
+    weight = torch.arange(32, dtype=torch.bfloat16).reshape(1, 32)
+    fake_quantized = torch.full_like(weight, 2)
+    seen = []
+
+    from vllm.model_executor.layers.quantization.utils import mxfp8_utils
+
+    monkeypatch.setattr(
+        fp8,
+        "fake_quantize_mxfp4",
+        lambda tensor: fake_quantized if tensor is weight else pytest.fail(),
+    )
+
+    def capture_quantize(tensor):
+        seen.append(tensor)
+        return (
+            torch.zeros_like(tensor, dtype=torch.float8_e4m3fn),
+            torch.ones(1, dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(mxfp8_utils, "mxfp8_e4m3_quantize", capture_quantize)
+
+    value, scale = fp8.quantize_mxfp8_weight(weight, fake_quant_mxfp4=True)
+
+    assert seen == [fake_quantized]
+    assert value.shape == weight.shape
+    assert scale.shape == (1, 1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

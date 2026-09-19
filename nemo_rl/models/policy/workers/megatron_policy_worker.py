@@ -141,6 +141,7 @@ from nemo_rl.weight_sync.nccl_reshard_utils import (
     _extract_layer_prefix,
     build_nccl_reshard_refit_info,
     is_nccl_reshard_param,
+    make_nccl_reshard_refit_info_wire_safe,
 )
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
@@ -722,6 +723,24 @@ class MegatronPolicyWorkerImpl(
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
         self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
+        self._mxfp4_moe_weight_hook_handles = []
+        if self.fp8_cfg and self.fp8_cfg.get("mxfp4_moe_weight_fake_quant"):
+            if not (
+                self.fp8_cfg.get("enabled", False)
+                and self.fp8_cfg.get("fp8_recipe") == "mxfp8"
+                and self.fp8_cfg.get("fp8_param", False)
+            ):
+                raise ValueError(
+                    "megatron_cfg.fp8_cfg.mxfp4_moe_weight_fake_quant=True "
+                    "requires enabled=true, fp8_recipe='mxfp8', and fp8_param=true."
+                )
+            from nemo_rl.models.megatron.mxfp4_fake_quant import (
+                register_mxfp4_moe_weight_hooks,
+            )
+
+            self._mxfp4_moe_weight_hook_handles = register_mxfp4_moe_weight_hooks(
+                self.model
+            )
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
         )
@@ -3648,13 +3667,19 @@ class MegatronPolicyWorkerImpl(
             raise ValueError(
                 "Source NCCL refit requires train/gen parallelism and world sizes."
             )
-        return self._prepare_source_nccl_reshard_refit_info(
+        refit_info = self._prepare_source_nccl_reshard_refit_info(
             train_parallelism,
             gen_parallelism,
             train_world_size,
             gen_world_size,
             refit_payload_mode,
         )
+        # This result crosses the Megatron worker -> driver Ray boundary before
+        # the synchronizer can sanitize it.  Megatron patches PyTorch's tensor
+        # storage pickle loader, so return only list/dict mesh metadata while
+        # retaining the original objects in self.nccl_reshard_refit_info for
+        # the train-side transfer loop.
+        return make_nccl_reshard_refit_info_wire_safe(refit_info)
 
     def _build_expert_groups(self, param_map):
         """Group this rank's local expert params into stack-ready source specs.
