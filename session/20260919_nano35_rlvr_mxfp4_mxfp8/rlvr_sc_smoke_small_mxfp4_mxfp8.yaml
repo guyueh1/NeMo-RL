@@ -1,0 +1,72 @@
+# Nano 3.5 RLVR v2 small-smoke overlay for native routed-expert W4A8.
+#
+# This preserves the archived 10-node smoke shape and changes only the
+# training/rollout precision path. Megatron runs MXFP8 weight/activation
+# training and rounds routed FC1/FC2 weights through MXFP4 before each forward.
+# vLLM reloads logical refit tensors, stores routed FC1/FC2 in packed OCP MXFP4,
+# and executes them with dynamic MXFP8 activations via FlashInfer CUTLASS.
+defaults: rlvr_sc_smoke_small.yaml
+
+policy:
+  megatron_cfg:
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+    fp8_cfg:
+      enabled: true
+      fp8: e4m3
+      fp8_recipe: mxfp8
+      fp8_param: true
+      mxfp4_moe_weight_fake_quant: true
+    moe_router_dtype: fp32
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 0
+    num_layers_at_end_in_bf16: 8
+    te_precision_config_file: /opt/nemo-rl/te_config.yaml
+    fp32_lm_head: true
+    use_fused_linear_logprobs: false
+    env_vars:
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+
+  generation:
+    # Native MXFP4 repacks routed experts in vLLM's reload_weights path, so use
+    # the ordinary packed collective refit instead of nccl_reshard's direct
+    # destination writes.
+    refit_transport: null
+    real_quant_export_cpu_offload: true
+    vllm_cfg:
+      precision: fp8
+      is_mx: true
+      refit_with_reload_api: true
+      mxfp4_moe_weight_fake_quant: false
+      mxfp4_moe_weight_native: true
+      # Hybrid attention/Mamba cache groups each materialize a large slice of
+      # the utilization-derived budget in vLLM 0.25.1. Keep the aggregate
+      # cache allocations within physical memory for this smoke test.
+      gpu_memory_utilization: 0.40
+      enforce_eager: false
+      tensor_parallel_size: 4
+      expert_parallel_size: 1
+      num_first_layers_in_bf16: 0
+      num_last_layers_in_bf16: 0
+      # Ignore every non-routed-MoE weight. Routed FC1/FC2 are therefore the
+      # only weights handled by the native MXFP4/MXFP8 quantization method.
+      quantization_ignored_layer_kws:
+        - conv2d
+        - mtp
+        - q_proj
+        - v_proj
+        - k_proj
+        - o_proj
+        - in_proj
+        - out_proj
+        - fc1_latent_proj
+        - fc2_latent_proj
+        - shared_expert
+      fp32_lm_head: true
+    vllm_kwargs:
+      moe_backend: flashinfer_cutlass_afp8
+      max_num_seqs: 256
+      # Keep capture sizes bounded if eager mode is relaxed in a later run.
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 192, 256]

@@ -1,5 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
+import sys
+from types import ModuleType
+
 import pytest
 import torch
 
@@ -106,6 +109,12 @@ def test_register_mxfp4_moe_weight_hooks_targets_only_expert_fc(monkeypatch) -> 
             mlp.shared_experts.linear_fc1 = torch.nn.Linear(32, 32, bias=False)
             self.decoder.layers[0].mlp = mlp
 
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            mlp = self.decoder.layers[0].mlp
+            value = mlp.experts.linear_fc1(value)
+            value = mlp.experts.linear_fc2(value)
+            return mlp.shared_experts.linear_fc1(value)
+
     model = ToyModel()
     seen = []
     monkeypatch.setattr(
@@ -114,17 +123,49 @@ def test_register_mxfp4_moe_weight_hooks_targets_only_expert_fc(monkeypatch) -> 
         lambda weight: seen.append(weight),
     )
 
-    handles = mxfp4_fake_quant.register_mxfp4_moe_weight_hooks(model)
+    hook = mxfp4_fake_quant.register_mxfp4_moe_weight_hooks(model)
     x = torch.ones(1, 32)
-    model.decoder.layers[0].mlp.experts.linear_fc1(x)
-    model.decoder.layers[0].mlp.experts.linear_fc2(x)
-    model.decoder.layers[0].mlp.shared_experts.linear_fc1(x)
+    model(x)
+    model(x)
 
-    assert len(handles) == 2
     assert seen == [
         model.decoder.layers[0].mlp.experts.linear_fc1.weight,
         model.decoder.layers[0].mlp.experts.linear_fc2.weight,
     ]
+    hook.arm()
+    model(x)
+    assert len(seen) == 4
+
+
+def test_patch_mcore_language_loss_clones_logits_and_is_idempotent(
+    monkeypatch,
+) -> None:
+    from nemo_rl.models.megatron import mxfp4_fake_quant
+
+    class FakeLanguageModule:
+        def compute_language_model_loss(self, labels, logits):
+            del labels
+            return logits
+
+    fake_module = ModuleType(
+        "megatron.core.models.common.language_module.language_module"
+    )
+    fake_module.LanguageModule = FakeLanguageModule
+    monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
+
+    original = FakeLanguageModule.compute_language_model_loss
+    mxfp4_fake_quant.patch_mcore_language_loss_for_frozen_logits()
+    patched = FakeLanguageModule.compute_language_model_loss
+    mxfp4_fake_quant.patch_mcore_language_loss_for_frozen_logits()
+
+    logits = torch.ones(2, requires_grad=True)
+    cloned = FakeLanguageModule().compute_language_model_loss(None, logits)
+
+    assert patched is FakeLanguageModule.compute_language_model_loss
+    assert patched is not original
+    assert cloned.data_ptr() != logits.data_ptr()
+    cloned.sum().backward()
+    assert torch.equal(logits.grad, torch.ones_like(logits))
 
 
 def test_register_mxfp4_moe_weight_hooks_supports_grouped_linear_weights(
@@ -148,6 +189,9 @@ def test_register_mxfp4_moe_weight_hooks_supports_grouped_linear_weights(
             self.experts.linear_fc1 = GroupedLinear()
             self.experts.linear_fc2 = GroupedLinear()
 
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return self.experts.linear_fc2(self.experts.linear_fc1(value))
+
     model = ToyModel()
     seen = []
     monkeypatch.setattr(
@@ -156,15 +200,14 @@ def test_register_mxfp4_moe_weight_hooks_supports_grouped_linear_weights(
         lambda weight: seen.append(weight),
     )
 
-    handles = mxfp4_fake_quant.register_mxfp4_moe_weight_hooks(model)
+    hook = mxfp4_fake_quant.register_mxfp4_moe_weight_hooks(model)
     x = torch.ones(1, 32)
-    model.experts.linear_fc1(x)
-    model.experts.linear_fc2(x)
+    model(x)
 
-    assert len(handles) == 2
     assert seen == [
         model.experts.linear_fc1.weight0,
         model.experts.linear_fc1.weight1,
         model.experts.linear_fc2.weight0,
         model.experts.linear_fc2.weight1,
     ]
+    hook.remove()

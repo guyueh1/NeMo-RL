@@ -690,6 +690,14 @@ class MegatronPolicyWorkerImpl(
 
         # Store FP8 config for later use
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+        if self.fp8_cfg and self.fp8_cfg.get("mxfp4_moe_weight_fake_quant"):
+            from nemo_rl.models.megatron.mxfp4_fake_quant import (
+                patch_mcore_language_loss_for_frozen_logits,
+            )
+
+            # Install before model construction: MTP captures this bound loss
+            # callback while its layers are initialized.
+            patch_mcore_language_loss_for_frozen_logits()
 
         # Full-iteration CUDA graphs cannot be interrupted, so disable the
         # NaN-in-loss check that would otherwise require breaking out of the graph.
@@ -723,7 +731,7 @@ class MegatronPolicyWorkerImpl(
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
         self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
-        self._mxfp4_moe_weight_hook_handles = []
+        self._mxfp4_moe_weight_hook = None
         if self.fp8_cfg and self.fp8_cfg.get("mxfp4_moe_weight_fake_quant"):
             if not (
                 self.fp8_cfg.get("enabled", False)
@@ -738,9 +746,7 @@ class MegatronPolicyWorkerImpl(
                 register_mxfp4_moe_weight_hooks,
             )
 
-            self._mxfp4_moe_weight_hook_handles = register_mxfp4_moe_weight_hooks(
-                self.model
-            )
+            self._mxfp4_moe_weight_hook = register_mxfp4_moe_weight_hooks(self.model)
         log_gpu_memory_diagnostics(
             label="after_model_setup", worker_type="MegatronPolicyWorker"
         )
@@ -1553,6 +1559,8 @@ class MegatronPolicyWorkerImpl(
                 "a train step is already open; "
                 "call finish_train_step or abort_train_step before begin"
             )
+        if self._mxfp4_moe_weight_hook is not None:
+            self._mxfp4_moe_weight_hook.arm()
         # Match sync train() inference-state reset (line 332-340).
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
@@ -4004,6 +4012,8 @@ class MegatronPolicyWorkerImpl(
         # is also the "idle wait end" marker. Whether the offload was suppressed
         # is the difference between accumulating gradients across chunks and
         # discarding all but the last, so it is worth a line.
+        if self._mxfp4_moe_weight_hook is not None:
+            self._mxfp4_moe_weight_hook.arm()
         log.debug(
             "[lp_prep] rank=%d keep_train_buffers=%s",
             self.rank,

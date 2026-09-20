@@ -494,7 +494,7 @@ def test_init_fp8_reads_layer_count_from_text_config(fp8_module, monkeypatch):
     assert "model.layers.6.mlp.experts.up_proj" in ignored_layers
     assert "model.layers.7.mlp.experts.up_proj" in ignored_layers
     assert "model.layers.2.mlp.experts.up_proj" not in ignored_layers
-    assert from_config_calls[0][1] == {"trust_remote_code": True}
+    assert from_config_calls[0][1] == {}
 
 
 @pytest.mark.parametrize(

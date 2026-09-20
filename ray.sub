@@ -504,6 +504,17 @@ done
 unset _sorted_pairs _pair _si
 echo "[INFO] Nodes after hostname sort: ${nodes_array[*]}"
 
+# Sandbox nginx expands a cross-node upstream using Slurm hostnames. Some HSG
+# sandbox images do not have a working DNS resolver, and the submit host's
+# /etc/hosts does not necessarily list the allocated compute nodes. Build a
+# per-allocation hosts file from the IPs resolved above and bind-mount it into
+# every sandbox task so nginx configuration validation is deterministic.
+SANDBOX_HOSTS_FILE="$LOG_DIR/sandbox-hosts"
+cp /etc/hosts "$SANDBOX_HOSTS_FILE"
+for (( _si = 0; _si < ${#nodes_array[@]}; _si++ )); do
+  printf '%s\t%s\n' "${ip_addresses_array[$_si]}" "${nodes_array[$_si]}" >> "$SANDBOX_HOSTS_FILE"
+done
+
 head_node=${nodes_array[0]}
 head_node_ip=${ip_addresses_array[0]}
 
@@ -1020,7 +1031,7 @@ SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
 
 SANDBOX_BASE_PORT="${SANDBOX_BASE_PORT:-6001}"
 if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
-  SANDBOX_MOUNTS="$SANDBOX_PORTS_DIR:$SANDBOX_PORTS_DIR"
+  SANDBOX_MOUNTS="$SANDBOX_HOSTS_FILE:/etc/hosts:ro,$SANDBOX_PORTS_DIR:$SANDBOX_PORTS_DIR"
   if [[ -n "${SANDBOX_EXTRA_MOUNTS:-}" ]]; then
     SANDBOX_MOUNTS="${SANDBOX_EXTRA_MOUNTS},${SANDBOX_MOUNTS}"
   fi
