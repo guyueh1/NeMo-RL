@@ -19,8 +19,8 @@ sides when either exits.
 
 ## Stock vLLM API usage
 
-No endpoint plugin is required. The launcher sets `VLLM_SERVER_DEV_MODE=1`,
-which enables vLLM's development control endpoints. The controller uses:
+The launcher sets `VLLM_SERVER_DEV_MODE=1`, which enables vLLM's development
+control endpoints. The controller uses:
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -44,6 +44,45 @@ KV state.
 These development endpoints are powerful and must remain on the job's private
 network. A failed reload leaves the server paused because some workers may
 already contain the new version.
+
+## Multi-turn prefix-token extension
+
+Stock vLLM can return prompt and generation token IDs, but it does not accept
+NeMo Gym's `required_prefix_token_ids` request field. Multi-turn workloads that
+need exact token continuity load the endpoint plugin under
+`nemo_rl_vllm_prefix_plugin/`. The plugin is pinned to vLLM 0.29.0, shadows
+only `/v1/chat/completions`, and delegates the rest of request handling to the
+stock vLLM serving implementation.
+
+Build the pure-Python wheel onto shared storage and expose it to the vLLM API
+server process:
+
+```bash
+PLUGIN_WHEEL=$(tools/external_rollout_vllm/build_prefix_plugin.sh /shared/plugin)
+export PYTHONPATH="${PLUGIN_WHEEL}${PYTHONPATH:+:${PYTHONPATH}}"
+export VLLM_PLUGINS=nemo_rl_prefix_api
+vllm serve ...
+```
+
+The wheel path on `PYTHONPATH` supplies both the Python package and its entry
+point metadata; nothing is installed into the container. Check activation at
+`GET /v1/nemo-rl/prefix-token-capability`.
+
+The legacy inline-prefix mode enables token IDs in both directions:
+
+```yaml
+return_token_id_information: true
+request_prompt_and_generation_token_ids: true
+supply_prefix_token_ids: true
+```
+
+For SingleController external staging, enable `token_capture.enabled=true`
+instead. NeMo RL then configures every plugin backend with a controller-hosted
+staging bridge. Gym sends `ng_capture` admissions, and the plugin returns
+`ng_commit_coords` only after the exact token delta is durable in TransferQueue.
+This mode sets `return_token_id_information=false` and
+`supply_prefix_token_ids=false`; the staged delta is the authoritative token
+transport.
 
 ## Launching the Nano 3.5 RLVR smoke
 

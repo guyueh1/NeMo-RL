@@ -72,6 +72,16 @@ for required_file in vllm_backend_registry.sh vllm_pool_lb.py lb_watchdog.sh ser
     exit 1
   fi
 done
+EXTERNAL_VLLM_ROUTER_POOL="${EXTERNAL_VLLM_ROUTER_POOL:-}"
+if [[ -n "${VLLM_ROUTER_WHEEL:-}" && -n "${VLLM_ROUTER_SITE_PACKAGES:-}" ]]; then
+  echo "[FATAL] Set only one of VLLM_ROUTER_WHEEL and VLLM_ROUTER_SITE_PACKAGES" >&2
+  exit 1
+fi
+if [[ -n "${EXTERNAL_VLLM_ROUTER_POOL}" ]] &&
+  [[ ! -f "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/vllm_router_from_registry.sh" ]]; then
+  echo "[FATAL] Missing ${EXTERNAL_VLLM_TOOLS_DIR_HOST}/vllm_router_from_registry.sh" >&2
+  exit 1
+fi
 if [[ ! "${GPUS_PER_NODE}" =~ ^[0-9]+$ ]] || (( GPUS_PER_NODE <= 0 )); then
   echo "[FATAL] GPUS_PER_NODE must be a positive integer" >&2
   exit 1
@@ -123,13 +133,16 @@ declare -A node_counts=()
 declare -A served_model_names=()
 declare -A backend_ports=()
 declare -A lb_ports=()
+declare -A control_lb_ports=()
 declare -A startup_timeouts=()
 declare -A placeholders=()
+declare -A control_placeholders=()
 declare -A group_ids=()
 declare -A pool_log_dirs=()
 declare -A state_dirs=()
 declare -A lb_state_dirs=()
 declare -A pool_urls=()
+declare -A control_pool_urls=()
 
 total_external_nodes=0
 max_startup_timeout=0
@@ -161,8 +174,15 @@ for pool in "${pool_names[@]}"; do
   served_model_names["${pool}"]=$(pool_value "${pool}" SERVED_MODEL_NAME model)
   backend_ports["${pool}"]=$(pool_value "${pool}" VLLM_PORT 8000)
   lb_ports["${pool}"]=$(require_pool_value "${pool}" LB_PORT)
+  control_lb_ports["${pool}"]=$(pool_value "${pool}" CONTROL_LB_PORT)
   startup_timeouts["${pool}"]=$(pool_value "${pool}" STARTUP_TIMEOUT 3600)
   placeholders["${pool}"]=$(require_pool_value "${pool}" URL_PLACEHOLDER)
+  control_placeholders["${pool}"]=$(pool_value "${pool}" CONTROL_URL_PLACEHOLDER)
+  if { [[ -n "${control_lb_ports[${pool}]}" ]] && [[ -z "${control_placeholders[${pool}]}" ]]; } ||
+    { [[ -z "${control_lb_ports[${pool}]}" ]] && [[ -n "${control_placeholders[${pool}]}" ]]; }; then
+    echo "[FATAL] ${pool} must set both control endpoint fields" >&2
+    exit 1
+  fi
   group_ids["${pool}"]=$(pool_value "${pool}" GROUP_ID "inline-${pool,,}-${SLURM_JOB_ID}")
   if [[ ! "${group_ids[${pool}]}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "[FATAL] ${pool}_GROUP_ID may contain only letters, digits, '.', '_', and '-'" >&2
@@ -183,6 +203,8 @@ for pool in "${pool_names[@]}"; do
   export "${pool}_PREFILL_REPLICAS=${prefill_replicas[${pool}]}"
   export "${pool}_SERVED_MODEL_NAME=${served_model_names[${pool}]}"
   export "${pool}_VLLM_PORT=${backend_ports[${pool}]}"
+  export "${pool}_CONTROL_LB_PORT=${control_lb_ports[${pool}]}"
+  export "${pool}_CONTROL_URL_PLACEHOLDER=${control_placeholders[${pool}]}"
   export "${pool}_ENV_VARS=$(pool_value "${pool}" ENV_VARS)"
   export "${pool}_VLLM_ARGS=$(pool_value "${pool}" VLLM_ARGS)"
 
@@ -249,6 +271,18 @@ for pool in "${pool_names[@]}"; do
     exit 1
   fi
   seen_lb_ports["${lb_ports[${pool}]}"]="${pool}"
+  if [[ -n "${control_lb_ports[${pool}]}" ]]; then
+    if [[ ! "${control_lb_ports[${pool}]}" =~ ^[0-9]+$ ]] ||
+      (( control_lb_ports[${pool}] <= 0 || control_lb_ports[${pool}] > 65535 )); then
+      echo "[FATAL] ${pool}_CONTROL_LB_PORT must be a valid TCP port" >&2
+      exit 1
+    fi
+    if [[ -n "${seen_lb_ports[${control_lb_ports[${pool}]}]-}" ]]; then
+      echo "[FATAL] Multiple endpoints use port ${control_lb_ports[${pool}]}" >&2
+      exit 1
+    fi
+    seen_lb_ports["${control_lb_ports[${pool}]}"]="${pool}-control"
+  fi
   if [[ -n "${seen_placeholders[${placeholders[${pool}]}]-}" ]]; then
     echo "[FATAL] Multiple pools use URL placeholder ${placeholders[${pool}]}" >&2
     exit 1
@@ -257,6 +291,17 @@ for pool in "${pool_names[@]}"; do
   if [[ "${COMMAND}" != *"${placeholders[${pool}]}"* ]]; then
     echo "[FATAL] Driver command is missing ${placeholders[${pool}]} for ${display_names[${pool}]}" >&2
     exit 1
+  fi
+  if [[ -n "${control_placeholders[${pool}]}" ]]; then
+    if [[ -n "${seen_placeholders[${control_placeholders[${pool}]}]-}" ]]; then
+      echo "[FATAL] Multiple pools use URL placeholder ${control_placeholders[${pool}]}" >&2
+      exit 1
+    fi
+    if [[ "${COMMAND}" != *"${control_placeholders[${pool}]}"* ]]; then
+      echo "[FATAL] Driver command is missing ${control_placeholders[${pool}]} for ${display_names[${pool}]}" >&2
+      exit 1
+    fi
+    seen_placeholders["${control_placeholders[${pool}]}"]="${pool}-control"
   fi
 
   # Each private Ray cluster owns whole nodes. This makes its fixed Ray port safe
@@ -270,7 +315,31 @@ for pool in "${pool_names[@]}"; do
   fi
 done
 
+if [[ -n "${EXTERNAL_VLLM_ROUTER_POOL}" ]]; then
+  if [[ -z "${seen_pool_names[${EXTERNAL_VLLM_ROUTER_POOL}]-}" ]]; then
+    echo "[FATAL] EXTERNAL_VLLM_ROUTER_POOL is not registered: ${EXTERNAL_VLLM_ROUTER_POOL}" >&2
+    exit 1
+  fi
+  if [[ -z "${control_lb_ports[${EXTERNAL_VLLM_ROUTER_POOL}]}" ||
+    -z "${control_placeholders[${EXTERNAL_VLLM_ROUTER_POOL}]}" ]]; then
+    echo "[FATAL] ${EXTERNAL_VLLM_ROUTER_POOL} requires a separate control port and URL placeholder" >&2
+    exit 1
+  fi
+fi
+for pool in "${pool_names[@]}"; do
+  if [[ -n "${control_lb_ports[${pool}]}" && "${pool}" != "${EXTERNAL_VLLM_ROUTER_POOL}" ]]; then
+    echo "[FATAL] Only EXTERNAL_VLLM_ROUTER_POOL may define a separate control endpoint" >&2
+    exit 1
+  fi
+done
+
 shared_paths=("${BASE_LOG_DIR}" "${EXTERNAL_VLLM_TOOLS_DIR_HOST}")
+if [[ -n "${VLLM_ROUTER_WHEEL:-}" ]]; then
+  shared_paths+=("${VLLM_ROUTER_WHEEL}")
+fi
+if [[ -n "${VLLM_ROUTER_SITE_PACKAGES:-}" ]]; then
+  shared_paths+=("${VLLM_ROUTER_SITE_PACKAGES}")
+fi
 for pool in "${pool_names[@]}"; do
   if [[ "${models[${pool}]}" == /* ]]; then
     shared_paths+=("${models[${pool}]}")
@@ -589,6 +658,32 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     sleep 5
   done
 
+  if [[ "${NEMO_RL_VLLM_PREFIX_PLUGIN_REQUIRED:-0}" == "1" ]]; then
+    capability_path="${NEMO_RL_VLLM_PREFIX_CAPABILITY_PATH:-/v1/nemo-rl/prefix-token-capability}"
+    capability_url="http://${HEAD_IP}:${VLLM_HTTP_PORT}${capability_path}"
+    if [[ "${LAUNCH_MODE}" == "native" ]]; then
+      capability_json=$(curl --fail --silent --show-error --max-time 5 "${capability_url}")
+    else
+      capability_json=$("${VLLM_PYTHON}" -c \
+        'import sys, urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())' \
+        "${capability_url}")
+    fi
+    if ! printf '%s' "${capability_json}" | grep -Eq \
+      '"active"[[:space:]]*:[[:space:]]*true' \
+      || ! printf '%s' "${capability_json}" | grep -Eq \
+        '"required_prefix_token_ids"[[:space:]]*:[[:space:]]*true' \
+      || ! printf '%s' "${capability_json}" | grep -Eq \
+        '"ng_capture"[[:space:]]*:[[:space:]]*true' \
+      || ! printf '%s' "${capability_json}" | grep -Eq \
+        '"external_staging"[[:space:]]*:[[:space:]]*true' \
+      || ! printf '%s' "${capability_json}" | grep -Eq \
+        '"stock_chat_routes_replaced"[[:space:]]*:[[:space:]]*[1-9][0-9]*'; then
+      echo "[${REPLICA_ID}] ERROR: incomplete NeMo RL token-capture capability: ${capability_json}" >&2
+      exit 1
+    fi
+    echo "[${REPLICA_ID}] Verified NeMo RL token-capture API capability"
+  fi
+
   registry_add "${REPLICA_ID}" "${HEAD_IP}" "${VLLM_HTTP_PORT}" "${BACKEND_ROLE}"
   echo "[${REPLICA_ID}] Registered healthy ${BACKEND_ROLE} backend ${HEAD_IP}:${VLLM_HTTP_PORT}"
   if wait "${VLLM_PID}"; then
@@ -694,7 +789,15 @@ for pool in "${pool_names[@]}"; do
     lb_mode=disaggregated-prefill
   fi
   pool_urls["${pool}"]="http://${ray_head_ip}:${lb_ports[${pool}]}/v1"
-  echo "[INFO] Starting ${display_names[${pool}]} load balancer at ${pool_urls[${pool}]}"
+  proxy_port="${lb_ports[${pool}]}"
+  proxy_label="load balancer"
+  if [[ "${pool}" == "${EXTERNAL_VLLM_ROUTER_POOL}" ]]; then
+    proxy_port="${control_lb_ports[${pool}]}"
+    control_pool_urls["${pool}"]="http://${ray_head_ip}:${proxy_port}/v1"
+    proxy_label="control fan-out proxy"
+    lb_mode=control-fanout
+  fi
+  echo "[INFO] Starting ${display_names[${pool}]} ${proxy_label} on port ${proxy_port}"
   srun \
     --het-group=0 \
     --no-container-mount-home \
@@ -711,9 +814,41 @@ for pool in "${pool_names[@]}"; do
     --ntasks=1 \
     --cpus-per-task=2 \
     --output="${pool_log_dirs[${pool}]}/load_balancer.log" \
-    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}' '${lb_mode}'" &
+    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${proxy_port}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}' '${lb_mode}'" &
   lb_step_pids+=("$!")
-  lb_step_labels+=("${display_names[${pool}]} load balancer")
+  lb_step_labels+=("${display_names[${pool}]} ${proxy_label}")
+
+  if [[ "${pool}" == "${EXTERNAL_VLLM_ROUTER_POOL}" ]]; then
+    echo "[INFO] Starting ${display_names[${pool}]} Rust router at ${pool_urls[${pool}]}"
+    router_mounts="${external_service_mount},${EXTERNAL_VLLM_TOOLS_DIR_HOST}:/opt/external-vllm-tools:ro,${state_dirs[${pool}]}:${lb_state_dirs[${pool}]}"
+    srun \
+      --het-group=0 \
+      --no-container-mount-home \
+      --container-name="external-vllm-router-${pool,,}-${SLURM_JOB_ID}" \
+      --container-image="${containers[${pool}]}" \
+      --container-mounts="${router_mounts}" \
+      --container-workdir="${SLURM_SUBMIT_DIR}" \
+      --mpi=pmix \
+      -A "${SLURM_JOB_ACCOUNT}" \
+      -p "${SLURM_JOB_PARTITION}" \
+      --overlap \
+      --nodelist="${ray_head_node}" \
+      --nodes=1 \
+      --ntasks=1 \
+      --cpus-per-task="${VLLM_ROUTER_CPUS:-8}" \
+      --output="${pool_log_dirs[${pool}]}/vllm_router_step.log" \
+      --export="ALL,EXTERNAL_VLLM_TOOLS_DIR=/opt/external-vllm-tools" \
+      bash /opt/external-vllm-tools/vllm_router_from_registry.sh \
+        "${lb_ports[${pool}]}" \
+        "${lb_state_dirs[${pool}]}" \
+        "${group_ids[${pool}]}" \
+        "${replicas[${pool}]}" \
+        "${prefill_replicas[${pool}]}" \
+        "${startup_timeouts[${pool}]}" \
+        "${pool_log_dirs[${pool}]}/vllm_router.log" &
+    lb_step_pids+=("$!")
+    lb_step_labels+=("${display_names[${pool}]} Rust router")
+  fi
 done
 
 deadline=$((SECONDS + max_startup_timeout))
@@ -754,6 +889,18 @@ for pool in "${pool_names[@]}"; do
   done
   echo "${pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_url"
   COMMAND="${COMMAND//${placeholders[${pool}]}/${pool_urls[${pool}]}}"
+  if [[ -n "${control_placeholders[${pool}]}" ]]; then
+    until curl -sfm 10 "${control_pool_urls[${pool}]}/models" >/dev/null 2>&1; do
+      check_service_steps
+      if (( SECONDS >= deadline )); then
+        echo "[FATAL] ${display_names[${pool}]} control proxy failed its /models probe" >&2
+        exit 1
+      fi
+      sleep 5
+    done
+    echo "${control_pool_urls[${pool}]}" > "${LOG_DIR}/${pool,,}_control_url"
+    COMMAND="${COMMAND//${control_placeholders[${pool}]}/${control_pool_urls[${pool}]}}"
+  fi
 done
 export COMMAND
 

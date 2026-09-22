@@ -79,6 +79,8 @@ The generated fields are:
 | `POOL_PREFILL_REPLICAS` | no | `0` | Number of leading replicas used as NIXL prefill producers. The remaining replicas are decode consumers. Requires data parallel size 1. |
 | `POOL_LB_PORT` | yes | — | Unique load-balancer port on the Ray head node. |
 | `POOL_URL_PLACEHOLDER` | yes | — | Token in `COMMAND` replaced by this pool's `/v1` URL. |
+| `POOL_CONTROL_LB_PORT` | router only | — | Control fan-out proxy port when generation uses the Rust router. |
+| `POOL_CONTROL_URL_PLACEHOLDER` | router only | — | Token replaced by the control proxy's `/v1` URL. |
 | `POOL_GROUP_ID` | no | `inline-<pool>-<job-id>` | Registry namespace; set with `--group-id` only when an explicit stable namespace is needed. |
 | `POOL_DISPLAY_NAME` | no | pool name | Human-readable log label. |
 | `POOL_SERVED_MODEL_NAME` | no | `model` | OpenAI API model name. Must equal the calling Gym server's `model` field because Gym overwrites the request model. |
@@ -115,6 +117,48 @@ launcher's pool definition. A pool's reasoning-parser setting must also agree
 with the consuming Gym server's `uses_reasoning_parser` setting; in particular,
 do not pass `--reasoning-parser` when Gym explicitly disables it.
 
+### Optional Rust vLLM router frontend
+
+`run_in_allocation_vllm_router.sh` is an opt-in alternative for a P/D rollout
+pool. It keeps the original deployment available and changes only the rollout
+frontend:
+
+- OpenAI generation requests go directly to `vllm-project/router`, using
+  cache-aware prefill and decode policies by default.
+- A second instance of the existing Python proxy is control-only and broadcasts
+  pause, checkpoint reload, prefix-cache reset, and resume to every engine.
+- NeMo RL receives the Rust router as `remote_vllm_cfg.base_url` and the proxy
+  as `remote_vllm_cfg.control_base_url`.
+
+Register that pool with two distinct endpoints:
+
+```bash
+register_external_vllm_pool ROLLOUT \
+  ... \
+  --prefill-replicas 2 \
+  --lb-port 9210 \
+  --url-placeholder __ROLLOUT_BASE_URL__ \
+  --control-lb-port 9211 \
+  --control-url-placeholder __ROLLOUT_CONTROL_BASE_URL__
+
+COMMAND+=" ++policy.generation.remote_vllm_cfg.control_base_url=__ROLLOUT_CONTROL_BASE_URL__"
+```
+
+Submit `run_in_allocation_vllm_router.sh` instead of
+`run_in_allocation.sh`. The router container is the rollout pool's container.
+It must either have `vllm-router` importable by `VLLM_ROUTER_PYTHON`, or the
+caller must provide one of two artifacts on the shared filesystem:
+
+- `VLLM_ROUTER_SITE_PACKAGES`, a directory containing the router and its Python
+  dependencies, is added directly to `PYTHONPATH` and is preferred for an
+  immutable production image.
+- `VLLM_ROUTER_WHEEL`, a compatible wheel, is installed with `--no-deps` into a
+  job-local temporary directory. Use this only when the image already contains
+  all router dependencies.
+
+The Gym Nemotron 3.5 Super deployment uses a pinned patched router wheel; use
+the same wheel for comparable routing behavior rather than an unpinned release.
+
 ## Global contract
 
 Required variables:
@@ -137,6 +181,9 @@ Optional globals:
 | `EXTERNAL_VLLM_LB_PYTHON` | `/opt/nemo_rl_venv/bin/python` | Python with `aiohttp` in `CONTAINER`. |
 | `RAY_SUB` | `$SLURM_SUBMIT_DIR/ray.sub` | Normal NeMo RL Slurm entrypoint. |
 | `EXTERNAL_VLLM_SHARED_ROOT` | `/lustre` | Shared host path mounted at the same path in every external-service container. |
+| `EXTERNAL_VLLM_ROUTER_POOL` | empty | Pool routed by `vllm-project/router`; the opt-in wrapper defaults it to `ROLLOUT`. |
+| `VLLM_ROUTER_WHEEL` | empty | Optional patched router wheel under the shared root. |
+| `VLLM_ROUTER_SITE_PACKAGES` | empty | Optional shared router-plus-dependencies directory; mutually exclusive with `VLLM_ROUTER_WHEEL`. |
 | `DEDICATED_RAY_HEAD` | unset | Passed through to `ray.sub`. With `1`, include one extra node in hetgroup 0 while keeping `cluster.num_nodes` equal to the GPU worker-node count; the head node's GPUs remain allocated but idle. |
 
 The number of nodes in hetgroup 1 must equal:

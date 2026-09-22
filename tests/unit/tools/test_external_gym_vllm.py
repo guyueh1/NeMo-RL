@@ -707,12 +707,17 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
                 srun_blocks.append("\n".join(current_block))
                 current_block = []
 
-    assert len(srun_blocks) == 2
+    assert len(srun_blocks) == 3
     replica_launch = next(block for block in srun_blocks if "VLLM_SERVER_BODY" in block)
     lb_launch = next(
         block
         for block in srun_blocks
         if "lb_watchdog.sh" in block and "--output=" in block
+    )
+    router_launch = next(
+        block
+        for block in srun_blocks
+        if "vllm_router_from_registry.sh" in block and "--output=" in block
     )
 
     assert "--het-group=1" in replica_launch
@@ -721,6 +726,8 @@ def test_launcher_routes_generic_pools_to_explicit_hetgroups():
     assert "--het-group=0" in lb_launch
     assert '-A "${SLURM_JOB_ACCOUNT}"' in lb_launch
     assert '-p "${SLURM_JOB_PARTITION}"' in lb_launch
+    assert "--het-group=0" in router_launch
+    assert '--container-image="${containers[${pool}]}"' in router_launch
 
     assert "preflight" not in source.lower()
     assert "import ray, vllm" not in source
@@ -978,6 +985,44 @@ def test_pool_registration_counts_disaggregated_prefill_nodes():
     )
 
     assert result.stdout.splitlines() == ["prefill=2", "nodes=4"]
+
+
+def test_pool_registration_supports_separate_control_endpoint():
+    script = REPO_ROOT / "tools/external_gym_vllm/pool_config.sh"
+    program = textwrap.dedent(
+        f"""
+        set -euo pipefail
+        source {script}
+        register_external_vllm_pool ROLLOUT \
+          --model model --container image --python /opt/python \
+          --replicas 4 --tensor-parallel-size 4 --prefill-replicas 2 \
+          --lb-port 9210 --url-placeholder __ROLLOUT_URL__ \
+          --control-lb-port 9211 --control-url-placeholder __ROLLOUT_CONTROL_URL__
+        printf 'control_port=%s\n' "$ROLLOUT_CONTROL_LB_PORT"
+        printf 'control_placeholder=%s\n' "$ROLLOUT_CONTROL_URL_PLACEHOLDER"
+        """
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", program], capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout.splitlines() == [
+        "control_port=9211",
+        "control_placeholder=__ROLLOUT_CONTROL_URL__",
+    ]
+
+
+def test_rust_router_launcher_keeps_generation_off_python_proxy():
+    wrapper = REPO_ROOT / "tools/external_gym_vllm/run_in_allocation_vllm_router.sh"
+    router = REPO_ROOT / "tools/external_gym_vllm/vllm_router_from_registry.sh"
+
+    assert "EXTERNAL_VLLM_ROUTER_POOL" in wrapper.read_text()
+    router_source = router.read_text()
+    assert "--vllm-pd-disaggregation" in router_source
+    assert '--prefill-policy "${VLLM_ROUTER_PREFILL_POLICY}"' in router_source
+    assert '--decode-policy "${VLLM_ROUTER_DECODE_POLICY}"' in router_source
+    assert "vllm_pool_lb.py" not in router_source
 
 
 def test_pool_registration_supports_native_vllm_image_without_nemo_python():

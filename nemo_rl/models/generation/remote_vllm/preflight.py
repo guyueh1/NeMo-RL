@@ -32,15 +32,23 @@ def preflight_remote_vllm_service(
     ``VLLM_SERVER_DEV_MODE=1``, which is also what exposes ``/collective_rpc``.
     """
     client = RemoteVllmClient(config)
-    health = client.health(timeout_s=config.connect_timeout_s)
+    generation_health = client.health(timeout_s=config.connect_timeout_s)
+    control_health = generation_health
+    if config.control_base_url is not None:
+        control_health = client.health(
+            timeout_s=config.connect_timeout_s,
+            control=True,
+        )
     # The existing external-vLLM launcher puts a small load balancer in front
     # of each pool. Its /health response exposes the backend count. A normal
     # request proxy cannot make /collective_rpc global across independent
     # engine deployments, so fail before training rather than silently refit
     # only one replica. Native vLLM TP/PP/DP workers remain one backend here.
-    if health is not None and isinstance(health.get("total_backends"), int):
-        total_backends = health["total_backends"]
-        control_fanout = health.get("control_fanout") is True
+    if control_health is not None and isinstance(
+        control_health.get("total_backends"), int
+    ):
+        total_backends = control_health["total_backends"]
+        control_fanout = control_health.get("control_fanout") is True
         if total_backends != 1 and not control_fanout:
             raise RuntimeError(
                 "External vLLM refit requires exactly one engine deployment "
@@ -65,7 +73,9 @@ def preflight_remote_vllm_service(
         )
 
     raw_server_info: Any = client.get_json(
-        config.server_info_path, timeout_s=config.connect_timeout_s
+        config.server_info_path,
+        timeout_s=config.connect_timeout_s,
+        control=True,
     )
     if not isinstance(raw_server_info, dict):
         raise RuntimeError("External vLLM /server_info response is not an object")
