@@ -77,6 +77,28 @@ NL2BASH_TENSOR_PARALLEL_SIZE="${NL2BASH_TENSOR_PARALLEL_SIZE:-4}"
 VLLM_PYTHON="${VLLM_PYTHON:-/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python}"
 ROLLOUT_VLLM_LAUNCH_MODE="${ROLLOUT_VLLM_LAUNCH_MODE:-native}"
 ROLLOUT_VLLM_EXECUTABLE="${ROLLOUT_VLLM_EXECUTABLE:-/usr/local/bin/vllm}"
+ROLLOUT_FRONTEND="${ROLLOUT_FRONTEND:-python-proxy}"
+case "${ROLLOUT_FRONTEND}" in
+  python-proxy)
+    BATCH_SCRIPT="${EXTERNAL_VLLM_TOOLS_DIR_HOST}/run_in_allocation.sh"
+    ;;
+  vllm-router)
+    BATCH_SCRIPT="${EXTERNAL_VLLM_TOOLS_DIR_HOST}/run_in_allocation_vllm_router.sh"
+    ;;
+  *)
+    echo "ERROR: ROLLOUT_FRONTEND must be python-proxy or vllm-router" >&2
+    exit 1
+    ;;
+esac
+
+# The Gym-inspired Rust router is packaged separately from both the NeMo-RL
+# and vLLM containers. The deployment supplies either its site-packages
+# directory or a wheel; the downstream launcher rejects setting both.
+if [[ "${ROLLOUT_FRONTEND}" == "vllm-router" ]] && \
+  [[ -z "${VLLM_ROUTER_SITE_PACKAGES:-}" && -z "${VLLM_ROUTER_WHEEL:-}" ]]; then
+  echo "ERROR: vllm-router requires VLLM_ROUTER_SITE_PACKAGES or VLLM_ROUTER_WHEEL" >&2
+  exit 1
+fi
 
 CONFIG="${CONFIG:-${PROJECT_ROOT}/examples/nemo_gym/nemotron-3.5-nano/rlvr_sc_smoke_small_external_vllm.yaml}"
 TIME_LIMIT="${TIME_LIMIT:-1:30:00}"
@@ -145,11 +167,20 @@ done
 export MOUNTS
 
 ROLLOUT_BASE_URL=__ROLLOUT_BASE_URL__
+ROLLOUT_CONTROL_BASE_URL=__ROLLOUT_CONTROL_BASE_URL__
 GENRM_BASE_URL=__GENRM_BASE_URL__
 NL2BASH_BASE_URL=__NL2BASH_BASE_URL__
 ROLLOUT_REASONING_PARSER_PLUGIN="${PROJECT_ROOT}/nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
 
 COMMAND="cd ${PROJECT_ROOT} && OMP_NUM_THREADS=16 NEMO_GYM_VENV_DIR=${GYM_VENV_DIR} HF_HOME=${HF_HOME} RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 UV_HTTP_TIMEOUT=300 NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 NRL_WG_USE_RAY_REF=1 uv run examples/run_grpo_external_vllm_single_controller.py --config ${CONFIG} policy.model_name=${MODEL_PATH} policy.generation.max_new_tokens=${ROLLOUT_MAX_NEW_TOKENS} cluster.num_nodes=${TRAIN_NODES} cluster.gpus_per_node=${GPUS_PER_NODE} cluster.segment_size=${SEGMENT_SIZE} env.nemo_gym.num_gpu_nodes=${GYM_NODES} data.train.data_path=${TRAIN_PATH} data.validation.data_path=${VAL_PATH} policy.generation.remote_vllm_cfg.base_url=${ROLLOUT_BASE_URL} ++env.nemo_gym.genrm_model.responses_api_models.genrm_model.base_url=${GENRM_BASE_URL} ++env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=model ++env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.base_url=${NL2BASH_BASE_URL} ++env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=model env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=${SAFETY_JUDGE_MODEL} env.nemo_gym.nemo_gym_log_dir=${BASE_LOG_DIR}/nemo_gym checkpointing.checkpoint_dir=${BASE_LOG_DIR} logger.log_dir=${BASE_LOG_DIR} logger.wandb_enabled=${WANDB_ENABLED} logger.wandb.project=${WANDB_PROJECT} logger.wandb.name=${WANDB_NAME} grpo.max_num_steps=${NRL_MAX_STEPS}"
+ROLLOUT_CONTROL_ARGS=()
+if [[ "${ROLLOUT_FRONTEND}" == "vllm-router" ]]; then
+  COMMAND+=" ++policy.generation.remote_vllm_cfg.control_base_url=${ROLLOUT_CONTROL_BASE_URL}"
+  ROLLOUT_CONTROL_ARGS=(
+    --control-lb-port 9211
+    --control-url-placeholder "${ROLLOUT_CONTROL_BASE_URL}"
+  )
+fi
 
 source "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/pool_config.sh"
 EXTERNAL_VLLM_POOLS=""
@@ -169,10 +200,12 @@ register_external_vllm_pool ROLLOUT \
   --vllm-port 8000 \
   --served-model-name policy \
   --url-placeholder "${ROLLOUT_BASE_URL}" \
+  "${ROLLOUT_CONTROL_ARGS[@]}" \
   --startup-timeout "${STARTUP_TIMEOUT}" \
   --shared-path "${ROLLOUT_REASONING_PARSER_PLUGIN}"
 external_vllm_pool_env ROLLOUT \
   VLLM_SERVER_DEV_MODE=1 \
+  VLLM_HTTP_TIMEOUT_KEEP_ALIVE=180 \
   VLLM_SSM_CONV_STATE_LAYOUT=DS \
   UCX_MODULE_DIR=/usr/local/lib/python3.12/dist-packages/nixl_cu13.libs/ucx \
   UCX_TLS=all
@@ -280,6 +313,7 @@ echo "  Gym source:  checkout (USE_IMAGE_GYM=${USE_IMAGE_GYM})"
 echo "  Gym venvs:   ${GYM_VENV_DIR}"
 echo "  Ray image:   ${CONTAINER}"
 echo "  rollout image/mode: ${ROLLOUT_VLLM_CONTAINER} (${ROLLOUT_VLLM_LAUNCH_MODE})"
+echo "  rollout frontend:   ${ROLLOUT_FRONTEND}"
 echo "  other vLLM image:   ${VLLM_CONTAINER} (nemo-rl-ray)"
 echo "  config:      ${CONFIG}"
 
@@ -313,4 +347,4 @@ sbatch \
   --mem=0 \
   --gres="gpu:${GPUS_PER_NODE}" \
   --time="${TIME_LIMIT}" \
-  "${EXTERNAL_VLLM_TOOLS_DIR_HOST}/run_in_allocation.sh"
+  "${BATCH_SCRIPT}"

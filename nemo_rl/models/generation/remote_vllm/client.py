@@ -161,5 +161,14 @@ class RemoteVllmClient:
     def reset_prefix_cache(self) -> None:
         self.request("POST", self.config.reset_prefix_cache_path, control=True)
 
+    def configure_token_capture(self, *, bridge_url: str, auth_token: str) -> None:
+        """Configure every external backend to use the controller bridge."""
+        self.request(
+            "POST",
+            "/v1/nemo-rl/token-capture/configure",
+            body={"bridge_url": bridge_url, "auth_token": auth_token},
+            control=True,
+        )
+
     def resume(self) -> None:
         self.request("POST", self.config.resume_path, control=True)

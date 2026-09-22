@@ -320,10 +320,6 @@ if [[ -n "${EXTERNAL_VLLM_ROUTER_POOL}" ]]; then
     echo "[FATAL] EXTERNAL_VLLM_ROUTER_POOL is not registered: ${EXTERNAL_VLLM_ROUTER_POOL}" >&2
     exit 1
   fi
-  if (( prefill_replicas[${EXTERNAL_VLLM_ROUTER_POOL}] == 0 )); then
-    echo "[FATAL] Rust router mode currently requires a prefill/decode pool" >&2
-    exit 1
-  fi
   if [[ -z "${control_lb_ports[${EXTERNAL_VLLM_ROUTER_POOL}]}" ||
     -z "${control_placeholders[${EXTERNAL_VLLM_ROUTER_POOL}]}" ]]; then
     echo "[FATAL] ${EXTERNAL_VLLM_ROUTER_POOL} requires a separate control port and URL placeholder" >&2
@@ -662,6 +658,32 @@ if [[ "${SLURM_PROCID:-0}" -eq 0 ]]; then
     sleep 5
   done
 
+  if [[ "${NEMO_RL_VLLM_PREFIX_PLUGIN_REQUIRED:-0}" == "1" ]]; then
+    capability_path="${NEMO_RL_VLLM_PREFIX_CAPABILITY_PATH:-/v1/nemo-rl/prefix-token-capability}"
+    capability_url="http://${HEAD_IP}:${VLLM_HTTP_PORT}${capability_path}"
+    if [[ "${LAUNCH_MODE}" == "native" ]]; then
+      capability_json=$(curl --fail --silent --show-error --max-time 5 "${capability_url}")
+    else
+      capability_json=$("${VLLM_PYTHON}" -c \
+        'import sys, urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())' \
+        "${capability_url}")
+    fi
+    if ! printf '%s' "${capability_json}" | grep -Eq \
+      '"active"[[:space:]]*:[[:space:]]*true' \
+      || ! printf '%s' "${capability_json}" | grep -Eq \
+        '"required_prefix_token_ids"[[:space:]]*:[[:space:]]*true' \
+      || ! printf '%s' "${capability_json}" | grep -Eq \
+        '"ng_capture"[[:space:]]*:[[:space:]]*true' \
+      || ! printf '%s' "${capability_json}" | grep -Eq \
+        '"external_staging"[[:space:]]*:[[:space:]]*true' \
+      || ! printf '%s' "${capability_json}" | grep -Eq \
+        '"stock_chat_routes_replaced"[[:space:]]*:[[:space:]]*[1-9][0-9]*'; then
+      echo "[${REPLICA_ID}] ERROR: incomplete NeMo RL token-capture capability: ${capability_json}" >&2
+      exit 1
+    fi
+    echo "[${REPLICA_ID}] Verified NeMo RL token-capture API capability"
+  fi
+
   registry_add "${REPLICA_ID}" "${HEAD_IP}" "${VLLM_HTTP_PORT}" "${BACKEND_ROLE}"
   echo "[${REPLICA_ID}] Registered healthy ${BACKEND_ROLE} backend ${HEAD_IP}:${VLLM_HTTP_PORT}"
   if wait "${VLLM_PID}"; then
@@ -773,6 +795,7 @@ for pool in "${pool_names[@]}"; do
     proxy_port="${control_lb_ports[${pool}]}"
     control_pool_urls["${pool}"]="http://${ray_head_ip}:${proxy_port}/v1"
     proxy_label="control fan-out proxy"
+    lb_mode=control-fanout
   fi
   echo "[INFO] Starting ${display_names[${pool}]} ${proxy_label} on port ${proxy_port}"
   srun \

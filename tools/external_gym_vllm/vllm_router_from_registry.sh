@@ -56,25 +56,41 @@ while true; do
   sleep 5
 done
 
+worker_urls=()
 prefill_urls=()
 decode_urls=()
 for entry in "${registry_entries[@]}"; do
   read -r endpoint role <<< "${entry}"
-  case "${role}" in
-    prefill) prefill_urls+=("http://${endpoint}") ;;
-    decode) decode_urls+=("http://${endpoint}") ;;
-    *)
-      echo "Rust P/D router requires prefill/decode registry roles; got ${role}" >&2
-      exit 1
-      ;;
-  esac
+  if (( prefill_replicas > 0 )); then
+    case "${role}" in
+      prefill) prefill_urls+=("http://${endpoint}") ;;
+      decode) decode_urls+=("http://${endpoint}") ;;
+      *)
+        echo "Rust P/D router requires prefill/decode registry roles; got ${role}" >&2
+        exit 1
+        ;;
+    esac
+  else
+    case "${role}" in
+      standard) worker_urls+=("http://${endpoint}") ;;
+      *)
+        echo "Rust router regular mode requires standard registry roles; got ${role}" >&2
+        exit 1
+        ;;
+    esac
+  fi
 done
-if (( ${#prefill_urls[@]} != prefill_replicas )); then
-  echo "Expected ${prefill_replicas} prefill workers, found ${#prefill_urls[@]}" >&2
-  exit 1
-fi
-if (( ${#decode_urls[@]} != replicas - prefill_replicas )); then
-  echo "Expected $((replicas - prefill_replicas)) decode workers, found ${#decode_urls[@]}" >&2
+if (( prefill_replicas > 0 )); then
+  if (( ${#prefill_urls[@]} != prefill_replicas )); then
+    echo "Expected ${prefill_replicas} prefill workers, found ${#prefill_urls[@]}" >&2
+    exit 1
+  fi
+  if (( ${#decode_urls[@]} != replicas - prefill_replicas )); then
+    echo "Expected $((replicas - prefill_replicas)) decode workers, found ${#decode_urls[@]}" >&2
+    exit 1
+  fi
+elif (( ${#worker_urls[@]} != replicas )); then
+  echo "Expected ${replicas} standard workers, found ${#worker_urls[@]}" >&2
   exit 1
 fi
 
@@ -109,17 +125,27 @@ router_args=(
   --request-timeout-secs "${VLLM_ROUTER_REQUEST_TIMEOUT_S}"
   --worker-startup-timeout-secs "${startup_timeout}"
   --intra-node-data-parallel-size "${VLLM_ROUTER_INTRA_NODE_DATA_PARALLEL_SIZE}"
-  --prefill-policy "${VLLM_ROUTER_PREFILL_POLICY}"
-  --decode-policy "${VLLM_ROUTER_DECODE_POLICY}"
-  --vllm-pd-disaggregation
   --log-level "${VLLM_ROUTER_LOG_LEVEL:-info}"
 )
-for url in "${prefill_urls[@]}"; do
-  router_args+=(--prefill "${url}")
-done
-for url in "${decode_urls[@]}"; do
-  router_args+=(--decode "${url}")
-done
 
-echo "Starting vllm-router with ${#prefill_urls[@]} prefill and ${#decode_urls[@]} decode workers"
+if (( prefill_replicas > 0 )); then
+  router_args+=(
+    --prefill-policy "${VLLM_ROUTER_PREFILL_POLICY}"
+    --decode-policy "${VLLM_ROUTER_DECODE_POLICY}"
+    --vllm-pd-disaggregation
+  )
+  for url in "${prefill_urls[@]}"; do
+    router_args+=(--prefill "${url}")
+  done
+  for url in "${decode_urls[@]}"; do
+    router_args+=(--decode "${url}")
+  done
+  echo "Starting vllm-router with ${#prefill_urls[@]} prefill and ${#decode_urls[@]} decode workers"
+else
+  router_args+=(--policy "${VLLM_ROUTER_POLICY:-cache_aware}" --worker-urls)
+  for url in "${worker_urls[@]}"; do
+    router_args+=("${url}")
+  done
+  echo "Starting vllm-router with ${#worker_urls[@]} standard workers"
+fi
 exec "${router_python}" -m vllm_router.launch_router "${router_args[@]}" >> "${log_file}" 2>&1

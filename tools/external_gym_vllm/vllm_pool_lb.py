@@ -81,6 +81,7 @@ RETRYABLE_UPSTREAM_STATUSES = {500, 502, 503, 504}
 REFIT_CONTROL_PATHS = {
     "/pause",
     "/collective_rpc",
+    "/v1/nemo-rl/token-capture/configure",
     "/reset_prefix_cache",
     "/resume",
 }
@@ -341,7 +342,11 @@ class LoadBalancer:
                 "healthy_backends": healthy_count,
                 "total_backends": len(backends),
                 "role_counts": role_counts,
-                "control_fanout": self.mode == "disaggregated-prefill",
+                "control_fanout": self.mode
+                in {
+                    "control-fanout",
+                    "disaggregated-prefill",
+                },
                 "backends": backends,
             }
         )
@@ -614,9 +619,12 @@ class LoadBalancer:
         }
 
         request_path = request.path_qs.partition("?")[0]
+        if (
+            self.mode in {"control-fanout", "disaggregated-prefill"}
+            and request_path in REFIT_CONTROL_PATHS
+        ):
+            return await self._handle_control_fanout(request, body, headers)
         if self.mode == "disaggregated-prefill":
-            if request_path in REFIT_CONTROL_PATHS:
-                return await self._handle_control_fanout(request, body, headers)
             if (
                 request.method == "POST"
                 and request_path in DISAGGREGATED_GENERATION_PATHS
@@ -771,7 +779,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=("load-balance", "disaggregated-prefill"),
+        choices=("load-balance", "control-fanout", "disaggregated-prefill"),
         default="load-balance",
         help="Proxy topology",
     )
