@@ -72,9 +72,6 @@ class VllmSpecificArgs(TypedDict):
     cap_max_tokens_to_context: NotRequired[bool]
     # Use ModelOpt MXFP8 quantization when precision is fp8.
     is_mx: NotRequired[bool]
-    # Before MXFP8 refit packing, round routed MoE FC1/FC2 weights through
-    # block-32 MXFP4. Runtime weights and activations remain MXFP8.
-    mxfp4_moe_weight_fake_quant: NotRequired[bool]
     # Store routed MoE FC1/FC2 weights as packed block-32 MXFP4 and execute
     # them with dynamic MXFP8 activations through FlashInfer CUTLASS.
     mxfp4_moe_weight_native: NotRequired[bool]

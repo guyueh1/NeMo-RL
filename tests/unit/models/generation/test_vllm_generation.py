@@ -520,13 +520,10 @@ def test_vllm_generation_broadcasts_native_refit_pause_and_resume(
 
 def test_vllm_generation_requests_logical_refit_payload_for_mxfp4() -> None:
     generation = VllmGeneration.__new__(VllmGeneration)
-    generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_fake_quant": True}}
-    assert generation.get_refit_payload_mode() == "logical_weights"
-
     generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_native": True}}
     assert generation.get_refit_payload_mode() == "logical_weights"
 
-    generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_fake_quant": False}}
+    generation.cfg = {"vllm_cfg": {"mxfp4_moe_weight_native": False}}
     assert generation.get_refit_payload_mode() == "hf_export"
 
 
@@ -1502,7 +1499,7 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
         ),
         (
             {"vllm_cfg": {"expert_parallel_size": 2}},
-            "requires expert_parallel_size=1",
+            "requires expert_parallel_size=1 or expert_parallel_size=",
         ),
     ],
 )
@@ -1526,6 +1523,24 @@ def test_vllm_validate_settings_rejects_unsupported_native_mxfp4(
 
     with pytest.raises(AssertionError, match=error_match):
         VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_validate_settings_accepts_native_mxfp4_tp4_ep4():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["colocated"]["enabled"] = False
+    vllm_config["refit_transport"] = None
+    vllm_config["vllm_cfg"].update(
+        {
+            "refit_with_reload_api": True,
+            "mxfp4_moe_weight_native": True,
+            "tensor_parallel_size": 4,
+            "expert_parallel_size": 4,
+        }
+    )
+    vllm_config["vllm_kwargs"] = {"moe_backend": "flashinfer_cutlass_afp8"}
+    master_config = types.SimpleNamespace(policy={"generation": vllm_config})
+
+    VllmGeneration.validate_settings(master_config)
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):

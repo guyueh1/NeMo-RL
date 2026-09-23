@@ -690,14 +690,17 @@ class MegatronPolicyWorkerImpl(
 
         # Store FP8 config for later use
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-        if self.fp8_cfg and self.fp8_cfg.get("mxfp4_moe_weight_fake_quant"):
-            from nemo_rl.models.megatron.mxfp4_fake_quant import (
-                patch_mcore_language_loss_for_frozen_logits,
+        self._mxfp4_moe_runtime_patch_enabled = bool(
+            self.fp8_cfg and self.fp8_cfg.get("mxfp4_moe_weight_native")
+        )
+        if self._mxfp4_moe_runtime_patch_enabled:
+            from nemo_rl.models.megatron.mxfp4_runtime import (
+                patch_mcore_language_loss_for_detached_mtp_logits,
             )
 
-            # Install before model construction: MTP captures this bound loss
-            # callback while its layers are initialized.
-            patch_mcore_language_loss_for_frozen_logits()
+            # Install before model construction: detached MTP heads capture
+            # this bound loss callback while their layers are initialized.
+            patch_mcore_language_loss_for_detached_mtp_logits()
 
         # Full-iteration CUDA graphs cannot be interrupted, so disable the
         # NaN-in-loss check that would otherwise require breaking out of the graph.
@@ -732,17 +735,18 @@ class MegatronPolicyWorkerImpl(
         self.draft_model = model_and_optimizer_state.draft_model
         self._colocated_reshard_plan = model_and_optimizer_state.colocated_reshard_plan
         self._mxfp4_moe_weight_hook = None
-        if self.fp8_cfg and self.fp8_cfg.get("mxfp4_moe_weight_fake_quant"):
+        if self._mxfp4_moe_runtime_patch_enabled:
+            assert self.fp8_cfg is not None
             if not (
                 self.fp8_cfg.get("enabled", False)
                 and self.fp8_cfg.get("fp8_recipe") == "mxfp8"
                 and self.fp8_cfg.get("fp8_param", False)
             ):
                 raise ValueError(
-                    "megatron_cfg.fp8_cfg.mxfp4_moe_weight_fake_quant=True "
+                    "megatron_cfg.fp8_cfg.mxfp4_moe_weight_native=True "
                     "requires enabled=true, fp8_recipe='mxfp8', and fp8_param=true."
                 )
-            from nemo_rl.models.megatron.mxfp4_fake_quant import (
+            from nemo_rl.models.megatron.mxfp4_runtime import (
                 register_mxfp4_moe_weight_hooks,
             )
 

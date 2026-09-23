@@ -166,14 +166,14 @@ def test_check_nccl_reshard_refit_support_accepts_mxfp8_policy_for_mxfp4_refit()
         {
             "precision": "fp8",
             "is_mx": True,
-            "mxfp4_moe_weight_fake_quant": True,
+            "mxfp4_moe_weight_native": True,
         }
     )
     config.policy["megatron_cfg"]["fp8_cfg"] = {
         "enabled": True,
         "fp8_param": True,
         "fp8_recipe": "mxfp8",
-        "mxfp4_moe_weight_fake_quant": True,
+        "mxfp4_moe_weight_native": True,
     }
 
     check_nccl_reshard_refit_support(config)

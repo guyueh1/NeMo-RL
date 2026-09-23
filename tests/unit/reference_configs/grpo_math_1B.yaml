@@ -314,7 +314,7 @@ policy:
       fp8: "e4m3"
       fp8_recipe: "blockwise"
       fp8_param: false
-      mxfp4_moe_weight_fake_quant: false
+      mxfp4_moe_weight_native: false
 
     env_vars: null
 
@@ -433,7 +433,6 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
-      mxfp4_moe_weight_fake_quant: false
       mxfp4_moe_weight_native: false
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs

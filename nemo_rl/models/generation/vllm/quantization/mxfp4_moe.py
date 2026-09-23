@@ -25,62 +25,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-
 NEMO_MXFP4_MOE_MXFP8 = "nemo_mxfp4_moe_mxfp8"
 MXFP4_BLOCK_SIZE = 32
-_MXFP4_BLOCKS_PER_CHUNK = 262_144
 _registered = False
-
-
-def quantize_mxfp4_weight(
-    weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a logical weight as OCP E2M1 values and block-32 E8M0 scales."""
-    if not weight.is_floating_point():
-        raise TypeError(
-            f"MXFP4 quantization requires a float tensor, got {weight.dtype}"
-        )
-    if weight.shape[-1] % MXFP4_BLOCK_SIZE != 0:
-        raise ValueError(
-            "MXFP4 quantization requires the last dimension to be divisible by "
-            f"{MXFP4_BLOCK_SIZE}, got shape {tuple(weight.shape)}."
-        )
-
-    blocks = weight.reshape(-1, MXFP4_BLOCK_SIZE)
-    packed = torch.empty(
-        (blocks.shape[0], MXFP4_BLOCK_SIZE // 2),
-        dtype=torch.uint8,
-        device=weight.device,
-    )
-    scales = torch.empty(blocks.shape[0], dtype=torch.uint8, device=weight.device)
-    boundaries = torch.tensor(
-        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-        dtype=torch.float32,
-        device=weight.device,
-    )
-
-    for start in range(0, blocks.shape[0], _MXFP4_BLOCKS_PER_CHUNK):
-        stop = min(start + _MXFP4_BLOCKS_PER_CHUNK, blocks.shape[0])
-        values = blocks[start:stop].to(torch.float32)
-        amax = values.abs().amax(dim=-1, keepdim=True)
-        finite_amax = torch.where(torch.isfinite(amax), amax, torch.zeros_like(amax))
-        exponent = torch.ceil(torch.log2(finite_amax / 6.0))
-        exponent = torch.where(
-            finite_amax == 0, torch.full_like(exponent, -127), exponent
-        ).clamp(-127, 127)
-        scale = torch.exp2(exponent)
-        magnitude_code = torch.bucketize(
-            (values / scale).abs().clamp(max=6.0), boundaries
-        ).to(torch.uint8)
-        sign_code = (torch.signbit(values) & (magnitude_code != 0)).to(torch.uint8) << 3
-        code = magnitude_code | sign_code
-        packed[start:stop].copy_(code[:, 0::2] | (code[:, 1::2] << 4))
-        scales[start:stop].copy_((exponent.squeeze(-1) + 127).to(torch.uint8))
-
-    return (
-        packed.reshape(*weight.shape[:-1], weight.shape[-1] // 2),
-        scales.reshape(*weight.shape[:-1], weight.shape[-1] // MXFP4_BLOCK_SIZE),
-    )
 
 
 def _quantize_stacked_experts_for_cutlass(

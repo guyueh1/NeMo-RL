@@ -5,7 +5,6 @@ grpo:
   num_generations_per_prompt: 4
   async_grpo:
     enabled: true
-    max_trajectory_age_steps: 1
     in_flight_weight_updates: true
 loss_fn:
   use_importance_sampling_correction: true
@@ -14,9 +13,6 @@ checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-nemotron3.5-lightning-native-mxfp4-mxfp8
 policy:
-  # Megatron trains from logical weights and keeps the MXFP4 quant-dequant
-  # pre-forward hook enabled. vLLM receives those logical weights during each
-  # reload refit, then stores routed experts as native packed OCP MXFP4.
   model_name: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
   tokenizer:
     name: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
@@ -29,18 +25,11 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
-    tensor_model_parallel_size: 1
-    expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
-    pipeline_model_parallel_size: 1
-    context_parallel_size: 1
     sequence_parallel: true
     activation_checkpointing: true
-    freeze_moe_router: true
     moe_router_dtype: fp32
-    moe_router_load_balancing_type: none
     moe_router_enable_expert_bias: true
-    moe_token_dispatcher_type: alltoall
     moe_grouped_gemm: true
     use_fused_weighted_squared_relu: true
     bias_activation_fusion: false
@@ -50,23 +39,18 @@ policy:
     mtp_detach_heads: true
     fp8_cfg:
       enabled: true
-      fp8: e4m3
       fp8_recipe: mxfp8
       fp8_param: true
-      # Keep policy numerics aligned with vLLM's native MXFP4 expert weights.
-      mxfp4_moe_weight_fake_quant: true
+      mxfp4_moe_weight_native: true
+    te_precision_config_file: /opt/nemo-rl/te_config.yaml
     optimizer:
       use_precision_aware_optimizer: false
     env_vars:
-      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: '1'
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
   sequence_packing:
     enabled: false
   generation:
-    backend: vllm
-    # reload_weights restores logical BF16 tensors, loads the refit, and invokes
-    # the MXFP4 packer before copying into CUDA-graph-stable kernel storage.
-    refit_transport: null
     colocated:
       enabled: false
       resources:
@@ -74,31 +58,23 @@ policy:
         gpus_per_node: 4
     vllm_cfg:
       async_engine: true
-      # TP=2 leaves enough headroom for layerwise logical-weight loading and
-      # MXFP4 packing; TP=1 exhausts a 192 GB GB200 during initial conversion.
       tensor_parallel_size: 2
-      # Keep EP disabled until the upstream CUTLASS MXFP8 scale-swizzle/all-to-all
-      # ordering bug is fixed in the pinned vLLM line.
-      expert_parallel_size: 1
       gpu_memory_utilization: 0.7
       precision: fp8
       is_mx: true
       refit_with_reload_api: true
-      mxfp4_moe_weight_fake_quant: false
       mxfp4_moe_weight_native: true
       quantization_ignore_patterns:
-        - model.layers.*.self_attn.*
-        - model.layers.*.linear_attn.*
-        - model.layers.*.mlp.gate
-        - model.layers.*.mlp.shared_expert*
-        - lm_head
+      - '*mtp*'
+      - model.layers.*.self_attn.*
+      - model.layers.*.linear_attn.*
+      - model.layers.*.mlp.gate
+      - model.layers.*.mlp.shared_expert*
+      - lm_head
     vllm_kwargs:
       moe_backend: flashinfer_cutlass_afp8
 data:
   max_input_seq_length: 2048
-  train:
-    dataset_name: OpenMathInstruct-2
-  validation: null
 logger:
   log_dir: logs/grpo-nemotron3.5-lightning-native-mxfp4-mxfp8
   wandb_enabled: true

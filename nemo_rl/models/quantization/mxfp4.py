@@ -14,13 +14,12 @@
 
 import torch
 
-
 MXFP4_BLOCK_SIZE = 32
 MXFP4_E2M1_MAX = 6.0
 _MXFP4_BLOCKS_PER_CHUNK = 262_144
 
 
-def fake_quantize_mxfp4(weight: torch.Tensor) -> torch.Tensor:
+def quantize_dequantize_mxfp4(weight: torch.Tensor) -> torch.Tensor:
     """Round a logical weight through block-scaled MXFP4 and dequantize it.
 
     MXFP4 uses blocks of 32 E2M1 values with one power-of-two E8M0 scale per
@@ -29,11 +28,11 @@ def fake_quantize_mxfp4(weight: torch.Tensor) -> torch.Tensor:
     """
     if not weight.is_floating_point():
         raise TypeError(
-            f"MXFP4 fake quantization requires a float tensor, got {weight.dtype}"
+            f"MXFP4 quantize/dequantize requires a float tensor, got {weight.dtype}"
         )
     if weight.shape[-1] % MXFP4_BLOCK_SIZE != 0:
         raise ValueError(
-            "MXFP4 fake quantization requires the last dimension to be divisible "
+            "MXFP4 quantize/dequantize requires the last dimension to be divisible "
             f"by {MXFP4_BLOCK_SIZE}, got shape {tuple(weight.shape)}."
         )
 
@@ -70,21 +69,3 @@ def fake_quantize_mxfp4(weight: torch.Tensor) -> torch.Tensor:
         dequantized[start:stop].copy_(torch.copysign(quantized, float_blocks) * scale)
 
     return dequantized.reshape(original_shape)
-
-
-def is_routed_moe_weight_name(name: str) -> bool:
-    """Return whether an HF/Megatron name denotes a routed MoE FC weight."""
-    return (
-        ".experts." in name
-        and name.endswith(".weight")
-        and any(
-            component in name
-            for component in (
-                ".gate_proj.",
-                ".up_proj.",
-                ".down_proj.",
-                ".linear_fc1.",
-                ".linear_fc2.",
-            )
-        )
-    )

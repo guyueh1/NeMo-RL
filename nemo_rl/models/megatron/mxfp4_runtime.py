@@ -17,24 +17,24 @@ from typing import Any
 
 import torch
 
-from nemo_rl.models.quantization.mxfp4 import fake_quantize_mxfp4
+from nemo_rl.models.quantization.mxfp4 import quantize_dequantize_mxfp4
 
 
-def patch_mcore_language_loss_for_frozen_logits() -> None:
-    """Clone logits before MCore's in-place fused vocabulary cross entropy.
+def patch_mcore_language_loss_for_detached_mtp_logits() -> None:
+    """Clone detached MTP logits before MCore's in-place fused cross entropy.
 
-    Detached MTP heads use ``LinearWithFrozenWeight``, whose custom autograd
-    function returns a view. MCore's native fused cross entropy normalizes its
-    logits in place, which is forbidden on that view and fails in backward.
-    This patch is installed before model construction so MTP stores the wrapped
-    loss callback, and is scoped to the MXFP4 fake-quant training mode.
+    MTP detached heads use ``LinearWithFrozenWeight``, whose custom autograd
+    function returns a view. MCore's fused vocabulary cross entropy normalizes
+    logits in place, which is forbidden on that view during backward. This is
+    unrelated to quantizing the output projection; install the compatibility
+    patch before model construction so MTP captures the wrapped loss callback.
     """
     from megatron.core.models.common.language_module.language_module import (
         LanguageModule,
     )
 
     original = LanguageModule.compute_language_model_loss
-    if getattr(original, "_nrl_clones_frozen_logits", False):
+    if getattr(original, "_nrl_clones_detached_mtp_logits", False):
         return
 
     @wraps(original)
@@ -45,17 +45,19 @@ def patch_mcore_language_loss_for_frozen_logits() -> None:
     ) -> torch.Tensor:
         return original(self, labels, logits.clone())
 
-    compute_language_model_loss_with_cloned_logits._nrl_clones_frozen_logits = True  # type: ignore[attr-defined]
+    compute_language_model_loss_with_cloned_logits._nrl_clones_detached_mtp_logits = (  # type: ignore[attr-defined]
+        True
+    )
     LanguageModule.compute_language_model_loss = (  # type: ignore[method-assign]
         compute_language_model_loss_with_cloned_logits
     )
     print(
-        "Patched MCore language-model loss to clone frozen-head logits before "
+        "Patched MCore language-model loss to clone detached MTP logits before "
         "in-place fused cross entropy."
     )
 
 
-def _fake_quantize_mxfp4_weight_(weight: torch.Tensor) -> None:
+def _quantize_dequantize_mxfp4_weight_(weight: torch.Tensor) -> None:
     """Round one BF16 or Transformer Engine MXFP8 weight in place."""
     # Keep optional Transformer Engine/Megatron imports off non-Megatron paths.
     from megatron.core.fp8_utils import (
@@ -72,7 +74,7 @@ def _fake_quantize_mxfp4_weight_(weight: torch.Tensor) -> None:
 
     for member in members:
         logical = dequantize_fp8_tensor(member) if is_float8tensor(member) else member
-        member.copy_(fake_quantize_mxfp4(logical))
+        member.copy_(quantize_dequantize_mxfp4(logical))
 
 
 class MXFP4MoEWeightHook:
@@ -108,20 +110,20 @@ class MXFP4MoEWeightHook:
                     weight = getattr(module, weight_name, None)
                     if weight is None:
                         raise RuntimeError(
-                            "MXFP4 MoE fake-quant hook lost weight "
+                            "MXFP4 MoE runtime hook lost weight "
                             f"{module_name}.{weight_name}."
                         )
-                    _fake_quantize_mxfp4_weight_(weight)
+                    _quantize_dequantize_mxfp4_weight_(weight)
         self._application_count += 1
         print(
-            "Applied one-shot MXFP4->MXFP8 fake quantization to "
+            "Applied one-shot MXFP4 quantize/dequantize to "
             f"{sum(len(names) for _, _, names in self._matched_weights)} "
             f"routed-expert weights (application {self._application_count})."
         )
 
 
 def register_mxfp4_moe_weight_hooks(model: torch.nn.Module) -> MXFP4MoEWeightHook:
-    """Fake-quantize all routed-expert FC1/FC2 weights before model forward.
+    """Quantize/dequantize non-MTP routed-expert weights before model forward.
 
     Megatron parameters can be views into one flat parameter buffer. Quantizing
     individual expert weights immediately before each expert executes therefore
@@ -131,7 +133,8 @@ def register_mxfp4_moe_weight_hooks(model: torch.nn.Module) -> MXFP4MoEWeightHoo
     """
     matched_weights: list[tuple[str, torch.nn.Module, tuple[str, ...]]] = []
     for module_name, module in model.named_modules():
-        if "experts" not in module_name.split("."):
+        module_path = module_name.split(".")
+        if "mtp" in module_path or "experts" not in module_path:
             continue
         if not module_name.endswith((".linear_fc1", ".linear_fc2")):
             continue
@@ -146,7 +149,7 @@ def register_mxfp4_moe_weight_hooks(model: torch.nn.Module) -> MXFP4MoEWeightHoo
 
     if not matched_weights:
         raise ValueError(
-            "mxfp4_moe_weight_fake_quant did not find routed-expert "
+            "MXFP4 MoE runtime patch did not find routed-expert "
             "linear_fc1/linear_fc2 modules."
         )
 
@@ -155,7 +158,7 @@ def register_mxfp4_moe_weight_hooks(model: torch.nn.Module) -> MXFP4MoEWeightHoo
         len(weight_names) for _module_name, _module, weight_names in matched_weights
     )
     print(
-        "Registered model-level MXFP4->MXFP8 fake-quant hook on "
+        "Registered model-level MXFP4 quantize/dequantize hook on "
         f"{matched_weight_count} routed-expert weights across "
         f"{len(matched_weights)} modules."
     )

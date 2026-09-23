@@ -111,17 +111,14 @@ def _record_vllm_generation_metrics(
 
 class VllmGeneration(GenerationInterface):
     def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Request logical weights when either MXFP4 refit mode needs them.
+        """Request logical weights when native MXFP4 refit needs them.
 
         An MXFP8-param Megatron policy otherwise exports its physical FP8 payload
-        and scale siblings. MXFP4 refit must instead receive logical values so
-        vLLM can either fake-quantize before MXFP8 packing or store native packed
-        MXFP4 expert weights.
+        and scale siblings. Native MXFP4 refit must instead receive logical values
+        so vLLM can materialize packed MXFP4 expert weights.
         """
         vllm_cfg = self.cfg["vllm_cfg"]
-        if vllm_cfg.get("mxfp4_moe_weight_fake_quant") or vllm_cfg.get(
-            "mxfp4_moe_weight_native"
-        ):
+        if vllm_cfg.get("mxfp4_moe_weight_native"):
             return "logical_weights"
         return "hf_export"
 
@@ -140,10 +137,12 @@ class VllmGeneration(GenerationInterface):
                 "policy.generation.vllm_kwargs.moe_backend="
                 "'flashinfer_cutlass_afp8'."
             )
-            assert vllm_cfg.get("expert_parallel_size", 1) == 1, (
-                "Native MXFP4/MXFP8 FlashInfer CUTLASS refit currently requires "
-                "expert_parallel_size=1 because vLLM 0.25.1 swizzles MXFP8 "
-                "scales before expert-parallel all-to-all."
+            tensor_parallel_size = vllm_cfg["tensor_parallel_size"]
+            expert_parallel_size = vllm_cfg["expert_parallel_size"]
+            assert expert_parallel_size in (1, tensor_parallel_size), (
+                "Native MXFP4/MXFP8 FlashInfer CUTLASS refit requires "
+                "expert_parallel_size=1 or expert_parallel_size="
+                "tensor_parallel_size."
             )
 
     @staticmethod

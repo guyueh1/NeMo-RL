@@ -6,35 +6,31 @@ from types import ModuleType
 import pytest
 import torch
 
-from nemo_rl.models.generation.vllm.quantization.mxfp4_moe import (
-    quantize_mxfp4_weight,
-)
-from nemo_rl.models.quantization.mxfp4 import (
-    fake_quantize_mxfp4,
-    is_routed_moe_weight_name,
-)
+from nemo_rl.models.quantization.mxfp4 import quantize_dequantize_mxfp4
 
 
-def test_fake_quantize_mxfp4_rounds_to_e2m1_levels() -> None:
+def test_quantize_dequantize_mxfp4_rounds_to_e2m1_levels() -> None:
     values = torch.tensor([0.1, 0.4, 0.9, 1.4, 1.9, 2.6, 3.7, 5.8], dtype=torch.float32)
     weight = values.repeat(4)
 
-    result = fake_quantize_mxfp4(weight)
+    result = quantize_dequantize_mxfp4(weight)
 
     expected = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     assert torch.equal(result[:8], expected)
 
 
-def test_fake_quantize_mxfp4_uses_power_of_two_block_scale() -> None:
+def test_quantize_dequantize_mxfp4_uses_power_of_two_block_scale() -> None:
     weight = torch.full((32,), 12.0, dtype=torch.bfloat16)
 
-    result = fake_quantize_mxfp4(weight)
+    result = quantize_dequantize_mxfp4(weight)
 
     # 12 / E2M1_MAX(6) selects scale 2.
     assert torch.equal(result, weight)
 
 
-def test_fake_quantize_mxfp4_preserves_results_across_chunks(monkeypatch) -> None:
+def test_quantize_dequantize_mxfp4_preserves_results_across_chunks(
+    monkeypatch,
+) -> None:
     from nemo_rl.models.quantization import mxfp4
 
     weight = torch.cat(
@@ -44,57 +40,46 @@ def test_fake_quantize_mxfp4_preserves_results_across_chunks(monkeypatch) -> Non
             torch.linspace(-3, 3, 32),
         ]
     )
-    expected = fake_quantize_mxfp4(weight)
+    expected = quantize_dequantize_mxfp4(weight)
     monkeypatch.setattr(mxfp4, "_MXFP4_BLOCKS_PER_CHUNK", 1)
 
-    result = fake_quantize_mxfp4(weight)
+    result = quantize_dequantize_mxfp4(weight)
 
     assert torch.equal(result, expected)
 
 
-def test_fake_quantize_mxfp4_rejects_unaligned_weights() -> None:
+def test_quantize_dequantize_mxfp4_rejects_unaligned_weights() -> None:
     with pytest.raises(ValueError, match="last dimension"):
-        fake_quantize_mxfp4(torch.ones(2, 31))
+        quantize_dequantize_mxfp4(torch.ones(2, 31))
 
 
-def test_native_mxfp4_pack_matches_fake_quant_numerics() -> None:
-    weight = torch.linspace(-12, 12, 64, dtype=torch.float32).reshape(2, 32)
-
-    packed, encoded_scale = quantize_mxfp4_weight(weight)
-
-    low = packed & 0xF
-    high = packed >> 4
-    codes = torch.stack((low, high), dim=-1).reshape_as(weight)
-    magnitude = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-    )[(codes & 0x7).long()]
-    values = torch.where((codes & 0x8) != 0, -magnitude, magnitude)
-    scale = torch.exp2(encoded_scale.to(torch.float32) - 127).repeat_interleave(
-        32, dim=-1
+def test_native_mxfp4_uses_flashinfer_quantizer(monkeypatch) -> None:
+    from nemo_rl.models.generation.vllm.quantization.mxfp4_moe import (
+        _quantize_stacked_experts_for_cutlass,
     )
 
-    torch.testing.assert_close(values * scale, fake_quantize_mxfp4(weight))
-    assert packed.dtype == torch.uint8
-    assert packed.shape == (2, 16)
-    assert encoded_scale.shape == (2, 1)
+    calls = []
+    fake_flashinfer = ModuleType("flashinfer")
 
+    def mxfp4_quantize(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(weight)
+        return weight.to(torch.uint8), torch.ones(weight.shape[0], 1, dtype=torch.uint8)
 
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("model.layers.0.mlp.experts.0.gate_proj.weight", True),
-        ("decoder.layers.0.mlp.experts.linear_fc2.weight", True),
-        ("model.layers.0.mlp.shared_experts.down_proj.weight", False),
-        ("model.layers.0.self_attn.q_proj.weight", False),
-        ("model.layers.0.mlp.experts.gate", False),
-    ],
-)
-def test_is_routed_moe_weight_name(name: str, expected: bool) -> None:
-    assert is_routed_moe_weight_name(name) is expected
+    fake_flashinfer.mxfp4_quantize = mxfp4_quantize
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+
+    weight = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4)
+    quantized, scales = _quantize_stacked_experts_for_cutlass(weight)
+
+    assert len(calls) == 2
+    assert torch.equal(calls[0], weight[0])
+    assert torch.equal(calls[1], weight[1])
+    assert quantized.shape == weight.shape
+    assert scales.shape == (2, 2, 1)
 
 
 def test_register_mxfp4_moe_weight_hooks_targets_only_expert_fc(monkeypatch) -> None:
-    from nemo_rl.models.megatron import mxfp4_fake_quant
+    from nemo_rl.models.megatron import mxfp4_runtime
 
     class ToyModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -108,6 +93,13 @@ def test_register_mxfp4_moe_weight_hooks_targets_only_expert_fc(monkeypatch) -> 
             mlp.shared_experts = torch.nn.Module()
             mlp.shared_experts.linear_fc1 = torch.nn.Linear(32, 32, bias=False)
             self.decoder.layers[0].mlp = mlp
+            self.mtp = torch.nn.Module()
+            self.mtp.layers = torch.nn.ModuleList([torch.nn.Module()])
+            mtp_mlp = torch.nn.Module()
+            mtp_mlp.experts = torch.nn.Module()
+            mtp_mlp.experts.linear_fc1 = torch.nn.Linear(32, 32, bias=False)
+            mtp_mlp.experts.linear_fc2 = torch.nn.Linear(32, 32, bias=False)
+            self.mtp.layers[0].mlp = mtp_mlp
 
         def forward(self, value: torch.Tensor) -> torch.Tensor:
             mlp = self.decoder.layers[0].mlp
@@ -118,12 +110,12 @@ def test_register_mxfp4_moe_weight_hooks_targets_only_expert_fc(monkeypatch) -> 
     model = ToyModel()
     seen = []
     monkeypatch.setattr(
-        mxfp4_fake_quant,
-        "_fake_quantize_mxfp4_weight_",
+        mxfp4_runtime,
+        "_quantize_dequantize_mxfp4_weight_",
         lambda weight: seen.append(weight),
     )
 
-    hook = mxfp4_fake_quant.register_mxfp4_moe_weight_hooks(model)
+    hook = mxfp4_runtime.register_mxfp4_moe_weight_hooks(model)
     x = torch.ones(1, 32)
     model(x)
     model(x)
@@ -132,15 +124,23 @@ def test_register_mxfp4_moe_weight_hooks_targets_only_expert_fc(monkeypatch) -> 
         model.decoder.layers[0].mlp.experts.linear_fc1.weight,
         model.decoder.layers[0].mlp.experts.linear_fc2.weight,
     ]
+    assert all(
+        weight is not model.mtp.layers[0].mlp.experts.linear_fc1.weight
+        for weight in seen
+    )
+    assert all(
+        weight is not model.mtp.layers[0].mlp.experts.linear_fc2.weight
+        for weight in seen
+    )
     hook.arm()
     model(x)
     assert len(seen) == 4
 
 
-def test_patch_mcore_language_loss_clones_logits_and_is_idempotent(
+def test_patch_mcore_language_loss_clones_detached_mtp_logits_and_is_idempotent(
     monkeypatch,
 ) -> None:
-    from nemo_rl.models.megatron import mxfp4_fake_quant
+    from nemo_rl.models.megatron import mxfp4_runtime
 
     class FakeLanguageModule:
         def compute_language_model_loss(self, labels, logits):
@@ -154,9 +154,9 @@ def test_patch_mcore_language_loss_clones_logits_and_is_idempotent(
     monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
 
     original = FakeLanguageModule.compute_language_model_loss
-    mxfp4_fake_quant.patch_mcore_language_loss_for_frozen_logits()
+    mxfp4_runtime.patch_mcore_language_loss_for_detached_mtp_logits()
     patched = FakeLanguageModule.compute_language_model_loss
-    mxfp4_fake_quant.patch_mcore_language_loss_for_frozen_logits()
+    mxfp4_runtime.patch_mcore_language_loss_for_detached_mtp_logits()
 
     logits = torch.ones(2, requires_grad=True)
     cloned = FakeLanguageModule().compute_language_model_loss(None, logits)
@@ -171,7 +171,7 @@ def test_patch_mcore_language_loss_clones_logits_and_is_idempotent(
 def test_register_mxfp4_moe_weight_hooks_supports_grouped_linear_weights(
     monkeypatch,
 ) -> None:
-    from nemo_rl.models.megatron import mxfp4_fake_quant
+    from nemo_rl.models.megatron import mxfp4_runtime
 
     class GroupedLinear(torch.nn.Module):
         def __init__(self) -> None:
@@ -195,12 +195,12 @@ def test_register_mxfp4_moe_weight_hooks_supports_grouped_linear_weights(
     model = ToyModel()
     seen = []
     monkeypatch.setattr(
-        mxfp4_fake_quant,
-        "_fake_quantize_mxfp4_weight_",
+        mxfp4_runtime,
+        "_quantize_dequantize_mxfp4_weight_",
         lambda weight: seen.append(weight),
     )
 
-    hook = mxfp4_fake_quant.register_mxfp4_moe_weight_hooks(model)
+    hook = mxfp4_runtime.register_mxfp4_moe_weight_hooks(model)
     x = torch.ones(1, 32)
     model(x)
 

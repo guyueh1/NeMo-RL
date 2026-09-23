@@ -1551,7 +1551,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             return LocalParamSpec(base=None, pre=pre, post=post)
 
         def _bf16_to_mxfp8_receiver_quant_spec(
-            hf_name: str,
             value_param: torch.Tensor,
             scale_param: torch.Tensor,
             merged_slice: tuple[slice, ...] | None,
@@ -1574,22 +1573,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
             def post(ctx: RefitCtx) -> None:
                 from nemo_rl.models.generation.vllm.quantization.fp8 import (
-                    global_fp8_config,
                     quantize_mxfp8_weight,
                 )
-                from nemo_rl.models.quantization.mxfp4 import (
-                    is_routed_moe_weight_name,
-                )
 
-                use_mxfp4 = (
-                    global_fp8_config is not None
-                    and global_fp8_config.mxfp4_moe_weight_fake_quant
-                    and is_routed_moe_weight_name(hf_name)
-                )
-                if use_mxfp4:
-                    value, scale = quantize_mxfp8_weight(ctx.buf, fake_quant_mxfp4=True)
-                else:
-                    value, scale = quantize_mxfp8_weight(ctx.buf)
+                value, scale = quantize_mxfp8_weight(ctx.buf)
                 ctx.extra["value_region"].copy_(value)
                 ctx.extra["scale_region"].copy_(scale)
 
@@ -1675,7 +1662,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         f"{scale_name!r} has dtype {scale_param.dtype}, expected torch.uint8"
                     )
                 specs[hf_name] = _bf16_to_mxfp8_receiver_quant_spec(
-                    hf_name, vllm_param, scale_param, merged_slice
+                    vllm_param, scale_param, merged_slice
                 )
             elif wire_dtype != vllm_param.dtype:
                 raise ValueError(
