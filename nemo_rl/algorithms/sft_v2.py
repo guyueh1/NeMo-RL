@@ -479,6 +479,7 @@ def setup_sft_v2(
             raise ValueError("Energon packing does not support HybridEP flex dispatch.")
 
         cp_size = megatron_cfg["context_parallel_size"]
+        tp_size = megatron_cfg["tensor_model_parallel_size"]
         pack_options = energon_packing.options
         if pack_options.max_sequence_length != max_sequence_length:
             raise ValueError(
@@ -486,6 +487,8 @@ def setup_sft_v2(
             )
         pad_multiple = pack_options.sequence_length_pad_multiple
         parallel_multiple = 2 * cp_size if cp_size > 1 else 1
+        if megatron_cfg["sequence_parallel"]:
+            parallel_multiple *= tp_size
         if pad_multiple % parallel_multiple != 0:
             raise ValueError(
                 "Energon packing requires sequence_length_pad_multiple to "

@@ -303,6 +303,15 @@ def test_setup_rejects_a_validation_checkpoint_metric() -> None:
         ({"context_parallel_size": 2}, 2, "multiple of 4"),
         (
             {
+                "context_parallel_size": 16,
+                "tensor_model_parallel_size": 8,
+                "sequence_parallel": True,
+            },
+            128,
+            "multiple of 256",
+        ),
+        (
+            {
                 "moe_token_dispatcher_type": "flex",
                 "moe_flex_dispatcher_backend": "hybridep",
             },

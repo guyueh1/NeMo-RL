@@ -28,6 +28,7 @@ import os
 import warnings
 from dataclasses import dataclass, field
 from datetime import timedelta
+from signal import Signals
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -57,6 +58,48 @@ class _SerializableModelConfig:
 
     def finalize(self) -> None:
         self.finalized = True
+
+
+@pytest.mark.mcore
+def test_save_resolved_megatron_config_only_writes_on_rank_zero(tmp_path):
+    """The final Bridge config is serialized atomically by one global rank."""
+    from megatron.bridge.training.config import ConfigContainer
+
+    from nemo_rl.models.megatron.setup import _save_resolved_megatron_config
+
+    output_path = tmp_path / "resolved_megatron_config.yaml"
+    megatron_cfg = MagicMock(spec=ConfigContainer)
+    serialized = {
+        "model": {"hidden_size": 4096, "tensor_model_parallel_size": 8},
+        "optimizer": {"lr": 1.0e-5},
+        "training": {
+            "termination_signal": Signals.SIGTERM,
+            "cleanup_signals": (Signals.SIGINT, Signals.SIGTERM),
+            "params_dtype": torch.bfloat16,
+        },
+    }
+    expected = {
+        "model": {"hidden_size": 4096, "tensor_model_parallel_size": 8},
+        "optimizer": {"lr": 1.0e-5},
+        "training": {
+            "termination_signal": Signals.SIGTERM.value,
+            "cleanup_signals": [Signals.SIGINT.value, Signals.SIGTERM.value],
+            "params_dtype": "torch.bfloat16",
+        },
+    }
+
+    with patch.object(
+        ConfigContainer, "_convert_value_to_dict", return_value=serialized
+    ) as convert:
+        _save_resolved_megatron_config(megatron_cfg, str(output_path), rank=1)
+        assert not output_path.exists()
+        convert.assert_not_called()
+
+        _save_resolved_megatron_config(megatron_cfg, str(output_path), rank=0)
+
+    assert yaml.safe_load(output_path.read_text(encoding="utf-8")) == expected
+    convert.assert_called_once_with(megatron_cfg)
+    assert list(tmp_path.iterdir()) == [output_path]
 
 
 @pytest.mark.mcore
@@ -3630,14 +3673,18 @@ class TestSetupModelAndOptimizer:
         policy_cfg = {
             "megatron_cfg": {
                 "freeze_moe_router": True,  # Enable MoE router freezing
+                "resolved_config_output_path": "/tmp/resolved_megatron.yaml",
             }
         }
 
-        result = setup_model_and_optimizer(
-            policy_cfg=policy_cfg,
-            megatron_cfg=mock_megatron_cfg,
-            load_optimizer=True,
-        )
+        with patch(
+            "nemo_rl.models.megatron.setup._save_resolved_megatron_config"
+        ) as mock_save_config:
+            result = setup_model_and_optimizer(
+                policy_cfg=policy_cfg,
+                megatron_cfg=mock_megatron_cfg,
+                load_optimizer=True,
+            )
 
         # Verify get_model was called (the mixed_precision_wrapper should be CustomFloat16Module)
         mock_get_model.assert_called_once()
@@ -3646,6 +3693,9 @@ class TestSetupModelAndOptimizer:
         assert len(call_kwargs.get("pre_wrap_hook", [])) > 0
 
         assert result.param_sync_func == mock_model_chunk.start_param_sync
+        mock_save_config.assert_called_once_with(
+            mock_megatron_cfg, "/tmp/resolved_megatron.yaml", 0
+        )
 
 
 @pytest.mark.mcore

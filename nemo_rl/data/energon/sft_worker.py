@@ -98,14 +98,18 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
         )
         if packing is not None:
             cp_size = parallel_state.get_context_parallel_world_size()
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
             pad_multiple = _field(
                 _field(packing, "options"), "sequence_length_pad_multiple"
             )
-            if cp_size > 1 and pad_multiple % (2 * cp_size):
+            parallel_multiple = 2 * cp_size if cp_size > 1 else 1
+            if self.cfg["megatron_cfg"]["sequence_parallel"]:
+                parallel_multiple *= tp_size
+            if pad_multiple % parallel_multiple:
                 raise ValueError(
                     "Energon packing sequence_length_pad_multiple "
-                    f"({pad_multiple}) must be divisible by 2 * "
-                    f"context_parallel_size ({2 * cp_size})."
+                    f"({pad_multiple}) must be divisible by the required "
+                    f"parallel alignment ({parallel_multiple})."
                 )
 
         logical_rank = parallel_state.get_data_parallel_rank()

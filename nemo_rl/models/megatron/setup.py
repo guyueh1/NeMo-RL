@@ -22,6 +22,8 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
 from datetime import timedelta
+from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar, cast
 
 import torch
@@ -897,6 +899,50 @@ def validate_megatron_config(megatron_cfg: Any, config: Mapping[str, Any]) -> No
         # supplies no Bridge dataset. Keep the opt-in authoritative if that gate
         # changes or another config provider enables the field.
         megatron_cfg.model.moe_hybridep_pad_uneven_dispatch_inputs = False
+
+
+def _convert_to_yaml_safe_values(value: Any) -> Any:
+    """Recursively reduce a resolved config to YAML-safe primitive values."""
+    if isinstance(value, Enum):
+        return _convert_to_yaml_safe_values(value.value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            _convert_to_yaml_safe_values(key): _convert_to_yaml_safe_values(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_convert_to_yaml_safe_values(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [
+            _convert_to_yaml_safe_values(item)
+            for item in sorted(value, key=repr)
+        ]
+    return str(value)
+
+
+def _save_resolved_megatron_config(
+    megatron_cfg: ConfigContainer, output_path: str, rank: int
+) -> None:
+    """Atomically save the final Bridge config from global rank zero."""
+    if rank != 0:
+        return
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = _convert_to_yaml_safe_values(
+        ConfigContainer._convert_value_to_dict(megatron_cfg)
+    )
+    temporary_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as output_file:
+            yaml.safe_dump(serialized, output_file, sort_keys=False)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    print(f"Saved resolved Megatron Bridge config to {path}")
 
 
 def setup_model_config(
@@ -2443,6 +2489,23 @@ def setup_model_and_optimizer(
 
     # Get the first model from the list
     model = model[0]
+
+    # Model construction and checkpoint loading can resolve or mutate fields in
+    # the Bridge container (for example checkpoint.finetune). Write only after
+    # those steps so this is the final training configuration, not the initial
+    # provider/container construction.
+    resolved_config_output_path = policy_cfg["megatron_cfg"].get(
+        "resolved_config_output_path"
+    )
+    if resolved_config_output_path is not None:
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0
+        )
+        _save_resolved_megatron_config(
+            megatron_cfg, resolved_config_output_path, rank
+        )
 
     return ModelAndOptimizerState(
         state,
