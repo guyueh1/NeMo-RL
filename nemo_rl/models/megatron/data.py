@@ -1161,8 +1161,8 @@ def process_global_batch(
         )
 
     to_reduce = torch.tensor([local_valid_seqs, local_valid_toks]).cuda()
-    # Keep this rank's own count: the MoE aux-loss gradient scale is per-rank, not
-    # global (see MegatronPolicyWorker._compute_moe_grad_scale).
+    # Keep this rank's own count for callers that need both local throughput and
+    # the globally reduced loss denominator.
     local_valid_toks = to_reduce[1].clone()
     torch.distributed.all_reduce(to_reduce, group=dp_group)
     global_valid_seqs, global_valid_toks = to_reduce[0], to_reduce[1]

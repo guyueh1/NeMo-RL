@@ -350,6 +350,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
+    # Match Megatron-Core's loss-normalization switch. True computes a global
+    # token mean; False averages local microbatch means across DP/CP ranks.
+    calculate_per_token_loss: bool
     env_vars: NotRequired[dict[str, str] | None]
     # Optional YAML destination for the fully constructed Megatron Bridge
     # ConfigContainer. Only global rank zero writes the file.

@@ -28,6 +28,7 @@ policy:
   precision: bfloat16
   megatron_cfg:
     enabled: true
+    calculate_per_token_loss: true
     resolved_config_output_path: ${oc.env:NRL_REPRO_RUN_DIR}/resolved_megatron_config.yaml
     train_iters: 1000000
     empty_unused_memory_level: 1

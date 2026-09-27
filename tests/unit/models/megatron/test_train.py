@@ -31,7 +31,11 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
-from nemo_rl.algorithms.loss.interfaces import LossInputType
+from nemo_rl.algorithms.loss.interfaces import (
+    LossInputType,
+    LossType,
+    MetricNormalizer,
+)
 
 pytestmark = pytest.mark.mcore
 
@@ -369,7 +373,10 @@ class TestForwardWithPostProcessingFn:
 
         data_iterator = iter([processed_mb])
         mock_model = MagicMock()
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": True},
+        }
 
         mock_loss_fn = MagicMock()
         post_processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg)
@@ -507,6 +514,7 @@ class TestForwardWithPostProcessingFn:
 
         cfg = {
             "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": True},
             "generation": {"temperature": 0.7, "top_p": 1.0, "top_k": None},
         }
         post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
@@ -677,7 +685,10 @@ class TestForwardWithPostProcessingFn:
             cu_seqlens_padded=None,
         )
 
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": True},
+        }
         post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
         mock_timer = MagicMock()
 
@@ -932,7 +943,10 @@ class TestMegatronForwardBackward:
 
         mock_model = MagicMock()
         mock_loss_fn = MagicMock()
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": True},
+        }
         post_processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg)
 
         megatron_forward_backward(
@@ -964,7 +978,10 @@ class TestMegatronForwardBackward:
         mock_fb_func = MagicMock()
         mock_get_fb.return_value = mock_fb_func
 
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": True},
+        }
         post_processor = LossPostProcessor(loss_fn=MagicMock(), cfg=cfg)
 
         megatron_forward_backward(
@@ -1014,7 +1031,11 @@ class TestMegatronForwardBackward:
 
         mock_get_fb.return_value = run_forward_only
         post_processor = LossPostProcessor(
-            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+            loss_fn=MagicMock(),
+            cfg={
+                "sequence_packing": {"enabled": False},
+                "megatron_cfg": {"calculate_per_token_loss": True},
+            },
         )
 
         with patch.object(PipelineOffloadManager, "OFFLOAD_MGR", None):
@@ -1082,7 +1103,11 @@ class TestMegatronForwardBackward:
 
         mock_get_fb.return_value = run_schedule
         post_processor = LossPostProcessor(
-            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+            loss_fn=MagicMock(),
+            cfg={
+                "sequence_packing": {"enabled": False},
+                "megatron_cfg": {"calculate_per_token_loss": True},
+            },
         )
 
         with patch.object(PipelineOffloadManager, "OFFLOAD_MGR", manager):
@@ -1126,7 +1151,11 @@ class TestMegatronForwardBackward:
 
         mock_get_fb.return_value = run_forward_only
         post_processor = LossPostProcessor(
-            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+            loss_fn=MagicMock(),
+            cfg={
+                "sequence_packing": {"enabled": False},
+                "megatron_cfg": {"calculate_per_token_loss": True},
+            },
         )
 
         with patch.object(PipelineOffloadManager, "OFFLOAD_MGR", manager):
@@ -1163,7 +1192,11 @@ class TestMegatronForwardBackward:
 
         mock_get_fb.return_value = run_forward_only
         post_processor = LossPostProcessor(
-            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+            loss_fn=MagicMock(),
+            cfg={
+                "sequence_packing": {"enabled": False},
+                "megatron_cfg": {"calculate_per_token_loss": True},
+            },
         )
 
         with patch(
@@ -1195,7 +1228,11 @@ class TestMegatronForwardBackward:
 
         first_config = SimpleNamespace(fine_grained_activation_offloading=True)
         post_processor = LossPostProcessor(
-            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+            loss_fn=MagicMock(),
+            cfg={
+                "sequence_packing": {"enabled": False},
+                "megatron_cfg": {"calculate_per_token_loss": True},
+            },
         )
 
         with (
@@ -1236,7 +1273,11 @@ class TestMegatronForwardBackward:
 
         mock_get_fb.return_value = fail_forward_only
         post_processor = LossPostProcessor(
-            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+            loss_fn=MagicMock(),
+            cfg={
+                "sequence_packing": {"enabled": False},
+                "megatron_cfg": {"calculate_per_token_loss": True},
+            },
         )
 
         with pytest.raises(RuntimeError, match="forward-only failure"):
@@ -1270,7 +1311,11 @@ class TestMegatronForwardBackward:
 
         mock_get_fb.return_value = run_training
         post_processor = LossPostProcessor(
-            loss_fn=MagicMock(), cfg={"sequence_packing": {"enabled": False}}
+            loss_fn=MagicMock(),
+            cfg={
+                "sequence_packing": {"enabled": False},
+                "megatron_cfg": {"calculate_per_token_loss": True},
+            },
         )
 
         megatron_forward_backward(
@@ -1305,7 +1350,10 @@ class TestLossPostProcessor:
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(0.5), {"loss": 0.5}))
         mock_loss_fn.input_type = LossInputType.LOGIT
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": True},
+        }
 
         processor = LossPostProcessor(loss_fn=mock_loss_fn, cfg=cfg, cp_normalize=False)
 
@@ -1344,7 +1392,10 @@ class TestLossPostProcessor:
 
         mock_loss_fn = MagicMock(return_value=(torch.tensor(1.0), {}))
         mock_loss_fn.input_type = LossInputType.LOGIT
-        cfg = {"sequence_packing": {"enabled": False}}
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": True},
+        }
 
         processor = LossPostProcessor(
             loss_fn=mock_loss_fn, cfg=cfg, num_microbatches=4, cp_normalize=True
@@ -1368,6 +1419,151 @@ class TestLossPostProcessor:
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+        return_value=1,
+    )
+    def test_local_mean_mode_returns_sum_count_and_token_weighted_metric(
+        self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        """MCore receives a local numerator/count while logging keeps global-token weighting."""
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_loss_fn = MagicMock(
+            return_value=(
+                torch.tensor(12.0),
+                {"loss": 12.0, "num_unmasked_tokens": 3},
+            )
+        )
+        mock_loss_fn.input_type = LossInputType.LOGPROB
+        mock_loss_fn.loss_type = LossType.TOKEN_LEVEL
+        mock_loss_fn.metric_normalizations = {
+            "loss": MetricNormalizer.TOKENS,
+            "num_unmasked_tokens": MetricNormalizer.NONE,
+        }
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": False},
+        }
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn,
+            cfg=cfg,
+            prepare_fn=lambda logits, data, **_: (
+                {"next_token_logprobs": logits[..., 0]},
+                data,
+            ),
+        )
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+
+        wrapped_fn = processor(
+            data_dict=MagicMock(),
+            global_valid_seqs=torch.tensor(2),
+            global_valid_toks=torch.tensor(6),
+        )
+        local_sum, num_tokens, metrics = wrapped_fn(torch.randn(1, 4, 8))
+
+        assert torch.isclose(local_sum, torch.tensor(12.0))
+        assert num_tokens.item() == 3
+        assert metrics["loss"] == pytest.approx(2.0)
+        assert metrics["num_unmasked_tokens"] == 3
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+        return_value=1,
+    )
+    def test_local_mean_split_mode_defers_microbatch_average(
+        self, mock_cp_size, mock_cp_grp, mock_tp_grp, mock_tp_rank
+    ):
+        """Split training cancels MCore's per-call average for finish-time averaging."""
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        mock_loss_fn = MagicMock(
+            return_value=(
+                torch.tensor(12.0),
+                {"loss": 12.0, "num_unmasked_tokens": 3},
+            )
+        )
+        mock_loss_fn.input_type = LossInputType.LOGPROB
+        mock_loss_fn.loss_type = LossType.TOKEN_LEVEL
+        mock_loss_fn.metric_normalizations = {
+            "loss": MetricNormalizer.TOKENS,
+            "num_unmasked_tokens": MetricNormalizer.NONE,
+        }
+        cfg = {
+            "sequence_packing": {"enabled": False},
+            "megatron_cfg": {"calculate_per_token_loss": False},
+        }
+        processor = LossPostProcessor(
+            loss_fn=mock_loss_fn,
+            cfg=cfg,
+            num_microbatches=4,
+            defer_microbatch_average=True,
+            prepare_fn=lambda logits, data, **_: (
+                {"next_token_logprobs": logits[..., 0]},
+                data,
+            ),
+        )
+        mock_tp_grp.return_value = MagicMock()
+        mock_cp_grp.return_value = MagicMock()
+
+        wrapped_fn = processor(
+            data_dict=MagicMock(),
+            global_valid_seqs=torch.tensor(1),
+            global_valid_toks=torch.tensor(1),
+        )
+        backward_sum, num_tokens, _ = wrapped_fn(torch.randn(1, 4, 8))
+
+        assert torch.isclose(backward_sum, torch.tensor(48.0))
+        assert num_tokens.item() == 3
+
+    @patch("nemo_rl.models.megatron.train.torch.distributed.get_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.train.torch.distributed.get_world_size",
+        return_value=2,
+    )
+    def test_local_mean_cp_reshards_gathered_next_token_inputs(
+        self, mock_world_size, mock_rank
+    ):
+        """False mode restores MCore's rank-local CP numerator and count."""
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.train import (
+            _shard_next_token_loss_inputs_for_cp_local_mean,
+        )
+
+        loss_input = {"next_token_logprobs": torch.arange(7).view(1, 7)}
+        data = BatchedDataDict(
+            {
+                "token_mask": torch.tensor([[0, 1, 1, 1, 1, 1, 1, 1]]),
+                "sample_mask": torch.ones(1),
+            }
+        )
+
+        local_input, local_data = _shard_next_token_loss_inputs_for_cp_local_mean(
+            loss_input,
+            data,
+            context_parallel_group=MagicMock(),
+            physical_length=8,
+        )
+
+        # CP rank 0 owns zigzag chunks 0 and 3: target positions 0,1,6,7.
+        assert torch.equal(
+            local_input["next_token_logprobs"], torch.tensor([[0, 1, 6, 0]])
+        )
+        assert torch.equal(
+            local_data["token_mask"], torch.tensor([[0, 1, 1, 1, 0]])
+        )
+
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
+    @patch(
         "nemo_rl.models.megatron.train.get_context_parallel_world_size", return_value=1
     )
     @patch("nemo_rl.models.megatron.train.SequencePackingLossWrapper")
@@ -1382,7 +1578,10 @@ class TestLossPostProcessor:
         mock_cp_grp.return_value = MagicMock()
 
         mock_loss_fn = MagicMock()
-        cfg = {"sequence_packing": {"enabled": True}}
+        cfg = {
+            "sequence_packing": {"enabled": True},
+            "megatron_cfg": {"calculate_per_token_loss": True},
+        }
 
         mock_packed_seq_params = MagicMock()
         mock_packed_seq_params.cu_seqlens_q = torch.tensor([0, 5, 10])
