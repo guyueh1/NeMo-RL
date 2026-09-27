@@ -1122,8 +1122,8 @@ class _NemotronVisualProcessorAdapter:
         # Separate the two ways the placeholder count can disagree with the plan.
         # Conflating them blames truncation for samples that were never truncated.
         #
-        # A literal "<image>" in prose no longer reaches here: placeholders are
-        # counted by splice position, and validate_text_content rejects the row
+        # A literal "<image>" in prose is not counted here: placeholders are
+        # counted by splice position, so ordinary text cannot forge one
         # at render time. So this fires only on a renderer/planner disagreement.
         if image_tokens_before_truncation != compact_placeholders:
             raise ValueError(

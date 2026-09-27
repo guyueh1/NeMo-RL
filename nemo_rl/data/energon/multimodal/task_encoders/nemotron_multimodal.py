@@ -603,8 +603,8 @@ class NemotronMultiModalProcessorAdapter(_NemotronVisualProcessorAdapter):
         # Separate the two ways the placeholder count can disagree with the plan.
         # Conflating them blames truncation for samples that were never truncated.
         #
-        # See the sibling check in nemotron_visual: a literal "<image>" in prose
-        # is rejected at render time and cannot reach this comparison.
+        # Literal "<image>" text is not included here: only marker-spliced
+        # placeholders have recorded visual_placeholder_positions.
         if image_tokens_before_truncation != visual_placeholders:
             raise ValueError(
                 f"Nemotron Omni sample {sample.__key__!r} rendered "

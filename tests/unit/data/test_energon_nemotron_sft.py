@@ -465,6 +465,42 @@ def test_image_cost_is_predicted_before_processing_and_checked_after() -> None:
     assert postencoded.length == postencoded.packing_cost
 
 
+def test_literal_image_text_is_not_expanded_as_attached_media() -> None:
+    processor = NemotronH_Nano_Omni_Reasoning_V3Processor()
+    encoder = _encoder(processor)
+    image = _FakeMedia("image-a", height=64, width=32, marker=1.0)
+    sample = _sample(
+        [
+            {"type": "text", "text": "the literal tag <image> means image"},
+            {"type": "image", "media_index": 0},
+        ],
+        [
+            MediaRef(
+                "image",
+                image,
+                _metadata(height=64, width=32, num_tiles=1),
+            )
+        ],
+    )
+
+    preencoded = encoder.preencode_sample(sample)
+    assert sum(
+        len(message["visual_placeholder_positions"])
+        for message in preencoded.message_log
+    ) == 1
+
+    postencoded = encoder.postencode_sample(preencoded)
+    image_token_id = processor.tokenizer.convert_tokens_to_ids("<image>")
+    # One literal text token plus the two projected rows for the attached image.
+    assert (
+        sum(
+            int((message["token_ids"] == image_token_id).sum())
+            for message in postencoded.message_log
+        )
+        == 3
+    )
+
+
 def test_multiple_images_keep_source_order() -> None:
     processor = NemotronH_Nano_Omni_Reasoning_V3Processor()
     encoder = _encoder(processor)
