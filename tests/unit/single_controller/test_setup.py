@@ -575,6 +575,19 @@ def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_cont
     assert config.policy["train_global_batch_size"] == (
         config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
     )
+def test_token_capture_top_logprobs_requires_capture_and_vllm_max_logprobs():
+    mc = _make_master_config()
+    mc.token_capture.top_logprobs = 4
+
+    with pytest.raises(ValueError, match="token_capture.enabled"):
+        validate_single_controller_config(mc)
+
+    mc.token_capture.enabled = True
+    with pytest.raises(ValueError, match="max_logprobs"):
+        validate_single_controller_config(mc)
+
+    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
+    validate_single_controller_config(mc)
 
 
 @pytest.mark.parametrize(

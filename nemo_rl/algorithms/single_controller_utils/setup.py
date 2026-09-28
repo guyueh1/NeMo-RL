@@ -332,12 +332,14 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
+        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GENERATION_TOPK_FIELDS
 
         partition_fields = fields_with_optional_routed_experts(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
+        if token_capture_cfg.top_logprobs > 0:
+            partition_fields.extend(GENERATION_TOPK_FIELDS)
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -365,7 +367,12 @@ def _register_single_controller_partitions(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
-            + (list(MEDIA_STAGING_FIELDS) if capture_media else []),
+            + (list(MEDIA_STAGING_FIELDS) if capture_media else [])
+            + (
+                list(GENERATION_TOPK_FIELDS)
+                if token_capture_cfg.top_logprobs > 0
+                else []
+            ),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -2083,6 +2090,7 @@ def setup_single_controller(
             dp_config,
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
+            top_logprobs=token_capture_cfg.top_logprobs,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(
@@ -2158,6 +2166,7 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                top_logprobs=token_capture_cfg.top_logprobs,
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
