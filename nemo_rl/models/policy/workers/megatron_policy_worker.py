@@ -1581,6 +1581,7 @@ class MegatronPolicyWorkerImpl(
             "saved_grad_sync_func": None,
             "saved_no_sync_func": None,
             "saved_finalize_model_grads_func": None,
+            "step_phases": {},
         }
 
     def _assert_step_open(self) -> dict[str, Any]:
@@ -1828,6 +1829,7 @@ class MegatronPolicyWorkerImpl(
         # Build the per-call iterator. Each ``train_microbatches_from_meta``
         # call carries one DP slice; the iterator subdivides into pipeline
         # microbatches.
+        prep_started = time.monotonic()
         attach_media_token_validity_mask(data, self.media_placeholder_token_id)
         (
             data_iterator,
@@ -1888,6 +1890,7 @@ class MegatronPolicyWorkerImpl(
 
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
+        fwd_bwd_started = time.monotonic()
         with (
             maybe_r3_trace_stage("train", enabled=use_router_replay),
             self.model.no_sync(),
@@ -1922,14 +1925,19 @@ class MegatronPolicyWorkerImpl(
         self._set_mtp_grad_scale_func(None)
         self._add_step_phase("fwd_bwd", time.monotonic() - fwd_bwd_started)
 
+        empty_cache_started = time.monotonic()
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
+        self._add_step_phase(
+            "empty_cache", time.monotonic() - empty_cache_started
+        )
         self._log_gpu_mem("chunk_exit")
 
         # Collect per-mb metrics from the last PP stage; broadcast to all
         # PP ranks so non-last-stage ranks have something to all_reduce
         # against at finish. Metrics carry the N=1 placeholder for now —
         # ``finish_train_step`` rescales by the true 1/N.
+        metrics_started = time.monotonic()
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             mb_metrics_collected = []
             for x in losses_reduced:
@@ -1940,6 +1948,7 @@ class MegatronPolicyWorkerImpl(
         mb_metrics_collected = broadcast_loss_metrics_from_last_stage(
             mb_metrics_collected
         )
+        self._add_step_phase("mb_metrics", time.monotonic() - metrics_started)
 
         for m in mb_metrics_collected:
             draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
@@ -2002,6 +2011,7 @@ class MegatronPolicyWorkerImpl(
                 draft_step_state.counts_for_reduction(policy_counts),
             ]
         )
+        reduce_started = time.monotonic()
         torch.distributed.all_reduce(
             to_reduce, group=parallel_state.get_data_parallel_group()
         )
@@ -2042,6 +2052,9 @@ class MegatronPolicyWorkerImpl(
             self._scale_mtp_param_grads(
                 float((n_safe / global_valid_toks.clamp(min=1)).item())
             )
+        self._add_step_phase("finish_reduce", time.monotonic() - reduce_started)
+
+        opt_started = time.monotonic()
         # No more forward/backward calls remain in this step. Clear the
         # callables before optimizer/scheduler/checkpoint state can serialize them.
         self._set_mtp_grad_scale_func(None)
@@ -2100,6 +2113,7 @@ class MegatronPolicyWorkerImpl(
         # opt.step clips internally (clip_grad config); operates on the
         # already-rescaled grad. Returns (success, grad_norm, num_zeros).
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+        self._add_step_phase("finish_opt", time.monotonic() - opt_started)
         mtp_grad_norm = (
             self.optimizer.grad_norms_by_group.get("mtp")
             if state["mtp_enabled"]
@@ -2284,6 +2298,8 @@ class MegatronPolicyWorkerImpl(
                 metrics["moe_metrics"] = moe_metrics
 
         self._collect_mtp_metrics(metrics, mtp_grad_norm)
+
+        metrics["step_phases"] = dict(state["step_phases"])
 
         self._train_step_state = None
         return metrics
