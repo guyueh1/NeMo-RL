@@ -62,10 +62,10 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.schema import (
-    PER_TOKEN_STAGING_FIELDS,
     GENERATION_TOPK_FIELDS,
     GENERATION_TOPK_IDS_FIELD,
     GENERATION_TOPK_LOGPROBS_FIELD,
+    PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
@@ -656,6 +656,7 @@ class TQTokenSink:
                 type(error).__name__,
                 error,
             )
+
     def stage_topk(
         self, staging_key: str, topk_ids: torch.Tensor, topk_logprobs: torch.Tensor
     ) -> None:
@@ -673,7 +674,6 @@ class TQTokenSink:
                 GENERATION_TOPK_LOGPROBS_FIELD: topk_logprobs.unsqueeze(0),
             },
         )
-
 
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""

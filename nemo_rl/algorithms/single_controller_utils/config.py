@@ -1375,6 +1375,10 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     top_logprobs = master_config.token_capture.top_logprobs
     if top_logprobs > 0:
+        if master_config.policy["generation"]["backend"] != "vllm":
+            raise ValueError(
+                "token_capture.top_logprobs requires the vllm generation backend"
+            )
         if not master_config.token_capture.enabled:
             raise ValueError(
                 "token_capture.top_logprobs requires token_capture.enabled=true"

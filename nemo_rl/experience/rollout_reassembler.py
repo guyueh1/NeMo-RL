@@ -44,7 +44,13 @@ import torch
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import (GENERATION_TOPK_IDS_FIELD, GENERATION_TOPK_LOGPROBS_FIELD, MASK_SAMPLE, ROUTE_PLAN_TAG, TRUNCATED)
+from nemo_rl.data_plane.schema import (
+    GENERATION_TOPK_IDS_FIELD,
+    GENERATION_TOPK_LOGPROBS_FIELD,
+    MASK_SAMPLE,
+    ROUTE_PLAN_TAG,
+    TRUNCATED,
+)
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
     StagedMediaTensors,

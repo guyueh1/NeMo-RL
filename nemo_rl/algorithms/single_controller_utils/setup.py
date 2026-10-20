@@ -2086,12 +2086,19 @@ def setup_single_controller(
     # Mooncake memory owners when storage_unit_segment_size > 0.
     storage_units = start_storage_units(dp_config, storage_unit_node_ids)
     if token_capture_cfg.enabled:
-        media_columns = generation.setup_token_capture(
-            dp_config,
-            token_capture_cfg.staging_partition,
-            capture_media=capture_media,
-            top_logprobs=token_capture_cfg.top_logprobs,
-        )
+        if token_capture_cfg.top_logprobs > 0:
+            media_columns = cast(VllmGeneration, generation).setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                capture_media=capture_media,
+                top_logprobs=token_capture_cfg.top_logprobs,
+            )
+        else:
+            media_columns = generation.setup_token_capture(
+                dp_config,
+                token_capture_cfg.staging_partition,
+                capture_media=capture_media,
+            )
         if capture_media and media_columns is None:
             raise RuntimeError(
                 "media capture is enabled but no serving worker reported the "

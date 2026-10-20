@@ -145,6 +145,7 @@ def test_actor_forwards_capture_media_to_the_reassembler(
         router_replay_enabled=False,
         defer_routed_experts_to_policy=False,
         max_seq_len=4096,
+        top_logprobs=0,
         capture_media=capture_media,
         media_columns=(
             MediaColumnSpec(pixel_dtype=torch.bfloat16, patch_size=16)

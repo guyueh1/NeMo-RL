@@ -575,6 +575,8 @@ def test_single_controller_token_capture_nightly_recipe_resolves_to_runtime_cont
     assert config.policy["train_global_batch_size"] == (
         config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
     )
+
+
 def test_token_capture_top_logprobs_requires_capture_and_vllm_max_logprobs():
     mc = _make_master_config()
     mc.token_capture.top_logprobs = 4
@@ -588,6 +590,14 @@ def test_token_capture_top_logprobs_requires_capture_and_vllm_max_logprobs():
 
     mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
     validate_single_controller_config(mc)
+
+
+def test_token_capture_top_logprobs_rejects_megatron_generation():
+    mc = _make_master_config(backend="megatron", megatron_enabled=True)
+    mc.token_capture.enabled = True
+    mc.token_capture.top_logprobs = 4
+    with pytest.raises(ValueError, match="vllm generation backend"):
+        validate_single_controller_config(mc)
 
 
 def test_score_centering_requires_top_logprobs_and_unfiltered_sampling():
