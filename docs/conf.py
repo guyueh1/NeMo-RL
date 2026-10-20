@@ -50,6 +50,7 @@ extensions = [
     "sphinx_design",  # For grid layout
     "sphinx.ext.ifconfig",  # For conditional content
     "sphinxcontrib.mermaid",  # For Mermaid diagrams
+    "sphinx_reredirects",  # For preserving URLs when pages move
 ]
 
 templates_path = ["_templates"]
@@ -112,17 +113,20 @@ html_theme_options = {
 }
 html_extra_path = ["project.json", "versions1.json"]
 
+redirects = {
+    "guides/eval": "../about/evaluation.html",
+    "guides/dtensor-tp-accuracy": "automodel-tp-accuracy.html",
+    "design-docs/fsdp2-parallel-plan": "automodel-parallel-plan.html",
+}
+
 
 # Github links are now getting rate limited from the Github Actions
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
-]
-
-# PyTorch docs anchor IDs change between stable versions; verify the page
-# loads but skip anchor validation to avoid spurious failures on redirects.
-linkcheck_anchors_ignore_for_url = [
-    "https://docs.pytorch.org/.*",
+    "https://huggingface\\.co/datasets/nvidia/Nemotron-RL-Lightning-Training-Blend",
+    # Gated until the Nemotron 3.5 Super VL GA release; linkcheck gets 401.
+    "https://huggingface\\.co/nvidia/NVIDIA-Nemotron-3\\.5-Super-VL-120B-A12B-BF16",
 ]
 
 

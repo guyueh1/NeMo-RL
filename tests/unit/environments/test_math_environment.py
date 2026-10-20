@@ -274,20 +274,28 @@ def test_multi_reward_env_step_basic(math_multi_reward_env, multi_reward_test_da
         "Metadata should be unchanged"
     )
 
-    # Check rewards: shape (batch_size=3, number_of_rewards=3)
-    assert result.rewards.shape == (3, 3), "Rewards should be a tensor of shape (3, 3)"
+    # Check rewards: dict with 3 named components, each Tensor of shape (3,)
+    assert isinstance(result.rewards, dict), "Rewards should be a dict"
+    expected_keys = {"reward/correctness", "reward/integer", "reward/format"}
+    assert set(result.rewards.keys()) == expected_keys, (
+        f"Reward keys should be {expected_keys}, got {set(result.rewards.keys())}"
+    )
+    for name, tensor in result.rewards.items():
+        assert tensor.shape == (3,), f"{name} should be a tensor of shape (3,)"
 
     # Check rewards for each data point
-    # First reward: correctness reward 1.0, int reward 1.0, format reward 1.0
-    assert (result.rewards[0] == 1.0).all(), "First reward should be 1.0"
-    # Second reward: correctness reward 0.0, int reward 0.0, format reward 1.0
-    assert result.rewards[1][0] == 0.0
-    assert result.rewards[1][1] == 0.0
-    assert result.rewards[1][2] == 1.0
-    # Third reward: correctness reward 1.0, int reward 1.0, format reward 0.0
-    assert result.rewards[2][0] == 1.0
-    assert result.rewards[2][1] == 1.0
-    assert result.rewards[2][2] == 0.0
+    # Sample 0: correct answer "4", integer, valid format -> all 1.0
+    assert result.rewards["reward/correctness"][0] == 1.0
+    assert result.rewards["reward/integer"][0] == 1.0
+    assert result.rewards["reward/format"][0] == 1.0
+    # Sample 1: wrong answer, not integer, valid format -> only format 1.0
+    assert result.rewards["reward/correctness"][1] == 0.0
+    assert result.rewards["reward/integer"][1] == 0.0
+    assert result.rewards["reward/format"][1] == 1.0
+    # Sample 2: correct answer "4", integer, bad format -> correctness+integer 1.0
+    assert result.rewards["reward/correctness"][2] == 1.0
+    assert result.rewards["reward/integer"][2] == 1.0
+    assert result.rewards["reward/format"][2] == 0.0
 
     # Check terminated flags
     assert result.terminateds.shape == (3,), (
@@ -499,3 +507,63 @@ Now, let's consider \(f = x - n = (2 + \sqrt{3})^{1000} - \lfloor (2 + \sqrt{3})
         "Terminated flags should be a tensor of shape (1,)"
     )
     assert result.terminateds[0] == 1.0, "Terminated flag should be 1.0"
+
+
+def test_math_env_extracted_answers_stay_aligned_with_rewards(math_env):
+    """One score and one answer per sample, even when extraction finds nothing.
+
+    ``HFVerifyWorker.verify`` used to commit the score before attempting the
+    extraction, so a generation math-verify cannot parse produced a second
+    score from the except branch and pushed every later reward one slot out of
+    position. Nothing downstream notices: ``eval_pass_k`` splits the rewards
+    positionally and would report a wrong number rather than fail.
+    """
+    responses = [
+        "The answer is \\boxed{42}",  # correct
+        "I don't know.",  # nothing parseable
+        "The answer is \\boxed{137}",  # wrong, but parseable
+    ]
+    message_log_batch = [
+        [{"role": "assistant", "content": content}] for content in responses
+    ]
+    metadata = [{"ground_truth": "42"} for _ in responses]
+
+    result = ray.get(math_env.step.remote(message_log_batch, metadata, True))
+
+    assert result.rewards.shape == (3,), (
+        "one score per sample; an unparseable generation used to add a second"
+    )
+    assert result.rewards[0] == 1.0
+    assert result.rewards[2] == 0.0, "the wrong answer keeps its own slot"
+    assert len(result.answers) == 3
+    assert result.answers[1] is None, "nothing parseable means no answer"
+    assert result.answers[2] == "137", "the first prediction, not its first character"
+
+
+@pytest.mark.parametrize(
+    "extracted_answer,impl,expected",
+    [
+        # Nothing parsed at all -- math-verify returns an empty prediction list.
+        ((["42"], []), "hf_math_verify", None),
+        # A wrong but parseable answer: the prediction, not its first character.
+        ((["42"], ["137"]), "hf_math_verify", "137"),
+        # A match anywhere in the list wins.
+        ((["42"], ["7", "42"]), "hf_math_verify", "42"),
+        # Shapes the hf branch can hand back when its sympy conversion gives up.
+        (None, "hf_math_verify", None),
+        (("only-one-element",), "hf_math_verify", None),
+        # The dapo branch returns a plain normalized string, not a pair.
+        ("137", "dapo_math_verify", "137"),
+        (None, "dapo_math_verify", None),
+    ],
+)
+def test_select_extracted_answer_never_raises(extracted_answer, impl, expected):
+    """The whole fix rests on this helper not raising.
+
+    The caller commits the sample's score before asking for its answer, so an
+    exception here would either retract a score the verifier already returned
+    or desynchronize the results list from the batch.
+    """
+    from nemo_rl.environments.math_environment import _select_extracted_answer
+
+    assert _select_extracted_answer(extracted_answer, impl) == expected

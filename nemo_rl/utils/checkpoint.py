@@ -22,16 +22,142 @@ import json
 import os
 import re
 import shutil
+import threading
+import time
 import warnings
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Literal, Mapping, NotRequired, Optional, TypedDict, Union
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    Literal,
+    Mapping,
+    NotRequired,
+    Optional,
+    TypedDict,
+    Union,
+)
 
 import numpy as np
 import torch
 import yaml
 from pydantic import BaseModel
 
+from nemo_rl.telemetry.instrumentation import (
+    checkpoint_finalize_span,
+    current_trace_carrier,
+    remote_trace_context,
+)
+
 PathLike = Union[str, "os.PathLike[Any]"]
+
+
+@contextmanager
+def _finalize_telemetry(
+    carrier: Mapping[str, str], step: Optional[int]
+) -> Iterator[None]:
+    """Open ``rl.checkpoint.finalize``, or carry on without it if that fails.
+
+    Guarded because the block it wraps performs the rename that makes a
+    checkpoint resumable, and nothing in this package lets observability decide
+    whether that happens -- the same stance :meth:`_warn_on_delete_failure`
+    takes for pruning. Unguarded, a lens incompatibility would surface as a
+    failed save: the exception reaches ``finalize_pending`` as
+    ``_finalize_error``, so the run dies reporting a checkpoint failure *and*
+    skips the rename.
+
+    Only entering is guarded. A failure inside the block is the checkpoint's
+    own and must still reach both the span and the caller.
+    """
+    stack = ExitStack()
+    try:
+        stack.enter_context(remote_trace_context(carrier))
+        stack.enter_context(checkpoint_finalize_span(step))
+    # Deliberately broad: the point is that no failure from the telemetry stack,
+    # whatever it is, reaches the caller from here.
+    except Exception as e:
+        stack.close()
+        warnings.warn(
+            f"Could not open the checkpoint finalization span: {e!r}. "
+            "Finalization continues untraced; the checkpoint is unaffected.",
+            stacklevel=2,
+        )
+    # Yielded outside the except block so that a rename which then also fails is
+    # not reported as having happened "during handling" of the telemetry error,
+    # which points the reader at observability instead of at the rename. A
+    # closed ExitStack re-enters as an empty one, so this covers both paths.
+    with stack:
+        yield
+
+
+def _load_megatron_common_state_dict(iteration_dir: Path) -> dict[str, Any]:
+    """Load common state from either legacy or current MCore checkpoints."""
+    # Keep the optional MCore dependency out of the Automodel imports.
+    try:
+        from megatron.core.dist_checkpointing import load_common_state_dict
+    except ImportError as error:
+        raise RuntimeError(
+            "Megatron-Core is required to inspect optimizer state in the distributed "
+            f"checkpoint at {iteration_dir}. Install NeMo-RL with the `mcore` extra."
+        ) from error
+
+    # MCore accepts Path today but deprecates it in favor of str.
+    return load_common_state_dict(str(iteration_dir))
+
+
+def _load_megatron_sharded_metadata_keys(iteration_dir: Path) -> set[str]:
+    """Load the keys of tensors and objects stored in a torch_dist checkpoint."""
+    try:
+        from megatron.core.dist_checkpointing.serialization import (
+            load_sharded_metadata,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "Megatron-Core is required to inspect optimizer state in the distributed "
+            f"checkpoint at {iteration_dir}. Install NeMo-RL with the `mcore` extra."
+        ) from error
+
+    return {str(key) for key in load_sharded_metadata(str(iteration_dir))}
+
+
+def _is_megatron_optimizer_key(key: str) -> bool:
+    """Return whether a flattened Megatron checkpoint key belongs to the optimizer."""
+    # ChainedOptimizer prefixes every sharded key when a model has multiple
+    # sub-optimizers (for example, dense and expert parameters in MoE models).
+    key = re.sub(r"^chained_\d+\.", "", key)
+    return key == "optimizer" or key.startswith(("optimizer.", "optimizer/"))
+
+
+def validate_warm_start_checkpoint(
+    warm_start: PathLike, model_component: str = "value"
+) -> None:
+    """Reject a warm-start checkpoint whose model subtree does not exist.
+
+    This is the one checkpoint path that comes straight from user config, and
+    get_resume_paths never stats it -- an unresolvable path would train a cold
+    model behind a line claiming a warm start. Callers must gate this on a fresh
+    run, since a resume ignores the warm start entirely.
+
+    Args:
+        warm_start: step_<n> directory the user pointed the warm start at. A Hydra
+            override written as ``key=`` with an unset variable arrives as "".
+        model_component: Subtree the seed must carry, matching get_resume_paths.
+    """
+    if not str(warm_start).strip():
+        raise ValueError(
+            "warm_start_value_checkpoint is empty. A Hydra override written as "
+            "`ppo.warm_start_value_checkpoint=` with an unset variable produces "
+            "this; point it at a step_<n> directory or drop the override."
+        )
+    if not (Path(warm_start) / model_component / "weights").exists():
+        raise ValueError(
+            f"warm_start_value_checkpoint={str(warm_start)!r} has no "
+            f"{model_component}/weights subtree, so the {model_component} model "
+            "would silently start cold. Point it at a step_<n> directory from a "
+            "critic-pretrain or PPO run."
+        )
 
 
 class PretrainedCheckpointConfig(TypedDict):
@@ -39,7 +165,7 @@ class PretrainedCheckpointConfig(TypedDict):
 
     When set, the policy will restore its initial weights from this checkpoint
     instead of loading them from ``model_name``. Supported by the Megatron backend
-    only; DTensor backends continue to use HuggingFace weights via ``model_name``.
+    only; the Automodel backend continues to use HuggingFace weights via ``model_name``.
 
     Attributes:
         path: Filesystem path to the checkpoint to load.
@@ -79,12 +205,19 @@ class CheckpointingConfig(TypedDict):
         the metric should be taken from the validation or training metrics.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
-    model_save_format (str | None): Format for saving model (v2 allowed values: "torch_save" or "safetensors", v1 allowed values: None).
-    save_consolidated (bool): Whether to save consolidated checkpoints (for HF compatibility).
-    model_cache_dir (str): Directory for model cache (for safetensors format).
-    model_repo_id (str): Repository ID for the model (for safetensors format).
-    is_peft (bool): Whether the model uses PEFT.
+    ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
+    ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
+        When set, a checkpoint is saved every ft_save_period steps for crash recovery.
+        Requires ft_keep_latest_k to control how many of these are retained.
     save_optimizer (bool): Whether to save optimizer state with checkpoints.
+    save_data_plane (bool): Whether SingleController checkpoints include the
+        native TQ snapshot and replay-buffer metadata. Supported by the simple
+        and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
+    load_replay_buffer (bool): Whether async GRPO or SingleController restores
+        replay-buffer state when resuming from a checkpoint. Defaults to True.
+        When False, a frontier-aligned async resume or a SingleController native
+        TQ resume regenerates the buffered prompt groups on the current policy
+        instead of reusing completed groups.
     """
 
     enabled: bool
@@ -92,18 +225,29 @@ class CheckpointingConfig(TypedDict):
     metric_name: str | None
     higher_is_better: bool
     save_period: int
-    keep_top_k: NotRequired[int]
+    keep_top_k: NotRequired[int | None]
+    ft_keep_latest_k: NotRequired[int | None]
+    ft_save_period: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
-    # New nemo-automodel integration fields
-    model_save_format: NotRequired[str | None]  # Default: "safetensors"
-    save_consolidated: NotRequired[bool]  # Default: False
-    model_cache_dir: NotRequired[str]  # Default: ""
-    model_repo_id: NotRequired[str]  # Default: ""
-    is_peft: NotRequired[bool]  # Default: False
-    peft_config: NotRequired[Any]  # Default: None
-    is_async: NotRequired[bool]  # Default: False
+    save_data_plane: NotRequired[bool]
+    load_replay_buffer: NotRequired[bool]  # Default: True
+
+
+_AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(
+    {
+        "model_save_format",
+        "save_consolidated",
+        "single_rank_consolidation",
+        "consolidation_timeout_minutes",
+        "model_cache_dir",
+        "model_repo_id",
+        "is_peft",
+        "peft_config",
+        "is_async",
+    }
+)
 
 
 class CheckpointManager:
@@ -133,52 +277,85 @@ class CheckpointManager:
         Args:
             config (CheckpointingConfig)
         """
+        automodel_only_fields = sorted(
+            _AUTOMODEL_ONLY_CHECKPOINT_FIELDS.intersection(config)
+        )
+        if automodel_only_fields:
+            raise ValueError(
+                "Automodel-only fields are not supported under the top-level "
+                f"checkpointing config: {', '.join(automodel_only_fields)}. "
+                "Configure model_save_format, save_consolidated, "
+                "single_rank_consolidation, and consolidation_timeout_minutes "
+                "under policy.automodel_cfg (and value.automodel_cfg for value "
+                "models); remove the remaining fields because they are managed "
+                "internally."
+            )
+
         self.checkpoint_dir = Path(config["checkpoint_dir"])
         self.metric_name: str | None = config["metric_name"]
         self.higher_is_better = config["higher_is_better"]
         self.keep_top_k = config["keep_top_k"]
+        self.save_period: int = config["save_period"]
+        self.ft_keep_latest_k: int | None = config.get("ft_keep_latest_k", None)
         self.save_optimizer = config["save_optimizer"]
 
-        # Store nemo-automodel specific config options
-        self.model_save_format = config.get("model_save_format", "safetensors")
-        self.save_consolidated = config.get("save_consolidated", False)
-        self.model_cache_dir = config.get("model_cache_dir", "")
-        self.model_repo_id = config.get("model_repo_id", "")
-        self.is_peft = config.get("is_peft", False)
+        # Async finalization state
+        self._finalize_thread: Optional[threading.Thread] = None
+        self._pending_checkpoint_path: Optional[Path] = None
+        self._finalize_error: Optional[Exception] = None
+        self._delete_executor = ThreadPoolExecutor(max_workers=1)
 
     @staticmethod
     def get_resume_paths(
         last_checkpoint_path: Optional[PathLike],
+        *,
+        model_component: Literal["policy", "value"] = "policy",
     ) -> tuple[Optional[Path], Optional[Path]]:
         """Get weights and optimizer paths for resuming from a checkpoint.
 
         Args:
             last_checkpoint_path: Path to the last checkpoint, or None if starting fresh.
+            model_component: Model subtree to resolve. Policy is the default for
+                backward compatibility with algorithms that only checkpoint a policy.
 
         Returns:
             Tuple of (weights_path, optimizer_path). Both are None if no checkpoint.
             optimizer_path is None if checkpoint exists but optimizer state was not saved.
         """
         if last_checkpoint_path:
-            weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-            optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
+            component_path = Path(last_checkpoint_path) / model_component
+            weights_path = component_path / "weights"
+            optimizer_path = component_path / "optimizer"
 
-            # DTensor path
+            # Automodel path
             if optimizer_path.exists():
                 return weights_path, optimizer_path
 
-            # Megatron path
-            common_pt_path = weights_path / "iter_0000000" / "common.pt"
-            if common_pt_path.exists():
-                common_pt_obj = torch.load(common_pt_path, map_location="cpu")
-                if "optimizer" in common_pt_obj:
+            # Megatron path. MCore's public loader supports both legacy checkpoints,
+            # which store common state in common.pt, and current torch_dist
+            # checkpoints, which embed it as a common_state ShardedObject.
+            iteration_dir = weights_path / "iter_0000000"
+            is_megatron_checkpoint = (iteration_dir / "common.pt").exists() or (
+                iteration_dir / "metadata.json"
+            ).exists()
+            if is_megatron_checkpoint:
+                common_state_dict = _load_megatron_common_state_dict(iteration_dir)
+                if "optimizer" in common_state_dict:
                     # In Megatron, optimizer_path is only a flag to indicate that the optimizer
                     # state is embedded in the weights_path. We will actually load the optimizer
                     # state from the weights_path.
                     return weights_path, optimizer_path
 
+                # Modern torch_dist checkpoints shard optimizer tensors separately
+                # from the common state. Inspect stored keys rather than trusting
+                # run_config.save_optim, which only records configuration intent.
+                if (iteration_dir / "metadata.json").exists():
+                    sharded_keys = _load_megatron_sharded_metadata_keys(iteration_dir)
+                    if any(_is_megatron_optimizer_key(key) for key in sharded_keys):
+                        return weights_path, optimizer_path
+
             warnings.warn(
-                f"Optimizer state not found at {optimizer_path} (DTensor path), and no embedded "
+                f"Optimizer state not found at {optimizer_path} (Automodel path), and no embedded "
                 f"optimizer state detected under {weights_path} (Megatron path). "
                 "Optimizer will be freshly initialized.",
                 stacklevel=2,
@@ -209,8 +386,14 @@ class CheckpointManager:
         Returns:
             PathLike: Path to the temporary checkpoint directory.
         """
-        # create new step_{step} directory
         save_dir = self.checkpoint_dir / f"tmp_step_{step}"
+        # Remove a stale tmp_step_{step} left behind by an interrupted prior save
+        # so the new save starts clean.
+        if save_dir.exists():
+            t0 = time.monotonic()
+            shutil.rmtree(save_dir)
+            elapsed = time.monotonic() - t0
+            print(f"Removed stale {save_dir.name} in {elapsed:.2f}s")
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # save training info
@@ -225,87 +408,242 @@ class CheckpointManager:
         # save config
         if run_config is not None:
             with open(save_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(run_config.model_dump(), f)
+                # JSON mode converts enums and other Pydantic-supported scalar
+                # types to the primitive values expected by safe YAML.
+                yaml.safe_dump(run_config.model_dump(mode="json"), f)
 
         return Path(os.path.abspath(save_dir))
 
-    def finalize_checkpoint(self, checkpoint_path: PathLike) -> None:
-        """Complete a checkpoint by moving it from temporary to permanent location.
+    def _rename_checkpoint(self, checkpoint_path: PathLike) -> None:
+        """Rename tmp_step_N to step_N.
 
-        If a checkpoint at the target location already exists (i.e when resuming training),
-        we override the old one.
-        Also triggers cleanup of old checkpoints based on the keep_top_k setting.
-
-        Args:
-            checkpoint_path (PathLike): Path to the temporary checkpoint directory.
+        If step_N already exists (defensive guard for edge cases, e.g. resuming
+        training), performs a pseudo-atomic swap via an intermediate old_step_N
+        directory.
         """
-        # rename tmp_step_{step} to step_{step}
         checkpoint_path = Path(checkpoint_path)
-        to_checkpoint_path = (
-            checkpoint_path.parent / f"step_{checkpoint_path.name.split('_')[2]}"
-        )
+        step = checkpoint_path.name.split("_")[2]
+        to_checkpoint_path = checkpoint_path.parent / f"step_{step}"
         if to_checkpoint_path.exists():
-            # if step_{step} exists, rename it to old_step_{step}, move tmp_step_{step} to step_{step}, then delete
-            # we do this trickery to have a 'pseudo-atomic' checkpoint save
-            old_checkpoint_path = (
-                checkpoint_path.parent
-                / f"old_step_{checkpoint_path.name.split('_')[2]}"
-            )
+            old_checkpoint_path = checkpoint_path.parent / f"old_step_{step}"
             os.rename(to_checkpoint_path, old_checkpoint_path)
             os.rename(checkpoint_path, to_checkpoint_path)
-            # delete old_step_{step}
             if old_checkpoint_path.exists():
                 shutil.rmtree(old_checkpoint_path)
         else:
             os.rename(checkpoint_path, to_checkpoint_path)
-        self.remove_old_checkpoints()
 
-    def remove_old_checkpoints(self, exclude_latest: bool = True) -> None:
-        """Remove checkpoints that are not in the top-k or latest based on the (optional) metric.
+    def finalize_checkpoint(self, checkpoint_path: PathLike) -> None:
+        """Complete a checkpoint synchronously (rename + delete old).
 
-        If keep_top_k is set, this method removes all checkpoints except the top-k
-        best ones. The "best" checkpoints are determined by:
-        - If a metric is provided: the given metric value and the higher_is_better setting.
-          When multiple checkpoints have the same metric value, more recent checkpoints
-          (higher step numbers) are preferred.
-        - If no metric is provided: the step number. The most recent k checkpoints are kept.
+        This is the original synchronous API, preserved for backward
+        compatibility. For async-aware usage, prefer begin_finalization() +
+        finalize_pending().
 
         Args:
-            exclude_latest (bool): Whether to exclude the latest checkpoint from deletion. (may result in K+1 checkpoints)
+            checkpoint_path (PathLike): Path to the temporary checkpoint directory.
         """
-        if self.keep_top_k is None:
-            return
-        checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
-        latest_step = (
-            max([step for step, _, _ in checkpoint_history])
-            if checkpoint_history
-            else None
-        )
+        self._rename_checkpoint(checkpoint_path)
+        self.remove_old_checkpoints()
 
-        if self.metric_name is None:
-            checkpoint_history.sort(key=lambda x: x[0], reverse=True)
-        else:
-            # sort by metric value first, then by step number (for equal metrics, prefer more recent)
-            if self.higher_is_better:
-                # For higher_is_better=True: higher metric values first, then higher step numbers
-                checkpoint_history.sort(
-                    key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
-                    reverse=True,
-                )
-            else:
-                # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-                checkpoint_history.sort(
-                    key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0])
-                )
+    def begin_finalization(
+        self,
+        checkpoint_path: PathLike,
+        wait_fn: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Start background finalization of a checkpoint.
 
-        # remove checkpoints that are not in the top-k
-        for checkpoint in checkpoint_history[self.keep_top_k :]:
-            if exclude_latest and checkpoint[0] == latest_step:
-                continue
-            print(
-                f"Removing checkpoint {checkpoint[1]} due to being outside top-{self.keep_top_k}"
+        Spawns a daemon thread that calls wait_fn (blocks until async writers
+        finish), renames tmp_step_N to step_N, then queues old-checkpoint
+        deletion. All writes to checkpoint_path must be complete before calling
+        this. If a previous finalization is still active, blocks until it
+        completes.
+
+        Args:
+            checkpoint_path: Path to tmp_step_N directory from init_tmp_checkpoint().
+            wait_fn: Callable that blocks until all async writes are complete.
+                For Megatron async save: policy.finalize_async_save.
+                For sync saves: None (rename immediately).
+        """
+        self.finalize_pending()
+        self._pending_checkpoint_path = Path(checkpoint_path)
+        self._finalize_error = None
+        # The step is only in the staging dir name (tmp_step_<n>); None if it
+        # does not parse, since this only labels a span.
+        try:
+            step = int(Path(checkpoint_path).name.split("_")[2])
+        except (IndexError, ValueError):
+            step = None
+        # Captured here because a bare Thread starts with an empty context: read
+        # it on the worker instead and the finalize span re-roots into a trace of
+        # its own, detached from the run that produced the checkpoint.
+        carrier = current_trace_carrier()
+
+        def _finalize():
+            # The work is inside the span so a failed wait or rename is recorded
+            # on it, and the span is entered through a guard so the reverse
+            # cannot happen: telemetry must not be what skips the rename.
+            try:
+                with _finalize_telemetry(carrier, step):
+                    if wait_fn is not None:
+                        wait_fn()
+                    self._rename_checkpoint(checkpoint_path)
+                    # Prune old checkpoints off the critical path. Surface any
+                    # failure via a done-callback so a broken delete is not
+                    # silently swallowed (the discarded Future would otherwise
+                    # hide it).
+                    delete_future = self._delete_executor.submit(
+                        self.remove_old_checkpoints
+                    )
+                    delete_future.add_done_callback(self._warn_on_delete_failure)
+            except Exception as e:
+                self._finalize_error = e
+            finally:
+                self._pending_checkpoint_path = None
+
+        self._finalize_thread = threading.Thread(target=_finalize, daemon=True)
+        self._finalize_thread.start()
+
+    def finalize_pending(self) -> None:
+        """Block until the in-flight rename completes. Does NOT wait for deletion.
+
+        Re-raises any exception that occurred in the background thread.
+        No-op if nothing is pending. Safe to call multiple times.
+        """
+        if self._finalize_thread is not None:
+            self._finalize_thread.join()
+            self._finalize_thread = None
+        if self._finalize_error is not None:
+            err = self._finalize_error
+            self._finalize_error = None
+            raise RuntimeError("Background checkpoint finalization failed") from err
+
+    def shutdown(self) -> None:
+        """Block until rename + all queued deletions complete. Call at training exit.
+
+        Safe to call multiple times.
+        """
+        self.finalize_pending()
+        self._delete_executor.shutdown(wait=True)
+        self._delete_executor = ThreadPoolExecutor(max_workers=1)
+
+    @staticmethod
+    def _warn_on_delete_failure(future: "Future[None]") -> None:
+        """Surface background old-checkpoint deletion errors as warnings.
+
+        Deletion is best-effort cleanup that runs off the critical path, so a
+        failure should not abort training — but it must not be silent either.
+        """
+        exc = future.exception()
+        if exc is not None:
+            warnings.warn(
+                f"Failed to prune old checkpoints in the background: {exc!r}. "
+                "Training is unaffected, but stale checkpoints may remain on disk.",
+                stacklevel=2,
             )
-            shutil.rmtree(checkpoint[1])
+
+    def __enter__(self) -> "CheckpointManager":
+        """Enter a context that guarantees shutdown() flushes on exit."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Literal[False]:
+        """Flush pending finalizations when leaving the context.
+
+        If an exception is already propagating out of the ``with`` block, the
+        flush is best-effort and never masks the original exception. On a normal
+        exit, finalization errors propagate so a failed final checkpoint is not
+        silently dropped. Always returns ``False`` so exceptions are re-raised.
+        """
+        if exc_type is not None:
+            try:
+                self.shutdown()
+            except Exception:
+                warnings.warn(
+                    "Checkpoint finalization failed while handling an exception; "
+                    "the original exception will be re-raised.",
+                    stacklevel=2,
+                )
+            return False
+        self.shutdown()
+        return False
+
+    @property
+    def has_pending_finalization(self) -> bool:
+        """Whether a background finalization is in-flight."""
+        return self._pending_checkpoint_path is not None
+
+    def remove_old_checkpoints(self, exclude_latest: bool = True) -> None:
+        """Remove checkpoints that exceed the configured retention limits.
+
+        Retention rules are applied as a union — a checkpoint survives if any
+        rule retains it:
+
+        Periodic retention: save_period-aligned checkpoints (step % save_period == 0)
+        are always retained. If keep_top_k is set, only the top-k best among them
+        are kept; otherwise all periodic checkpoints survive indefinitely.
+
+        keep_top_k: limits periodic checkpoint retention to the top-k best.
+        The "best" are determined by:
+        - If a metric is provided: the metric value and the higher_is_better setting.
+          When multiple checkpoints share the same metric value, more recent
+          checkpoints (higher step numbers) are preferred.
+        - If no metric is provided: recency. The most recent k are kept.
+
+        ft_keep_latest_k: retains the most recent k checkpoints for crash recovery.
+        Applied to all checkpoints regardless of save_period alignment.
+        Purely recency-based — metrics are not considered.
+
+        Args:
+            exclude_latest (bool): Whether to protect the most recent checkpoint
+                from deletion.
+        """
+        checkpoint_history = _load_checkpoint_history(self.checkpoint_dir)
+        if not checkpoint_history:
+            return
+        if self.keep_top_k is None and self.ft_keep_latest_k is None:
+            return
+
+        latest_step = max(step for step, _, _ in checkpoint_history)
+        protected_steps: set[int] = set()
+
+        if exclude_latest:
+            protected_steps.add(latest_step)
+
+        periodic_history = [
+            (s, p, m) for s, p, m in checkpoint_history if s % self.save_period == 0
+        ]
+
+        if self.keep_top_k is not None:
+            # keep_top_k limits which periodic checkpoints survive
+            if self.metric_name is None:
+                periodic_history.sort(key=lambda x: x[0], reverse=True)
+            else:
+                # sort by metric value first, then by step number (for equal metrics, prefer more recent)
+                if self.higher_is_better:
+                    # For higher_is_better=True: higher metric values first, then higher step numbers
+                    periodic_history.sort(
+                        key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
+                        reverse=True,
+                    )
+                else:
+                    # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
+                    periodic_history.sort(
+                        key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0]),
+                    )
+            protected_steps.update(s for s, _, _ in periodic_history[: self.keep_top_k])
+        else:
+            # Without keep_top_k, all periodic checkpoints are retained
+            protected_steps.update(s for s, _, _ in periodic_history)
+
+        # ft_keep_latest_k: retain the most recent k checkpoints for crash recovery
+        if self.ft_keep_latest_k is not None:
+            by_step = sorted(checkpoint_history, key=lambda x: x[0], reverse=True)
+            protected_steps.update(s for s, _, _ in by_step[: self.ft_keep_latest_k])
+
+        for step, path, _ in checkpoint_history:
+            if step not in protected_steps:
+                print(f"Removing checkpoint {path} (step {step})")
+                shutil.rmtree(path)
 
     def get_best_checkpoint_path(self) -> Optional[str]:
         """Get the path to the best checkpoint based on the metric.
@@ -342,9 +680,16 @@ class CheckpointManager:
             )
             return self.get_latest_checkpoint_path()
 
-        valid_checkpoints.sort(
-            key=lambda x: x[2][self.metric_name], reverse=self.higher_is_better
-        )
+        # Sort by metric value first, then by step number so that when multiple
+        # checkpoints share the best metric value the most recent one (highest step)
+        # is returned. This matches the tie-breaking used by remove_old_checkpoints,
+        # which keeps the more recent checkpoint on equal metrics.
+        if self.higher_is_better:
+            valid_checkpoints.sort(
+                key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
+            )
+        else:
+            valid_checkpoints.sort(key=lambda x: (x[2][self.metric_name], -x[0]))
         return str(valid_checkpoints[0][1])
 
     def get_latest_checkpoint_path(self) -> Optional[str]:

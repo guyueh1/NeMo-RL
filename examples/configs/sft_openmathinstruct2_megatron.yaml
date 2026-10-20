@@ -3,7 +3,7 @@ sft:
   val_micro_batch_size: 1
 policy:
   train_micro_batch_size: 1
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     distributed_data_parallel_config:
@@ -42,3 +42,4 @@ logger:
     name: llama8b
 cluster:
   num_nodes: 2
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

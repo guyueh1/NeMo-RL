@@ -16,17 +16,20 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Callable, Iterator, Mapping, cast
 
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
-from megatron.training.utils import unwrap_model
+from megatron.core.utils import unwrap_model
 from torch import Tensor
+
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
 StateDict = dict[str, Tensor]
 CheckpointLoader = Callable[[Path], StateDict]
@@ -46,6 +49,19 @@ _HF_SNAPSHOT_ALLOW_PATTERNS = [
     "pytorch_model.bin.index.json",
 ]
 _HF_SNAPSHOT_IGNORE_PATTERNS = ["*.pt", "*.pth", "*.ckpt"]
+# Both the HF-mapped name ("lm_head") and the native Megatron/EAGLE names
+# ("output_layer", "eagle_output_layer") must be rejected: the validator runs on
+# raw state dicts too, where the copied target head is
+# `eagle_module.eagle_output_layer.weight`.
+_DFLASH_FORBIDDEN_EXPORT_COMPONENTS = frozenset(
+    {
+        "lm_head",
+        "output_layer",
+        "eagle_output_layer",
+        "mask_embedding",
+        "mask_token",
+    }
+)
 _MODEL_LAYER_QKV_KEY_PATTERN = re.compile(
     r"^eagle_module\.decoder\.layers\.(\d+)\.self_attention\.linear_qkv\.weight$"
 )
@@ -173,6 +189,47 @@ class _EagleModelLayout:
         return {layer.layer_index: layer for layer in self.layers}
 
 
+def _qkv_head_dims(config: TransformerConfig) -> tuple[int, int, int]:
+    """Return ``(num_attention_heads, num_query_groups, head_dim)`` for the qkv weight."""
+    nh = int(config.num_attention_heads)
+    ng = int(getattr(config, "num_query_groups", None) or nh)
+    hd = int(getattr(config, "kv_channels", None) or int(config.hidden_size) // nh)
+    return nh, ng, hd
+
+
+def _interleave_qkv(
+    q: Tensor, k: Tensor, v: Tensor, config: TransformerConfig
+) -> Tensor:
+    """Reorder HF ``[all_q; all_k; all_v]`` into Megatron's interleaved qkv layout.
+
+    Megatron's ``SelfAttention`` reads ``linear_qkv`` per query group as
+    ``[g0: q.. k v | g1: q.. k v | ...]`` (shape ``[num_query_groups,
+    (heads_per_group + 2) * head_dim, in]``), so a naive ``cat([q, k, v])`` is
+    silently mis-read for GQA (``num_query_groups < num_attention_heads``).
+    """
+    nh, ng, hd = _qkv_head_dims(config)
+    r = nh // ng
+    fused = torch.cat(
+        [q.reshape(ng, r * hd, -1), k.reshape(ng, hd, -1), v.reshape(ng, hd, -1)],
+        dim=1,
+    )
+    return fused.reshape(-1, q.shape[1]).contiguous()
+
+
+def _deinterleave_qkv(
+    fused: Tensor, config: TransformerConfig
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Inverse of :func:`_interleave_qkv`: recover HF ``(q, k, v)`` projections."""
+    nh, ng, hd = _qkv_head_dims(config)
+    r = nh // ng
+    g = fused.reshape(ng, (r + 2) * hd, -1)
+    return (
+        g[:, : r * hd].reshape(nh * hd, -1).contiguous(),
+        g[:, r * hd : (r + 1) * hd].reshape(ng * hd, -1).contiguous(),
+        g[:, (r + 1) * hd :].reshape(ng * hd, -1).contiguous(),
+    )
+
+
 def _combine_or_shard_weight_parts(
     *,
     parameter_name: str,
@@ -253,17 +310,27 @@ class _PendingLayerWeights:
         layer: _EagleLayerLayout,
         model_state: Mapping[str, Tensor],
         tp_rank: int,
+        config: TransformerConfig,
     ) -> None:
-        qkv_weight = _combine_or_shard_weight_parts(
-            parameter_name=layer.qkv_weight_key,
-            fused_weight=self.qkv_weight,
-            component_weights=(self.q_weight, self.k_weight, self.v_weight),
-            target=model_state.get(layer.qkv_weight_key),
-            tp_rank=tp_rank,
-            incomplete_error=(
+        if self.qkv_weight is not None:
+            # Pre-fused checkpoint qkv is assumed to already be Megatron-interleaved.
+            qkv_weight: Tensor | None = self.qkv_weight
+        elif (
+            self.q_weight is not None
+            and self.k_weight is not None
+            and self.v_weight is not None
+        ):
+            # Separate HF q/k/v are head-major; reorder to Megatron's interleaved
+            # layout (_shard_to_local_tp applies the dim-0 TP chunk afterwards).
+            qkv_weight = _interleave_qkv(
+                self.q_weight, self.k_weight, self.v_weight, config
+            )
+        elif self.q_weight is None and self.k_weight is None and self.v_weight is None:
+            qkv_weight = None
+        else:
+            raise RuntimeError(
                 "[draft] Incomplete QKV tensors. Expected q_proj, k_proj, and v_proj."
-            ),
-        )
+            )
         if qkv_weight is not None:
             mapped_state[layer.qkv_weight_key] = qkv_weight
 
@@ -310,38 +377,22 @@ def _all_gather_tp_shards(local_weight: Tensor) -> list[Tensor]:
 
 def _gather_tp_qkv_weight(
     local_fused_weight: Tensor,
-    q_dim: int,
-    kv_dim: int,
+    config: TransformerConfig,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    """Gather TP shards of the Megatron fused qkv weight and split into HF q/k/v.
+
+    Each TP rank owns a contiguous, group-aligned dim-0 chunk, so all-gathering
+    and concatenating in rank order reconstructs the full interleaved weight,
+    which is de-interleaved back into HF ``(q, k, v)`` (inverse of the load-time
+    :func:`_interleave_qkv`).
+    """
     shards = _all_gather_tp_shards(local_fused_weight)
-    if len(shards) == 1 and local_fused_weight.shape[0] == q_dim + 2 * kv_dim:
-        return local_fused_weight.split([q_dim, kv_dim, kv_dim], dim=0)
-
-    tp_world_size = len(shards)
-    if q_dim % tp_world_size != 0 or kv_dim % tp_world_size != 0:
-        raise RuntimeError(
-            "QKV dimensions are not divisible by the tensor-parallel world size."
-        )
-
-    q_shards = []
-    k_shards = []
-    v_shards = []
-    local_q_dim = q_dim // tp_world_size
-    local_kv_dim = kv_dim // tp_world_size
-    for shard in shards:
-        q_local, k_local, v_local = shard.split(
-            [local_q_dim, local_kv_dim, local_kv_dim],
-            dim=0,
-        )
-        q_shards.append(q_local)
-        k_shards.append(k_local)
-        v_shards.append(v_local)
-
-    return (
-        torch.cat(q_shards, dim=0).contiguous(),
-        torch.cat(k_shards, dim=0).contiguous(),
-        torch.cat(v_shards, dim=0).contiguous(),
+    full_fused = (
+        local_fused_weight
+        if len(shards) == 1
+        else torch.cat(shards, dim=0).contiguous()
     )
+    return _deinterleave_qkv(full_fused, config)
 
 
 def _gather_tp_gate_up_weight(
@@ -381,7 +432,7 @@ def _gather_tp_weight_if_needed(
     split_axis: int | None = None,
 ) -> Tensor:
     if split_axis is None:
-        tp_group = expected_shape_or_tp_group
+        tp_group = cast(dist.ProcessGroup | None, expected_shape_or_tp_group)
         if tp_group is None or not dist.is_available() or not dist.is_initialized():
             return local_weight
 
@@ -809,6 +860,7 @@ def _map_hf_state_to_eagle_state(
     model_state: Mapping[str, Tensor],
     layout: _EagleModelLayout,
     checkpoint_source: str,
+    config: TransformerConfig,
 ) -> StateDict:
     mapped_state: StateDict = {}
     pending_weights_by_layer = {
@@ -872,6 +924,7 @@ def _map_hf_state_to_eagle_state(
             layer,
             model_state=model_state,
             tp_rank=tp_rank,
+            config=config,
         )
 
     if not mapped_state:
@@ -911,9 +964,13 @@ def load_hf_weights_to_eagle(
         model_state=model_state,
         layout=layout,
         checkpoint_source=model_name,
+        config=unwrap_model(model).config,
     )
 
-    return model.load_state_dict(new_state, strict=False)
+    return cast(
+        tuple[list[str], list[str]],
+        model.load_state_dict(new_state, strict=False),
+    )
 
 
 def _require_state_tensor(
@@ -951,12 +1008,37 @@ def get_attached_draft_model(model: list[MegatronModule]) -> MegatronModule | No
     return None
 
 
+@contextmanager
+def draft_model_detached(model: list[MegatronModule]) -> Iterator[None]:
+    """Temporarily detach the nested draft model from its owner chunk.
+
+    Megatron-Bridge conversion only covers the base model's HF architecture;
+    draft weights are refit through `export_eagle_weights_to_hf` instead.
+    """
+    owner_chunk: MegatronModule | None = None
+    draft_model: MegatronModule | None = None
+    for model_chunk in reversed(model):
+        unwrapped_chunk = unwrap_model(model_chunk)
+        chunk_draft = getattr(unwrapped_chunk, "draft_model", None)
+        if chunk_draft is not None:
+            owner_chunk = unwrapped_chunk
+            draft_model = chunk_draft
+            break
+    if owner_chunk is None:
+        yield
+        return
+    delattr(owner_chunk, "draft_model")
+    try:
+        yield
+    finally:
+        owner_chunk.draft_model = draft_model
+
+
 def _export_layer_weights_to_hf(
     *,
     source_state: Mapping[str, Tensor],
     layer: _EagleLayerLayout,
-    q_dim: int,
-    kv_dim: int,
+    config: TransformerConfig,
     hidden_size: int,
     ffn_hidden_size: int,
 ) -> list[tuple[str, Tensor]]:
@@ -981,8 +1063,7 @@ def _export_layer_weights_to_hf(
 
     q_proj, k_proj, v_proj = _gather_tp_qkv_weight(
         _require_state_tensor(source_state, layer.qkv_weight_key),
-        q_dim=q_dim,
-        kv_dim=kv_dim,
+        config=config,
     )
     hf_state.append((f"{layer_prefix}.self_attn.q_proj.weight", q_proj))
     hf_state.append((f"{layer_prefix}.self_attn.k_proj.weight", k_proj))
@@ -1029,8 +1110,6 @@ def export_eagle_weights_to_hf(
     config = unwrapped_model.config
     layout = _EagleModelLayout.detect(source_state)
 
-    q_dim = config.num_attention_heads * config.kv_channels
-    kv_dim = config.num_query_groups * config.kv_channels
     ffn_hidden_size = config.ffn_hidden_size
     num_aux_hidden_states = _get_num_aux_hidden_states(config)
 
@@ -1049,8 +1128,7 @@ def export_eagle_weights_to_hf(
             _export_layer_weights_to_hf(
                 source_state=source_state,
                 layer=layer,
-                q_dim=q_dim,
-                kv_dim=kv_dim,
+                config=config,
                 hidden_size=config.hidden_size,
                 ffn_hidden_size=ffn_hidden_size,
             )
@@ -1078,6 +1156,27 @@ def export_eagle_weights_to_hf(
         hf_state.append(("d2t", source_state["eagle_module.d2t"]))
 
     return hf_state
+
+
+def validate_dflash_export_state_dict(
+    state_dict: Mapping[str, Tensor],
+) -> None:
+    """Reject target-owned parameters from a standalone DFlash artifact.
+
+    Called from the DFlash export path added in PR #3757.
+    """
+    forbidden_keys = sorted(
+        key
+        for key in state_dict
+        if _DFLASH_FORBIDDEN_EXPORT_COMPONENTS.intersection(
+            component.casefold() for component in key.split(".")
+        )
+    )
+    if forbidden_keys:
+        raise ValueError(
+            "[draft] DFlash export contains target-owned parameter keys: "
+            + ", ".join(forbidden_keys)
+        )
 
 
 def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tensor:
@@ -1170,14 +1269,36 @@ def copy_policy_lm_head_to_draft(
         )
 
 
+DRAFT_GRAD_NORM_GROUP = "draft"
+
+
+def register_draft_grad_norm_group() -> None:
+    """Register the 'draft' grad-norm group with Megatron's optimizer.
+
+    Megatron clips parameters in a registered group separately from the main
+    gradient norm (see MegatronOptimizer.clip_grad_norm and the 'mtp'
+    precedent in multi_token_prediction.py), so the draft head's large
+    early-training gradients do not shrink the policy update through the
+    shared global clip. Only called when a draft model is built, so baseline
+    (no-draft) runs keep Megatron's stock clipping behavior.
+    """
+    from megatron.core.optimizer import optimizer as mcore_optimizer
+
+    if DRAFT_GRAD_NORM_GROUP not in mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS:
+        mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS = (
+            *mcore_optimizer.SEPARATE_GRAD_NORM_GROUPS,
+            DRAFT_GRAD_NORM_GROUP,
+        )
+
+
 def build_draft_model(
     model_provider,
-    draft_config: dict[str, Any],
+    draft_config: Eagle3DraftConfig,
     pg_collection: ProcessGroupCollection,
     policy_model_chunk: MegatronModule,
 ) -> MegatronModule | None:
     """Build an Eagle draft model before parent mixed-precision/DDP wrapping."""
-    if not draft_config["enabled"]:
+    if not draft_config.enabled:
         return None
 
     from transformers import AutoConfig
@@ -1187,9 +1308,9 @@ def build_draft_model(
         get_eagle3_aux_hidden_state_layers,
     )
 
-    model_name = draft_config.get("model_name")
+    model_name = draft_config.model_name
     hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
-    draft_num_layers = draft_config.get("num_layers")
+    draft_num_layers = draft_config.num_layers
     config = TransformerConfig(
         normalization="RMSNorm",
         activation_func=torch.nn.functional.silu,
@@ -1260,9 +1381,7 @@ def build_draft_model(
             "eagle_aux_hidden_state_layer_ids", []
         )
     else:
-        config.eagle_aux_hidden_state_layer_ids = (
-            draft_config.get("aux_layer_indices") or []
-        )
+        config.eagle_aux_hidden_state_layer_ids = draft_config.aux_layer_indices or []
     if (
         config.use_aux_hidden_state
         and len(config.eagle_aux_hidden_state_layer_ids) == 0
@@ -1313,5 +1432,12 @@ def build_draft_model(
             policy_model_chunk=policy_model_chunk,
         )
         print("[draft] Initialized draft LM head from the policy output layer.")
+
+    # Tag draft params before optimizer construction so
+    # copy_optimizer_param_metadata propagates the group to the distributed
+    # optimizer's shard/fp32 main params and they are clipped separately.
+    register_draft_grad_norm_group()
+    for param in draft_model.parameters():
+        param.grad_norm_group = DRAFT_GRAD_NORM_GROUP
 
     return draft_model

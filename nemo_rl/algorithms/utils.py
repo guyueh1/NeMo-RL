@@ -17,7 +17,7 @@ import random
 import re
 import warnings
 from functools import partial, wraps
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -28,14 +28,28 @@ from transformers import (
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import (
+    get_deepseek_v4_tokenizer,
+    should_use_deepseek_v4_chat_template,
+)
 from nemo_rl.models.policy import TokenizerConfig
+from nemo_rl.telemetry.vocabulary import (
+    EFFICIENCY_PCT_KEY,
+    EFFICIENCY_PCT_PER_STEP_KEY,
+    RUN_WINDOW_WALL_CLOCK_CATEGORIES,
+)
+from nemo_rl.utils.fastokens import maybe_patch_fastokens
 from nemo_rl.utils.logger import Logger
 
+if TYPE_CHECKING:
+    from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-def get_gdpo_reward_component_keys(batch) -> list:
-    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
-    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
-    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
+
+def get_gdpo_reward_component_keys(batch) -> list[str]:
+    """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
+    return sorted(
+        k for k in batch.keys() if isinstance(k, str) and k.startswith("reward/")
+    )
 
 
 def calculate_kl(
@@ -44,6 +58,7 @@ def calculate_kl(
     kl_type: str = "k3",
     input_clamp_value: float | None = 20.0,
     output_clamp_value: float | None = 10.0,
+    importance_sampling_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two logprobs.
 
@@ -57,13 +72,26 @@ def calculate_kl(
                            If None, no clamping is applied.
         output_clamp_value: Optional clamping value for kl to prevent numerical instability.
                            If None, no clamping is applied.
+        importance_sampling_weights: Optional per-token importance weights. When
+                                     provided, weights are multiplied into the KL
+                                     before output clamping. If input clamping
+                                     applies to a token, the corresponding weight
+                                     is detached so the clamp suppresses both KL
+                                     and sampling-weight gradients.
 
     Returns:
         torch.Tensor: Per-token KL penalty values (b, s)
     """
     logr = logprobs_reference - logprobs
     if input_clamp_value is not None:
-        logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        logr_clamped = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        if importance_sampling_weights is not None:
+            importance_sampling_weights = torch.where(
+                logr == logr_clamped,
+                importance_sampling_weights,
+                importance_sampling_weights.detach(),
+            )
+        logr = logr_clamped
 
     if kl_type == "k1":
         kl = -logr
@@ -77,6 +105,9 @@ def calculate_kl(
     else:
         raise ValueError(f"Invalid KL type: {kl_type}")
 
+    if importance_sampling_weights is not None:
+        kl = importance_sampling_weights * kl
+
     if output_clamp_value is not None:
         kl = kl.clamp(min=-output_clamp_value, max=output_clamp_value)
 
@@ -89,13 +120,15 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
     std_rewards: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
     are not included in the baseline calculation.
 
-    prompts:    tensor (b, s)     Tensor of prompts the model used. May be on any device
+    prompts:    tensor (b, k)     Row equality keys defining prompt groups. GRPO uses
+                                  explicit rollout-group ids with shape (b, 1), not
+                                  prompt tokens. May be on any device.
     rewards:    tensor (b,)       Float-valued rewards. May be on any device
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
@@ -107,7 +140,13 @@ def calculate_baseline_and_std_per_prompt(
                                   shaped reward.
 
     Returns:
-    tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
+    tensor (b,), tensor (b,), bool tensor (b,) of baselines, std, and a per-sample
+    boolean that is True if the sample group distribution associated with the sample
+    is trivial, i.e. all the rewards are a single value.
+
+    Any non-zero std computed from a trivial distribution is float32 rounding noise
+    which can create explosive advantages during normalization that should not be
+    used for GRPO training.
     """
     if std_rewards is None:
         std_rewards = rewards
@@ -116,6 +155,7 @@ def calculate_baseline_and_std_per_prompt(
     baseline = torch.zeros_like(rewards)
     sq_baseline = torch.zeros_like(rewards)
     std = torch.zeros_like(rewards)
+    is_trivial_distribution = torch.ones_like(rewards, dtype=torch.bool)
     device_ordinal = rewards.get_device()
     if device_ordinal == -1:
         reward_device = torch.device("cpu")
@@ -165,9 +205,22 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
+            comparison_mask = baseline_mask_matrix.bool() & valid_mask[
+                prompt_idx
+            ].bool().unsqueeze(0)
+            comparison_rewards = (
+                std_rewards[prompt_idx].unsqueeze(0).expand(len(prompt_idx), -1)
+            )
+            comparison_min = comparison_rewards.masked_fill(
+                ~comparison_mask, torch.inf
+            ).amin(dim=1)
+            comparison_max = comparison_rewards.masked_fill(
+                ~comparison_mask, -torch.inf
+            ).amax(dim=1)
 
             baseline[prompt_idx] = prompt_baseline
             sq_baseline[prompt_idx] = std_prompt_baseline_square
+            is_trivial_distribution[prompt_idx] = comparison_min == comparison_max
             std[prompt_idx] = (
                 (
                     (std_prompt_baseline_square - std_prompt_baseline.square())
@@ -177,7 +230,31 @@ def calculate_baseline_and_std_per_prompt(
                 .nan_to_num(0)
             )
 
-    return baseline, std
+    return baseline, std, is_trivial_distribution
+
+
+def calculate_trivial_reward_distributions(
+    prompts: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Return an all-or-nothing exact-equality mask for each prompt group.
+
+    Unlike the per-sample mask returned by
+    ``calculate_baseline_and_std_per_prompt``, this always compares the full
+    valid reward group. It is therefore independent of leave-one-out baseline
+    semantics and safe to use for prompt-level dynamic sampling.
+    """
+    is_trivial_prompt_distribution = torch.ones_like(rewards, dtype=torch.bool)
+    for prompt in torch.unique(prompts, dim=0):
+        prompt_mask = (prompts == prompt).all(1)
+        valid_rewards = rewards[prompt_mask & valid_mask.bool()]
+        is_trivial = valid_rewards.numel() <= 1 or (
+            valid_rewards.amin() == valid_rewards.amax()
+        )
+        is_trivial_prompt_distribution[prompt_mask] = is_trivial
+
+    return is_trivial_prompt_distribution
 
 
 def surpress_user_warnings(f):  # type: ignore
@@ -189,6 +266,28 @@ def surpress_user_warnings(f):  # type: ignore
         return output
 
     return wrapper
+
+
+@torch.no_grad()
+def compute_seq_logprob_errors(
+    *,
+    policy_logprobs: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return mean multiplicative absolute error and validity per sequence.
+
+    Inputs must already be aligned to predicted tokens (without the first
+    input token). Padding and previously masked samples do not participate.
+    Nonfinite errors on valid tokens fail any finite threshold.
+    """
+    mask = token_mask * sample_mask.unsqueeze(-1)
+    counts = mask.sum(dim=-1)
+    valid = counts > 0
+    error = torch.where(mask.bool(), (generation_logprobs - policy_logprobs).abs(), 0.0)
+    errors = (torch.exp(error * mask) * mask).sum(dim=-1) / counts.clamp(min=1)
+    return errors, valid
 
 
 def masked_mean(
@@ -206,37 +305,44 @@ def masked_mean(
     return torch.sum(values * mask, dim=dim) / (normalization_factor + 1e-8)
 
 
-def mask_out_neg_inf_logprobs(
-    logprobs: torch.Tensor, mask: torch.Tensor, logprobs_name: str
+def mask_filtered_logprobs_outside_tokens(
+    logprobs: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
-    """Mask out negative infinity log probabilities.
+    """Zero top-k/top-p filtered log probabilities outside ``mask``.
 
-    Handling sampling mask mismatch:
-    vLLM samples token X from top-k/p filtered distribution -> generation_logprobs[X] is always finite (e.g., -5.41)
-    during training: policy computes logprobs with same top-k/p settings, but the distribution can be slightly different
-    token X may fall outside the training policy's top-k/p set -> curr_logprobs[X] = -inf, prev_logprobs[X] = -inf
-    Detect positions with -inf in any logprobs (generation_logprobs is always finite for valid tokens)
+    Prompt and padding tokens are often outside the filtered support and would
+    otherwise carry -inf (or NaN after multiplying by a mask) to every consumer.
+    Valid tokens keep -inf so the actor loss can exclude policy support
+    mismatches instead of treating them as log-probability zero.
 
     Args:
-        logprobs: Log probabilities.
-        mask: Mask.
-        logprobs_name: Name of the logprobs tensor. Used for printing warning messages.
+        logprobs: Filtered log probabilities.
+        mask: Valid-token mask (token_mask * sample_mask).
 
     Returns:
-        Masked log probabilities.
+        Log probabilities with zeros outside ``mask``.
     """
-    is_neginf = torch.isinf(logprobs)
-    neginf_count = (is_neginf & mask.bool()).sum().item()
-    if neginf_count > 0:
-        print(
-            f"[WARNING]: {neginf_count}/{int(mask.sum().item())} valid tokens have -inf in {logprobs_name} "
-            "(policy top-k/top-p mismatch). Masking out these positions."
+    return torch.where(mask.bool(), logprobs, 0.0)
+
+
+def masked_var(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    mean: Optional[torch.Tensor | float] = None,
+    unbiased: bool = True,
+) -> torch.Tensor:
+    if mean is None:
+        mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values.pow(2), mask)
+
+    if unbiased:
+        normalization_factor = torch.sum(mask)
+        # A singleton has zero centered variance; avoid an undefined correction.
+        variance = variance * (
+            normalization_factor / (normalization_factor - 1).clamp(min=1)
         )
-
-    mask = mask * (~is_neginf).float()
-    logprobs = torch.where(mask.bool(), logprobs, 0.0)
-
-    return logprobs
+    return variance
 
 
 def set_seed(seed: int) -> None:
@@ -265,6 +371,10 @@ def get_tokenizer(
                     - "default": Uses the tokenizer's default template
                     - A custom jinja2 template string
                     If not specified, the tokenizer's default template will be used.
+                - tokenizer_kwargs: Extra keyword arguments forwarded to tokenizer
+                  loading, e.g. {"fix_mistral_regex": False}. When
+                  get_processor=True, these are passed through
+                  AutoProcessor.from_pretrained().
         get_processor: Whether to return a processor (via AutoProcessor) instead of a tokenizer.
 
     Returns:
@@ -321,22 +431,41 @@ def get_tokenizer(
         >>>
         ```
     """
+    maybe_patch_fastokens(bool(tokenizer_config.get("use_fastokens")))
+
     processor = None
+    tokenizer_kwargs = dict(tokenizer_config.get("tokenizer_kwargs") or {})
 
     if get_processor:
         processor = AutoProcessor.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True, use_fast=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            use_fast=tokenizer_kwargs.pop("use_fast", True),
+            **tokenizer_kwargs,
         )
         tokenizer = processor.tokenizer
     else:
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
+            tokenizer_config["name"],
+            trust_remote_code=True,
+            **tokenizer_kwargs,
         )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
+    use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
+    chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
+    if chat_template_kwargs is not None:
+        assert isinstance(chat_template_kwargs, dict), (
+            "chat_template_kwargs should be a dictionary"
+        )
+    if use_deepseek_v4_tokenizer:
+        print("Using vLLM 0.25.1's DeepSeek V4 chat renderer")
+        tokenizer = get_deepseek_v4_tokenizer(tokenizer, chat_template_kwargs)
+        if processor is not None:
+            processor.tokenizer = tokenizer
+    elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response
@@ -354,15 +483,9 @@ def get_tokenizer(
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if (
-        "chat_template_kwargs" in tokenizer_config
-        and tokenizer_config["chat_template_kwargs"] is not None
-    ):
-        assert isinstance(tokenizer_config["chat_template_kwargs"], dict), (
-            "chat_template_kwargs should be a dictionary"
-        )
+    if chat_template_kwargs is not None and not use_deepseek_v4_tokenizer:
         tokenizer.apply_chat_template = partial(
-            tokenizer.apply_chat_template, **tokenizer_config["chat_template_kwargs"]
+            tokenizer.apply_chat_template, **chat_template_kwargs
         )
 
     # The "tokenizer" is passed to the policy workers only to use the pad/eos/bos tokens for extra padding and processing of the tokenized messages. That is the only reason it is needed.
@@ -420,7 +543,9 @@ def get_tokenizer(
     return tokenizer if processor is None else processor
 
 
-def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
+def maybe_pad_last_batch(
+    batch: "BatchedDataDict[Any]", dp_size: int, mbs: int
+) -> "BatchedDataDict[Any]":
     """Pads the given batch so that its size is divisible by (mbs * dp_size).
 
     Args:
@@ -434,48 +559,39 @@ def maybe_pad_last_batch(batch: dict, dp_size: int, mbs: int) -> dict:
     min_padding = (math.ceil(batch.size / (mbs * dp_size)) * mbs * dp_size) - batch.size
     if min_padding > 0:
         print(f"Padding last validation batch with {min_padding} padding samples")
-        # Pad input_ids
-        batch["input_ids"] = torch.cat(
-            [
-                batch["input_ids"],
-                batch["input_ids"][-1].unsqueeze(0).repeat(min_padding, 1),
-            ]
-        )
-        # Pad input_lengths
-        batch["input_lengths"] = torch.cat(
-            [
-                batch["input_lengths"],
-                batch["input_lengths"][-1].unsqueeze(0).repeat(min_padding),
-            ]
-        )
-        if "token_mask" in batch:
-            # Pad token_mask
-            batch["token_mask"] = torch.cat(
-                [
-                    batch["token_mask"],
-                    batch["token_mask"][-1].unsqueeze(0).repeat(min_padding, 1),
-                ]
-            )
-        # Pad sample_mask
-        batch["sample_mask"] = torch.cat(
-            [
-                batch["sample_mask"],
-                torch.zeros_like(batch["sample_mask"][-1])
-                .unsqueeze(0)
-                .repeat(min_padding),
-            ]
-        )
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-        if "reference_policy_logprobs" in batch:
-            # Pad reference_policy_logprobs
-            batch["reference_policy_logprobs"] = torch.cat(
-                [
-                    batch["reference_policy_logprobs"],
-                    batch["reference_policy_logprobs"][-1]
-                    .unsqueeze(0)
-                    .repeat(min_padding, 1),
-                ]
-            )
+        if "pair_index" in batch and "is_chosen" in batch:
+            if min_padding % 2 != 0:
+                raise ValueError(
+                    "Preference validation batches must be padded by complete pairs."
+                )
+            # Padding runs before sequence packing, while preference rows are
+            # still interleaved. Duplicate complete media-bearing pairs so all
+            # batch-aligned fields remain consistent.
+            pair_repeats = min_padding // 2
+            padding_indices = [batch.size - 2, batch.size - 1] * pair_repeats
+        else:
+            padding_indices = [batch.size - 1] * min_padding
+
+        padding_batch = batch.select_indices(padding_indices)
+        padding_batch["sample_mask"] = torch.zeros_like(padding_batch["sample_mask"])
+
+        if "pair_index" in padding_batch and "is_chosen" in padding_batch:
+            first_padding_pair = int(batch["pair_index"].max().item()) + 1
+            padding_batch["pair_index"] = torch.arange(
+                first_padding_pair,
+                first_padding_pair + min_padding // 2,
+                dtype=batch["pair_index"].dtype,
+                device=batch["pair_index"].device,
+            ).repeat_interleave(2)
+            padding_batch["is_chosen"] = torch.tensor(
+                [True, False],
+                dtype=batch["is_chosen"].dtype,
+                device=batch["is_chosen"].device,
+            ).repeat(min_padding // 2)
+
+        batch = BatchedDataDict.from_batches([batch, padding_batch])
     return batch
 
 
@@ -484,22 +600,37 @@ def print_performance_metrics(
     metrics: dict[str, Any],
     timing_metrics: dict[str, float],
     master_config: dict,
+    *,
+    num_prompts_per_step: int,
+    num_generations_per_prompt: int,
+    is_async_rl: bool,
 ) -> dict[str, float]:
-    """Print performance metrics for GRPO."""
+    """Print performance metrics for an RL training step."""
 
     # =====================================================
     # Generate Token Imbalance Visualization
     # =====================================================
-    def visualize_per_worker_load(per_worker_token_counts: dict[int, int]) -> float:
+    def visualize_per_worker_load(
+        per_worker_token_counts: dict[int, int],
+    ) -> Optional[float]:
         per_worker_token_counts_list = [
             v for k, v in sorted(per_worker_token_counts.items())
         ]
+        print("  • Visualizing Token Imbalance per Generation Worker:")
+        if not per_worker_token_counts_list:
+            print("    - No per-worker generation load data available.")
+            return None
+
+        max_token_count = max(per_worker_token_counts_list)
+        if max_token_count <= 0:
+            print("    - No generated tokens recorded per worker.")
+            return None
+
         per_worker_load_ratio = [
-            v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
+            v / max_token_count for v in per_worker_token_counts_list
         ]
         max_rows_to_print = 1000
         bar_length = 20
-        print("  • Visualizing Token Imbalance per Generation Worker:")
         for i in range(min(len(per_worker_token_counts_list), max_rows_to_print)):
             print(
                 f"    - Generated Tokens from Worker {i:3.0f}:"
@@ -532,7 +663,8 @@ def print_performance_metrics(
 
         if per_worker_token_counts is not None:
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
-            performance_metrics["average_token_imbalance"] = average_token_imbalance
+            if average_token_imbalance is not None:
+                performance_metrics["average_token_imbalance"] = average_token_imbalance
 
     if "mean_total_tokens_per_sample" in metrics:
         print(
@@ -663,37 +795,39 @@ def print_performance_metrics(
     # Throughputs
     # =====================================================
 
-    policy_and_reference_logprobs_time = timing_metrics["policy_and_reference_logprobs"]
-    policy_training_time = timing_metrics["policy_training"]
+    policy_and_reference_logprobs_time = timing_metrics.get(
+        "policy_and_reference_logprobs", 0
+    )
+    policy_training_time = timing_metrics.get("policy_training", 0)
     total_time = timing_metrics["total_step_time"]
     refit_time = (
         timing_metrics["weight_sync"]
         if "weight_sync" in timing_metrics
-        else timing_metrics["prepare_for_generation/total"]
+        else timing_metrics.get("prepare_for_generation/total", 0)
     )
-    if "generation" in timing_metrics:  # Sync GRPO
+    if "generation" in timing_metrics:  # Sync
         generation_time = timing_metrics["generation"]
-    else:  # Async GRPO
+    else:  # Async
         # If the training time is greater than the generation time, we include the idle time caused by training as part of the generation time.
         # if training time > generation time, generation time = training time
         # if training time < generation time, generation time = training time + exposed generation time
         generation_time = (
-            timing_metrics["exposed_generation"]
-            + timing_metrics["policy_and_reference_logprobs"]
-            + timing_metrics["policy_training"]
+            timing_metrics.get("exposed_generation", 0)
+            + policy_and_reference_logprobs_time
+            + policy_training_time
         )
 
-    num_nodes = master_config.cluster["num_nodes"]
-    gpus_per_node = master_config.cluster["gpus_per_node"]
+    num_nodes = master_config.cluster.num_nodes
+    gpus_per_node = master_config.cluster.gpus_per_node
     total_num_gpus = num_nodes * gpus_per_node
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
-    # Idle Time from Training Worker (Async GRPO only)
-    grpo_config = master_config.grpo
+    # Idle time from the training worker in async RL.
     if (
-        "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
-    ) and not colocated_inference:
-        # async grpo
+        "exposed_generation" in timing_metrics
+        and is_async_rl
+        and not colocated_inference
+    ):
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
@@ -713,9 +847,7 @@ def print_performance_metrics(
             training_worker_idle_time_ratio
         )
 
-    number_of_samples_per_step = (
-        grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
-    )
+    number_of_samples_per_step = num_prompts_per_step * num_generations_per_prompt
 
     if colocated_inference:
         training_num_gpus = total_num_gpus
@@ -733,28 +865,39 @@ def print_performance_metrics(
         )
         training_num_gpus = total_num_gpus - generation_num_gpus
 
+    total_num_tokens = metrics.get("total_num_tokens", 0)
+
     e2e_samples_per_sec_per_gpu = (
         number_of_samples_per_step / total_time / total_num_gpus
+        if total_time > 0
+        else 0
     )
 
     e2e_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / total_time / total_num_gpus
+        total_num_tokens / total_time / total_num_gpus if total_time > 0 else 0
     )
     policy_training_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / policy_training_time / training_num_gpus
+        total_num_tokens / policy_training_time / training_num_gpus
+        if policy_training_time > 0
+        else 0
     )
     policy_and_reference_logprobs_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / policy_and_reference_logprobs_time
-        / training_num_gpus
+        total_num_tokens / policy_and_reference_logprobs_time / training_num_gpus
+        if policy_and_reference_logprobs_time > 0
+        else 0
+    )
+    training_worker_group_time = (
+        policy_training_time + policy_and_reference_logprobs_time
     )
     training_worker_group_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / (policy_training_time + policy_and_reference_logprobs_time)
-        / training_num_gpus
+        total_num_tokens / training_worker_group_time / training_num_gpus
+        if training_worker_group_time > 0
+        else 0
     )
     generation_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / generation_time / generation_num_gpus
+        total_num_tokens / generation_time / generation_num_gpus
+        if generation_time > 0
+        else 0
     )
 
     print("  • Throughputs (per GPU):")
@@ -791,10 +934,17 @@ def print_performance_metrics(
     # FLOPS
     # =====================================================
 
-    if "total_flops" in train_results:
-        total_tflops = (
-            train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+    packing_enabled = master_config.policy.get("sequence_packing", {}).get(
+        "enabled", False
+    )
+    if "total_flops" in train_results and not packing_enabled:
+        # Prefer the CUDA-synchronized elapsed time recorded inside the Megatron worker
+        # over the driver-side policy_training timer, which returns as soon as the Ray
+        # future is submitted and can be much shorter than actual GPU compute time.
+        train_elapsed_seconds = train_results.get(
+            "train_elapsed_seconds", timing_metrics["policy_training"]
         )
+        total_tflops = train_results["total_flops"] / train_elapsed_seconds / 1e12
         num_ranks = train_results["num_ranks"]
         print(
             f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",
@@ -844,13 +994,13 @@ def print_performance_metrics(
     return performance_metrics
 
 
-def log_generation_metrics_to_wandb(
+def log_generation_metrics(
     generation_logger_metrics: dict[str, dict[int, list[Any]]],
     step: int,
     timeline_interval: float,
     logger: Logger,
 ) -> None:
-    """Log generation metrics to wandb.
+    """Log generation metric timelines to every configured logger backend.
 
     Args:
         generation_logger_metrics: Dictionary of generation logger metrics
@@ -866,3 +1016,166 @@ def log_generation_metrics_to_wandb(
             name=generation_metric,
             timeline_interval=timeline_interval,
         )
+
+
+WALL_CLOCK_EFFICIENCY_CATEGORIES = [
+    # Spelled out rather than INIT_TOTAL_CATEGORY: this list is the canonical
+    # declaration, and the telemetry suite parses it as string literals to keep
+    # the constants that restate it honest.
+    "init/total",
+    "idle/buffer_starvation",
+    "idle/refit_bubble",
+    "idle/validation",
+]
+
+THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES = [
+    "idle/buffer_full_backoff",
+    "idle/generation_limit_pause",
+    "idle/refit_event_wait",
+    "wasted/failed_trajectory",
+]
+
+EFFICIENCY_CATEGORIES = (
+    WALL_CLOCK_EFFICIENCY_CATEGORIES + THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES
+)
+
+STEP_WINDOW_WALL_CLOCK_CATEGORIES = [
+    category
+    for category in WALL_CLOCK_EFFICIENCY_CATEGORIES
+    if category not in RUN_WINDOW_WALL_CLOCK_CATEGORIES
+]
+
+
+def print_efficiency_summary(
+    efficiency_metrics: dict[str, float],
+    total_wall_time_s: float,
+    step: int,
+    step_wall_time_s: Optional[float] = None,
+) -> dict[str, float]:
+    """Print a summary table of efficiency metrics and return loggable dict.
+
+    Driver-side wall-clock categories drive the efficiency percentage.
+    Collector-side categories are summed across concurrent threads and reported
+    separately as thread-seconds so they are not compared directly against a
+    single wall-clock denominator.
+
+    The efficiency percentage is a *per-step* ratio, because the numerator is:
+    the driver resets its Timer every step, so its idle categories are per-step
+    deltas. Dividing them by the cumulative ``total_wall_time_s`` would make the
+    run look monotonically more efficient the longer it ran, whatever the idle
+    time actually did. ``init/total`` is excluded from that numerator for the
+    same reason in reverse -- it is a run-long constant (see
+    :data:`RUN_WINDOW_WALL_CLOCK_CATEGORIES`) and would otherwise add the whole
+    startup cost to every single step's waste.
+
+    Args:
+        efficiency_metrics: Dict mapping category labels to total seconds spent.
+        total_wall_time_s: Total wall-clock time in seconds since training began.
+            Used for the per-category ``% of Wall`` column.
+        step: Current training step number.
+        step_wall_time_s: Wall-clock seconds in the step being reported, the
+            denominator of the efficiency percentage. Defaults to
+            ``total_wall_time_s`` for callers with no per-step measurement.
+
+    Returns:
+        Dict of metrics suitable for logging to WandB/TensorBoard, including
+        per-category seconds and percentages, total waste, and efficiency_pct.
+    """
+    # Captured before the fallback below, because it decides which window the
+    # efficiency percentage actually covers.
+    pct_is_per_step = step_wall_time_s is not None
+    if step_wall_time_s is None:
+        step_wall_time_s = total_wall_time_s
+    print(f"\n📊 Efficiency Summary (Step {step}):")
+    print(f"  {'Category':<35} {'Time (s)':>10} {'% of Wall':>10}")
+    print(f"  {'─' * 57}")
+
+    loggable: dict[str, float] = {}
+
+    for category in WALL_CLOCK_EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        pct = (duration / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+        print(f"  {category:<35} {duration:>10.2f} {pct:>9.2f}%")
+        loggable[f"efficiency/{category}_s"] = duration
+        loggable[f"efficiency/{category}_pct"] = pct
+
+    thread_seconds_total = 0.0
+    for category in THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        thread_seconds_total += duration
+        print(f"  {category + ' (thread-s)':<35} {duration:>10.2f} {'n/a':>10}")
+        loggable[f"efficiency/{category}_s"] = duration
+
+    wall_waste = sum(
+        efficiency_metrics.get(cat, 0.0) for cat in STEP_WINDOW_WALL_CLOCK_CATEGORIES
+    )
+    if step_wall_time_s > 0 and wall_waste > step_wall_time_s:
+        wall_waste = step_wall_time_s
+
+    productive = max(0.0, step_wall_time_s - wall_waste)
+    efficiency_pct = (
+        (productive / step_wall_time_s * 100) if step_wall_time_s > 0 else 100.0
+    )
+    efficiency_pct = min(100.0, max(0.0, efficiency_pct))
+    waste_pct = (wall_waste / step_wall_time_s * 100) if step_wall_time_s > 0 else 0.0
+    waste_pct = min(100.0, max(0.0, waste_pct))
+
+    print(f"  {'─' * 57}")
+    print(
+        f"  {'Collector thread-seconds (info)':<35} "
+        f"{thread_seconds_total:>10.2f} {'n/a':>10}"
+    )
+    # Labelled "this step" because the denominator is the step's wall time, not
+    # the run's -- the column header above it is a share of the run.
+    print(
+        f"  {'Wall-clock waste (this step)':<35} {wall_waste:>10.2f} {waste_pct:>9.2f}%"
+    )
+    print(
+        f"  {'Productive time (this step)':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%"
+    )
+    print(f"  {'Efficiency (this step)':<35} {'':>10} {efficiency_pct:>9.2f}%")
+
+    loggable["efficiency/thread_seconds_total_s"] = thread_seconds_total
+    loggable["efficiency/total_waste_s"] = wall_waste
+    loggable["efficiency/productive_time_s"] = productive
+    loggable[EFFICIENCY_PCT_KEY] = efficiency_pct
+    loggable["efficiency/total_wall_time_s"] = total_wall_time_s
+    # Carries the window of the ratio above to the OTel tee, which tags it. A
+    # caller that supplies no per-step denominator gets a run-cumulative ratio,
+    # and publishing that as per-step would state the opposite of what it is.
+    # A float, not the string it represents, because everything in this dict is
+    # also logged to WandB/TensorBoard as a scalar.
+    loggable[EFFICIENCY_PCT_PER_STEP_KEY] = float(pct_is_per_step)
+
+    return loggable
+
+
+_DRAFT_RATIO_NUM_RE = re.compile(r"^(draft_.*)_num(@\d+)?$")
+
+
+def finalize_draft_ratio_metrics(metrics: dict[str, Any]) -> None:
+    """Turn summed ``draft_*_num``/``draft_*_den`` metric pairs back into ratios, in place.
+
+    DSparkRuntime/Eagle3Runtime (``nemo_rl/models/automodel/draft/runtime.py``)
+    emit per-microbatch accuracy/rate metrics as raw num/den pairs instead of
+    pre-divided ratios, because the training loop's default per-key metric
+    reduction sums every metric not on its small mean-reduction allowlist
+    across all microbatches and DP ranks -- summing a pre-divided
+    per-microbatch ratio would produce a meaningless value (e.g. a
+    "draft_full_acc@0" of 240 instead of a rate in [0, 1]). Call this AFTER
+    that per-key reduction has summed the raw num/den pairs into global
+    totals, so the ratio it computes is the correct token-weighted global
+    rate. Deliberately dependency-free (no nemo_automodel import) so the
+    driver process can call it unconditionally.
+    """
+    for key in list(metrics.keys()):
+        match = _DRAFT_RATIO_NUM_RE.match(key)
+        if match is None:
+            continue
+        base, suffix = match.group(1), match.group(2) or ""
+        den_key = f"{base}_den{suffix}"
+        if den_key not in metrics:
+            continue
+        num = metrics.pop(key)
+        den = metrics.pop(den_key)
+        metrics[f"{base}{suffix}"] = num / den if den > 0 else 0.0

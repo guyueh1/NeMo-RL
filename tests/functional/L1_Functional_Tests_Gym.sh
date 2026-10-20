@@ -35,6 +35,8 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym.sh
+run_test fast uv run --no-sync bash ./tests/functional/distillation_nemo_gym.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_sharded_gym_pack.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

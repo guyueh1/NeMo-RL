@@ -7,6 +7,9 @@ git config --global --add safe.directory $PROJECT_ROOT
 
 set -eou pipefail
 
+# Audio deps (torchaudio/torchcodec) are not in the shipped container; install at test time.
+bash "$PROJECT_ROOT/tools/install_audio_deps.sh"
+
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
@@ -24,6 +27,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.model_name=Qwen/Qwen2.5-Omni-3B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
+    ++data.train.max_samples=64 \
+    ++data.validation.max_samples=32 \
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \

@@ -20,6 +20,7 @@
 import argparse
 import builtins
 import json
+import math
 import statistics
 import sys
 
@@ -36,6 +37,12 @@ def min(value):
 def max(value):
     """Return the maximum value in a dictionary."""
     return builtins.max(float(v) for v in value.values())
+
+
+def all_finite(value):
+    """Return whether a metric is present and all recorded values are finite."""
+    values = [float(v) for v in value.values()]
+    return bool(values) and builtins.all(math.isfinite(value) for value in values)
 
 
 def ratio_above(value, threshold):
@@ -148,6 +155,7 @@ def evaluate_check(data: dict, check: str) -> tuple[bool, str, object]:
         "max": max,
         "mean": mean,
         "median": median,
+        "all_finite": all_finite,
         "ratio_above": ratio_above,
     }
 
@@ -208,8 +216,8 @@ def main():
     with open(args.json_file, "r") as f:
         data = json.load(f)
 
-    # Initialize rich console
-    console = Console()
+    # Initialize rich console — force wide output so CI logs never truncate columns.
+    console = Console(width=args.table_width or 300)
 
     table = Table(title="Metric Checks", min_width=220, width=args.table_width)
     table.add_column("Status", style="bold")

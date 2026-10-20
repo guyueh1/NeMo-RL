@@ -15,8 +15,160 @@
 from collections import defaultdict
 from typing import Any, Optional
 
+import torch
+
+from nemo_rl.data.multimodal_utils import (
+    VLLM_CONTENT_KEY,
+    VLLM_MULTI_MODAL_DATA_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_FALLBACK_DTYPE,
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+    GenerationDatumSpec,
+)
+from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.metric_names import (
+    FINISHED_REASON_LABEL,
+    GENERATION_LENGTH_HISTOGRAMS,
+    GENERATION_LENGTH_MEAN_KEY,
+    GENERATION_TOKEN_COUNTERS,
+    GENERATION_TOKENS_KEY,
+    GENERATIONS_FAILED_KEY,
+    GENERATIONS_OK_KEY,
+    OK_FINISH_REASONS,
+    PROMPT_LENGTH_HISTOGRAMS,
+    PROMPT_LENGTH_MEAN_KEY,
+    PROMPT_TOKEN_COUNTERS,
+    PROMPT_TOKENS_KEY,
+    REQUEST_SUCCESS_COUNTERS,
+)
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+
+def _format_refit_key_error(label: str, keys: set[str]) -> str:
+    """Format a bounded refit-key diagnostic."""
+    ordered = sorted(keys)
+    suffix = " ..." if len(ordered) > 8 else ""
+    return f"{label} ({len(ordered)}): {ordered[:8]}{suffix}"
+
+
+R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
+VLLM_LOGPROB_FLOOR = -9999.0
+
+# The expert-id range vs carry dtype is model-constant, so it is verified on the
+# first non-empty routed-experts tensor per process and skipped afterwards.
+G_ROUTED_EXPERTS_RANGE_CHECKED = False
+_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+
+
+def assert_reload_refit_config_supported(config: VllmConfig) -> None:
+    """Reject pure-config combinations unsupported by vLLM reload refit."""
+    vllm_cfg = config.get("vllm_cfg")
+    if not vllm_cfg or not vllm_cfg.get("refit_with_reload_api"):
+        return
+
+    assert not config["colocated"]["enabled"], (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+        "supported yet with colocated vLLM refit. Support for the "
+        "colocated IPC/ZMQ reload-refit path will be added later. Set "
+        "refit_with_reload_api=false for now."
+    )
+    refit_transport = config.get("refit_transport")
+    if refit_transport == "nccl_reshard":
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+            "explicitly unsupported with "
+            "policy.generation.refit_transport='nccl_reshard'. "
+            "nccl_reshard_refit is its own refit path and does not use "
+            "vLLM's reload_weights API."
+        )
+    if refit_transport == "nixl" or (
+        isinstance(refit_transport, str) and ":" in refit_transport
+    ):
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+            "supported yet with checkpoint-engine refit "
+            "(update_weights_from_checkpoint_engine). Support for using "
+            "vLLM's reload_weights API with checkpoint-engine transports is "
+            "future work. Set refit_transport=null or set "
+            "refit_with_reload_api=false for now."
+        )
+    assert refit_transport is None, (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is only "
+        "supported with the default non-colocated collective refit path. "
+        f"Got policy.generation.refit_transport={refit_transport!r}. Set "
+        "refit_transport=null or set refit_with_reload_api=false."
+    )
+    assert config.get("quant_cfg") is None, (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is "
+        "explicitly unsupported with policy.generation.quant_cfg set. "
+        "ModelOpt quantized refit requires the ModelOpt weight-loading path. "
+        "Set quant_cfg=null or set refit_with_reload_api=false."
+    )
+    assert not config.get("_draft_weights_from_refit"), (
+        "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+        "supported yet when policy.draft.enabled=true. Support for Eagle "
+        "draft-weight refit with vLLM's reload_weights API will be added "
+        "later. Set policy.draft.enabled=false or set "
+        "refit_with_reload_api=false for now."
+    )
+    vllm_kwargs = config.get("vllm_kwargs") or {}
+    spec_cfg = vllm_kwargs.get("speculative_config")
+    spec_method = None
+    if isinstance(spec_cfg, dict) and spec_cfg.get("num_speculative_tokens") != 0:
+        spec_method = spec_cfg.get("method")
+    if spec_method in ("deepseek_mtp", "mtp") and config.get("_mtp_weights_from_refit"):
+        raise AssertionError(
+            "policy.generation.vllm_cfg.refit_with_reload_api=true is not "
+            "supported yet when vLLM refit also updates MTP draft weights. "
+            "Support for MTP speculative decoding with reload refit will be "
+            "added later. Set refit_with_reload_api=false for now."
+        )
+
+
+def is_grouped_moe_expert_weight_name(name: str) -> bool:
+    """Return whether a checkpoint key is a grouped MoE expert slab."""
+    return name.endswith(_GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES)
+
+
+def _as_routed_experts_tensor(
+    value: Any, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Convert backend routed-expert ids to the resolved carry dtype.
+
+    Guards against expert ids overflowing ``dtype`` before the narrowing cast,
+    which would otherwise wrap silently (e.g. if the expert count was
+    mis-detected when resolving the dtype).
+    """
+    global G_ROUTED_EXPERTS_RANGE_CHECKED
+    tensor = torch.as_tensor(value, device=device)
+    if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
+        max_id = int(tensor.max())
+        limit = torch.iinfo(dtype).max
+        if max_id > limit:
+            raise ValueError(
+                f"routed expert id {max_id} exceeds the resolved carry dtype "
+                f"{dtype} (max {limit}); the model's expert count was likely "
+                "mis-detected (see resolve_routed_experts_dtype in "
+                "nemo_rl.models.generation.interfaces)."
+            )
+        G_ROUTED_EXPERTS_RANGE_CHECKED = True
+    return tensor.to(dtype=dtype)
+
+
+def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
+    """Reject rollouts generated from a different prompt than the learner's."""
+    if actual != expected:
+        actual_length = None if actual is None else len(actual)
+        raise ValueError(
+            "vLLM processed prompt differs from the learner prompt: "
+            f"expected_length={len(expected)}, actual_length={actual_length}. "
+            "Refusing to train on a different prompt."
+        )
 
 
 def format_prompt_for_vllm_generation(
@@ -53,34 +205,34 @@ def format_prompt_for_vllm_generation(
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
 
-    # Check if this is VLM generation by looking for message_log with images
-    # Support for videos/audio/etc. can be added here
-    # if 'message_log' in data and any('images' in msg for msg in data['message_log']):
-    if "vllm_content" in data:
+    content_rows = data.get(VLLM_CONTENT_KEY)
+    multi_modal_rows = data.get(VLLM_MULTI_MODAL_DATA_KEY)
+
+    def _get_multi_modal_data(index: int) -> dict[str, Any]:
+        row = multi_modal_rows[index] if multi_modal_rows is not None else None
+        if not row:
+            return {}
+        return {
+            modality: value
+            for modality, value in row.items()
+            if value is not None
+            and (not isinstance(value, (list, tuple)) or len(value) > 0)
+        }
+
+    # vLLM-ready content and modality data share this formatter path.
+    if content_rows is not None or multi_modal_rows is not None:
         # VLM generation using content and multi_modal_data
         for i in range(start_idx, end_idx):
-            msg = data["vllm_content"][i]
-            # if msg is None, this conversation had no multimodal content, fallback to regular prompt
-            if msg is None:
-                prompts.append(_get_regular_prompt(i))
-                continue
-            # init prompt dict
-            prompt_dict = {"prompt": msg}
-            # collect multi_modal_data from images and audios
-            multi_modal_data = {}
-            images = data.get("vllm_images", None)
-            if images is not None and len(images[i]) > 0:
-                multi_modal_data["image"] = (
-                    images[i][0] if len(images[i]) == 1 else images[i]
-                )
-            audios = data.get("vllm_audios", None)
-            if audios is not None and len(audios[i]) > 0:
-                multi_modal_data["audio"] = (
-                    audios[i][0] if len(audios[i]) == 1 else audios[i]
-                )
+            msg = content_rows[i] if content_rows is not None else None
+            multi_modal_data = _get_multi_modal_data(i)
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
+            # Later native turns clear the initial content to avoid replaying
+            # a stale prompt, sending updated token IDs with the same media.
+            # vLLM may re-expand image placeholders on that path; the worker's
+            # prompt validation rejects any resulting token-ID mismatch.
+            prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
             prompt_dict["multi_modal_data"] = multi_modal_data
             prompts.append(prompt_dict)
     else:
@@ -95,13 +247,343 @@ def format_prompt_for_vllm_generation(
     return prompts if return_all else prompts[0]
 
 
+def pad_and_align_routed_expert_indices(
+    request_output: Any,
+    completion_output: Any,
+    *,
+    valid_length: int,
+    padded_length: int,
+    device: torch.device,
+    require_complete_routed_experts: bool = False,
+    allow_missing_routed_experts_fallback: bool = True,
+    return_stats: bool = False,
+    routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], dict[str, int]]:
+    """Return full-sequence-aligned routed experts as ``[S, L, topk]`` in ``routed_experts_dtype``."""
+    routed = getattr(completion_output, "routed_experts", None)
+    prompt_routed = getattr(request_output, "prompt_routed_experts", None)
+
+    if prompt_routed is not None:
+        prompt_routed = _as_routed_experts_tensor(
+            prompt_routed, device=device, dtype=routed_experts_dtype
+        )
+    if routed is not None:
+        routed = _as_routed_experts_tensor(
+            routed, device=device, dtype=routed_experts_dtype
+        )
+
+    if prompt_routed is not None and routed is not None:
+        routed = torch.cat((prompt_routed, routed), dim=0)
+    elif prompt_routed is not None:
+        routed = prompt_routed
+
+    expected_routes = min(max(valid_length - 1, 0), padded_length)
+    stats = {
+        "actual_routes": 0,
+        "expected_routes": expected_routes,
+        "missing_routes": 0,
+        "surplus_routes": 0,
+    }
+
+    if routed is None:
+        return (None, stats) if return_stats else None
+    if routed.dim() != 3:
+        raise ValueError(
+            "vLLM routed_experts must have shape [tokens, num_moe_layers, topk], "
+            f"got {tuple(routed.shape)}"
+        )
+
+    stats["actual_routes"] = int(routed.shape[0])
+    stats["missing_routes"] = max(expected_routes - int(routed.shape[0]), 0)
+    stats["surplus_routes"] = max(int(routed.shape[0]) - (expected_routes + 1), 0)
+    if (
+        require_complete_routed_experts
+        and stats["missing_routes"] > 0
+        and not allow_missing_routed_experts_fallback
+    ):
+        # This has only been observed rarely with vLLM prefix caching plus
+        # chunked prefill: a small number of samples can omit routed-expert
+        # rows even though most requests are complete. Keep
+        # tools/model_diagnostics/6.vllm_routed_experts_completeness.py as a
+        # standalone reproducer for upstream vLLM bug reports.
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned incomplete routed_experts for router replay: "
+            f"routes={routed.shape[0]}, expected_at_least={expected_routes}, "
+            f"valid_length={valid_length}, padded_length={padded_length}, "
+            f"num_cached_tokens={num_cached_tokens}. This usually means the "
+            "generation backend did not return routed experts for every "
+            "non-final token in the prompt+response sequence."
+        )
+    max_allowed_routes = expected_routes + 1
+    if require_complete_routed_experts and routed.shape[0] > max_allowed_routes:
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned too many routed_experts routes for router replay: "
+            f"routes={routed.shape[0]}, expected={expected_routes}, "
+            f"max_allowed={max_allowed_routes}, valid_length={valid_length}, "
+            f"padded_length={padded_length}, num_cached_tokens={num_cached_tokens}. "
+            "Router replay allows at most one surplus final-token route."
+        )
+
+    full = torch.full(
+        (padded_length, routed.shape[1], routed.shape[2]),
+        R3_MISSING_ROUTE_SENTINEL,
+        dtype=routed_experts_dtype,
+        device=device,
+    )
+    routes_to_copy = min(expected_routes, routed.shape[0])
+    if routes_to_copy > 0:
+        full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
+    return (full, stats) if return_stats else full
+
+
+def attach_routed_experts_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+    *,
+    device: torch.device,
+    logger: Any = None,
+    routed_experts_dtype: torch.dtype = ROUTED_EXPERTS_FALLBACK_DTYPE,
+) -> Any:
+    """Attach aligned routed experts to OpenAI chat response choices."""
+    outputs_by_index = {
+        output.index: output for output in getattr(final_request_output, "outputs", [])
+    }
+    prompt_token_count = len(
+        getattr(final_request_output, "prompt_token_ids", []) or []
+    )
+
+    choices = list(getattr(response, "choices", []))
+    attached_choice_indices = set()
+    for choice in choices:
+        generation_details = outputs_by_index.get(choice.index)
+        if generation_details is None:
+            continue
+        attached_choice_indices.add(choice.index)
+
+        generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
+        routed_result = pad_and_align_routed_expert_indices(
+            final_request_output,
+            generation_details,
+            valid_length=prompt_token_count + generation_token_count,
+            padded_length=prompt_token_count + generation_token_count,
+            device=device,
+            require_complete_routed_experts=True,
+            return_stats=True,
+            routed_experts_dtype=routed_experts_dtype,
+        )
+        if not isinstance(routed_result, tuple):
+            raise RuntimeError(
+                "Expected routed_experts alignment to return stats for the "
+                "OpenAI-compatible chat endpoint."
+            )
+        routed_experts, r3_stats = routed_result
+        if routed_experts is None:
+            raise RuntimeError(
+                "vLLM was asked to return routed experts for the "
+                "OpenAI-compatible chat endpoint but the generation "
+                "output did not include routed_experts."
+            )
+        if r3_stats["missing_routes"] > 0 and logger is not None:
+            logger.warning(
+                "R3 router replay fallback: vLLM returned incomplete "
+                "routed_experts for chat choice_idx=%d, "
+                "missing_token_routes=%d, actual_routes=%d, "
+                "expected_routes=%d. Megatron will use its own router "
+                "for those missing token routes.",
+                choice.index,
+                r3_stats["missing_routes"],
+                r3_stats["actual_routes"],
+                r3_stats["expected_routes"],
+            )
+        # Base64 envelope instead of .tolist(): nested JSON int lists cost
+        # ~1s of CPU per serialize/parse hop at long context lengths and get
+        # re-validated at every gym HTTP hop; a single string passes through
+        # the gym chain opaquely.
+        choice.message.routed_experts = encode_routed_experts(
+            routed_experts.to(dtype=routed_experts_dtype)
+        )
+
+    if len(attached_choice_indices) != len(choices):
+        missing_choice_indices = sorted(
+            choice.index
+            for choice in choices
+            if choice.index not in attached_choice_indices
+        )
+        raise RuntimeError(
+            "vLLM was asked to return routed experts for the "
+            "OpenAI-compatible chat endpoint but response choices could not be "
+            "matched to generation outputs: "
+            f"missing_choice_indices={missing_choice_indices}."
+        )
+
+    return response
+
+
+def attach_token_information_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+) -> Any:
+    """Attach engine-native token information to OpenAI chat response choices."""
+    prompt_token_ids = getattr(final_request_output, "prompt_token_ids", None)
+    if prompt_token_ids is None:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but the final request output did "
+            "not include prompt_token_ids."
+        )
+
+    generation_outputs = list(getattr(final_request_output, "outputs", []))
+    generation_output_indices = [output.index for output in generation_outputs]
+    outputs_by_index = {output.index: output for output in generation_outputs}
+    if len(outputs_by_index) != len(generation_outputs):
+        raise RuntimeError(
+            "vLLM returned duplicate generation output indices while attaching "
+            "token information to the OpenAI-compatible chat response."
+        )
+
+    choices = list(getattr(response, "choices", []))
+    choice_indices = [choice.index for choice in choices]
+    if len(set(choice_indices)) != len(choice_indices):
+        raise RuntimeError(
+            "vLLM returned duplicate response choice indices while attaching "
+            "token information to the OpenAI-compatible chat response."
+        )
+
+    choice_index_set = set(choice_indices)
+    output_index_set = set(generation_output_indices)
+    missing_choice_indices = sorted(choice_index_set - output_index_set)
+    unexpected_output_indices = sorted(output_index_set - choice_index_set)
+    if missing_choice_indices or unexpected_output_indices:
+        raise RuntimeError(
+            "vLLM was asked to return token information for the "
+            "OpenAI-compatible chat endpoint but response choices could not be "
+            "matched to generation outputs: "
+            f"missing_choice_indices={missing_choice_indices}, "
+            f"unexpected_output_indices={unexpected_output_indices}."
+        )
+
+    for choice in choices:
+        generation_details = outputs_by_index[choice.index]
+        output_token_ids = getattr(generation_details, "token_ids", None)
+        if output_token_ids is None:
+            raise RuntimeError(
+                "vLLM was asked to return token information for the "
+                "OpenAI-compatible chat endpoint but generation output "
+                f"choice_idx={choice.index} did not include token_ids."
+            )
+        generation_token_ids = list(output_token_ids)
+
+        generation_logprob_details = getattr(generation_details, "logprobs", None)
+        if generation_logprob_details is None:
+            if generation_token_ids:
+                raise RuntimeError(
+                    "vLLM was asked to return token information for the "
+                    "OpenAI-compatible chat endpoint but generation output "
+                    f"choice_idx={choice.index} did not include logprobs."
+                )
+            generation_log_probs = []
+        else:
+            if len(generation_token_ids) != len(generation_logprob_details):
+                raise RuntimeError(
+                    "vLLM returned mismatched generation token IDs and log "
+                    "probabilities for the OpenAI-compatible chat endpoint: "
+                    f"choice_idx={choice.index}, "
+                    f"token_count={len(generation_token_ids)}, "
+                    f"logprob_count={len(generation_logprob_details)}."
+                )
+            generation_log_probs = []
+            for token_id, position_logprobs in zip(
+                generation_token_ids, generation_logprob_details
+            ):
+                selected_token_logprob = position_logprobs.get(token_id)
+                if selected_token_logprob is None:
+                    raise RuntimeError(
+                        "vLLM generation log probabilities did not include the "
+                        "selected token while attaching token information to "
+                        "the OpenAI-compatible chat response: "
+                        f"choice_idx={choice.index}, token_id={token_id}."
+                    )
+                generation_log_probs.append(
+                    max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
+                )
+
+        choice.message.prompt_token_ids = list(prompt_token_ids)
+        choice.message.generation_token_ids = generation_token_ids
+        choice.message.generation_log_probs = generation_log_probs
+
+    return response
+
+
+def model_dump_chat_response_with_dynamic_message_fields(
+    response: Any,
+) -> dict[str, Any]:
+    """Dump a vLLM OpenAI chat response while preserving dynamic message fields."""
+    response_dict = response.model_dump()
+    for choice, choice_dict in zip(
+        getattr(response, "choices", []), response_dict.get("choices", [])
+    ):
+        message = getattr(choice, "message", None)
+        for field_name in (
+            "routed_experts",
+            "prompt_token_ids",
+            "generation_token_ids",
+            "generation_log_probs",
+        ):
+            field_value = getattr(message, field_name, None)
+            if field_value is not None:
+                choice_dict.setdefault("message", {})[field_name] = field_value
+    return response_dict
+
+
+# --- vLLM engine counters -------------------------------------------------
+#
+# Workers hand the driver a flat ``{str: float | list[float]}`` dict, which is
+# all the aggregation below needs (it only ever sums). vLLM's reader, though,
+# reports labelled series as several objects sharing one ``name``, and
+# histograms as a ``count``/``sum``/``buckets`` triple with no scalar at all.
+# Both are folded into that flat shape by encoding the extra dimension in the
+# key, so a plain sum across workers still gives the right fleet total.
+COUNTER_KEY_SEP = "|"
+HISTOGRAM_SUM_PART = "sum"
+HISTOGRAM_COUNT_PART = "count"
+
+# Metric names kept from a worker's snapshot. The snapshot carries every series
+# vLLM exposes (~40), and forwarding all of them would put unbounded,
+# version-dependent cardinality on the step metrics.
+#
+# Matched exactly, not by prefix: vLLM ships close siblings of these names
+# (``vllm:prompt_tokens_by_source``, ``vllm:prompt_tokens_cached``) that a
+# prefix test would pull in as extra per-step payload nothing here reads.
+_KEPT_COUNTER_NAMES: tuple[str, ...] = (
+    PROMPT_TOKEN_COUNTERS
+    + GENERATION_TOKEN_COUNTERS
+    + PROMPT_LENGTH_HISTOGRAMS
+    + GENERATION_LENGTH_HISTOGRAMS
+    + REQUEST_SUCCESS_COUNTERS
+)
+
+
+def encode_counter_key(name: str, part: str) -> str:
+    """Encode a histogram component or a label into a flat counter key."""
+    return f"{name}{COUNTER_KEY_SEP}{part}"
+
+
+def _is_kept(metric_name: str) -> bool:
+    """Whether a snapshot key belongs to a family the driver consumes."""
+    base = metric_name.split(COUNTER_KEY_SEP, 1)[0]
+    return "spec_decode" in base or base in _KEPT_COUNTER_NAMES
+
+
 def aggregate_spec_decode_counters(
     worker_metrics: list[dict[str, float | list[float]]],
 ) -> dict[str | tuple[str, int], float]:
-    """Aggregate speculative decoding counters from multiple workers.
+    """Aggregate vLLM engine counters from multiple workers.
 
-    Combines spec decode metrics collected from DP leader workers into
-    a single aggregated counter dictionary.
+    Combines the metrics collected from DP leader workers into a single
+    aggregated counter dictionary. Retains the spec-decode family and the engine
+    series listed above; everything else in the snapshot is dropped.
 
     Args:
         worker_metrics: List of metric dictionaries from each worker.
@@ -122,15 +604,110 @@ def aggregate_spec_decode_counters(
 
     for report in worker_metrics:
         for metric_name, value in report.items():
-            if "spec_decode" in metric_name:
-                if isinstance(value, list):
-                    # Per-position metrics (e.g., acceptance counts at each draft position)
-                    for position, pos_value in enumerate(value, 1):
-                        counters[metric_name, position] += pos_value
-                else:
-                    counters[metric_name] += value
+            if not _is_kept(metric_name):
+                continue
+            if isinstance(value, list):
+                # Per-position metrics (e.g., acceptance counts at each draft position)
+                for position, pos_value in enumerate(value, 1):
+                    counters[metric_name, position] += pos_value
+            else:
+                counters[metric_name] += value
 
     return dict(counters)
+
+
+def _first_delta(
+    delta: dict[str | tuple[str, int], float],
+    candidates: tuple[str, ...],
+    part: Optional[str] = None,
+) -> Optional[float]:
+    """Return the delta for the first candidate name present, else ``None``."""
+    for name in candidates:
+        key = encode_counter_key(name, part) if part is not None else name
+        if key in delta:
+            return delta[key]
+    return None
+
+
+def _mean_from_histogram(
+    delta: dict[str | tuple[str, int], float], candidates: tuple[str, ...]
+) -> Optional[float]:
+    """Mean of a histogram over the step, from its ``sum``/``count`` delta.
+
+    Exact rather than bucket-interpolated: vLLM tracks both, so the mean needs no
+    approximation. ``None`` when the engine served no request in the step, which
+    is a real state (a step spent entirely in training) and not a zero-length
+    sequence.
+    """
+    total = _first_delta(delta, candidates, HISTOGRAM_SUM_PART)
+    count = _first_delta(delta, candidates, HISTOGRAM_COUNT_PART)
+    if total is None or count is None or count <= 0:
+        return None
+    return total / count
+
+
+def compute_engine_step_metrics(
+    start_counters: dict[str | tuple[str, int], float],
+    end_counters: dict[str | tuple[str, int], float],
+) -> dict[str, float]:
+    """Compute per-step vLLM engine token, sequence-length and outcome metrics.
+
+    These are the engine's own accounting, which is why they are worth carrying
+    even though the driver already derives token counts from the tensors a
+    ``generate()`` call returns: sequence-length distributions and aborted
+    requests leave no trace in the returned tensors at all.
+
+    Args:
+        start_counters: Counter snapshot taken before generation.
+        end_counters: Counter snapshot taken after generation.
+
+    Returns:
+        Metrics for logging, keyed with a ``vllm/`` prefix. Absent series are
+        omitted rather than reported as zero, so a vLLM release that renames one
+        leaves a gap in the dashboard instead of a plausible-looking zero.
+    """
+    # Drop series that went backwards: an engine restart reset its counters.
+    delta = {
+        k: end - start_counters.get(k, 0.0)
+        for k, end in end_counters.items()
+        if end >= start_counters.get(k, 0.0)
+    }
+
+    metrics: dict[str, float] = {}
+
+    prompt_tokens = _first_delta(delta, PROMPT_TOKEN_COUNTERS)
+    if prompt_tokens is not None:
+        metrics[PROMPT_TOKENS_KEY] = prompt_tokens
+    generation_tokens = _first_delta(delta, GENERATION_TOKEN_COUNTERS)
+    if generation_tokens is not None:
+        metrics[GENERATION_TOKENS_KEY] = generation_tokens
+
+    prompt_length = _mean_from_histogram(delta, PROMPT_LENGTH_HISTOGRAMS)
+    if prompt_length is not None:
+        metrics[PROMPT_LENGTH_MEAN_KEY] = prompt_length
+    generation_length = _mean_from_histogram(delta, GENERATION_LENGTH_HISTOGRAMS)
+    if generation_length is not None:
+        metrics[GENERATION_LENGTH_MEAN_KEY] = generation_length
+
+    ok, failed, saw_any = 0.0, 0.0, False
+    for name in REQUEST_SUCCESS_COUNTERS:
+        prefix = encode_counter_key(name, f"{FINISHED_REASON_LABEL}=")
+        for key, value in delta.items():
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            saw_any = True
+            reason = key[len(prefix) :]
+            if reason in OK_FINISH_REASONS:
+                ok += value
+            else:
+                failed += value
+        if saw_any:
+            break
+    if saw_any:
+        metrics[GENERATIONS_OK_KEY] = ok
+        metrics[GENERATIONS_FAILED_KEY] = failed
+
+    return metrics
 
 
 def compute_spec_decode_metrics(

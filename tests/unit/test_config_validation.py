@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import glob
 import os
 from pathlib import Path
@@ -23,14 +24,26 @@ from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
-from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    RewardPenaltyConfig,
+)
+from nemo_rl.algorithms.grpo import (
+    MasterConfig as GRPOMasterConfig,
+)
+from nemo_rl.algorithms.mpo import MasterConfig as MPOMasterConfig
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+from nemo_rl.algorithms.xtoken_off_policy_distillation import (
+    MasterConfig as XTokenOffPolicyDistillationMasterConfig,
+)
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -91,6 +104,16 @@ configs_dir = Path(
 config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
 assert len(config_files) > 0, "No config files found"
 
+# Every shipped config tree. Only the outdated-config guard uses it -- most of examples/nemo_gym
+# cannot satisfy the schema test by design (env manifests, launcher templates, unset env
+# interpolations).
+repo_root = Path(os.path.join(os.path.dirname(absolute_path), "../..")).resolve()
+full_config_files = config_files + [
+    path
+    for extra in ("examples/nemo_gym", "research")
+    for path in glob.glob(str(repo_root / extra / "**/*.yaml"), recursive=True)
+]
+
 
 @pytest.mark.parametrize("config_file", config_files)
 def test_all_config_files_have_required_keys(config_file):
@@ -112,18 +135,37 @@ def test_all_config_files_have_required_keys(config_file):
     if "/evals/" in config_file:
         master_config_class = EvalMasterConfig
         config_type = "eval"
+    elif "teachers" in config_dict or (
+        "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
+    ):
+        # Cross-tokenizer off-policy distillation also has a top-level
+        # ``distillation`` block, so it must be matched before the generic
+        # ``distillation`` branch below. The multi-teacher cross-tokenizer config
+        # is identified by its top-level ``teachers`` list (online distillation
+        # uses a singular ``teacher``); the per-(student, teacher) projection path
+        # now lives on each ``teachers[i].projection_matrix_path`` rather than
+        # ``loss_fn``. The legacy ``loss_fn.projection_matrix_path`` check is kept
+        # as a fallback for any single-teacher config that still carries it.
+        master_config_class = XTokenOffPolicyDistillationMasterConfig
+        config_type = "xtoken_off_policy_distillation"
     elif "distillation" in config_dict:
         master_config_class = DistillationMasterConfig
         config_type = "distillation"
     elif "dpo" in config_dict:
         master_config_class = DPOMasterConfig
         config_type = "dpo"
+    elif "mpo" in config_dict:
+        master_config_class = MPOMasterConfig
+        config_type = "mpo"
     elif "sft" in config_dict:
         master_config_class = SFTMasterConfig
         config_type = "sft"
     elif "grpo" in config_dict:
         master_config_class = GRPOMasterConfig
         config_type = "grpo"
+    elif "ppo" in config_dict:
+        master_config_class = PPOMasterConfig
+        config_type = "ppo"
     elif "rm" in config_dict:
         master_config_class = RMMasterConfig
         config_type = "rm"
@@ -136,12 +178,138 @@ def test_all_config_files_have_required_keys(config_file):
     validate_config_section(config_dict, master_config_class, config_file)
 
 
+def test_multimodal_dedup_grpo_config_keys_default_off():
+    """Older recipes keep flag-off behavior without duplicating default keys."""
+    assert GRPOConfig.model_fields["deduplicate_multimodal_data"].default is False
+    assert GRPOConfig.model_fields["debug_payload_metrics"].default is False
+
+
+def _sync_trainer_names(tree: ast.Module) -> set[str]:
+    """Names this launcher may call its synchronous trainer by.
+
+    Two shapes ship: ``run_grpo_nemo_gym.py`` calls ``grpo_train`` directly,
+    while ``run_vlm_grpo.py`` binds whatever ``select_sync_trainer`` returned
+    and calls that. Return one or the other, never their union -- a launcher
+    that calls the factory and then ignores it in favour of ``grpo_train`` is
+    the silent-legacy-trainer bug, and a union would pass it.
+    """
+    bound = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "select_sync_trainer"
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    return bound or {"grpo_train"}
+
+
+@pytest.mark.parametrize(
+    "launcher_relpath",
+    [
+        "examples/run_vlm_grpo.py",
+        "examples/nemo_gym/run_grpo_nemo_gym.py",
+    ],
+)
+def test_multimodal_launchers_forward_processor_to_both_trainers(
+    launcher_relpath: str,
+):
+    """Keep sync and async multimodal processing wired to the processor."""
+    launcher = Path(__file__).parents[2] / launcher_relpath
+    tree = ast.parse(launcher.read_text())
+    dispatch_names = {"async_grpo_train": "async"} | dict.fromkeys(
+        _sync_trainer_names(tree), "sync"
+    )
+    trainer_calls = {
+        dispatch_names[node.func.id]: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in dispatch_names
+    }
+
+    assert trainer_calls.keys() == {"sync", "async"}
+    for trainer_name, call in trainer_calls.items():
+        processor_keywords = [
+            keyword
+            for keyword in call.keywords
+            if keyword.arg == "processor"
+            and isinstance(keyword.value, ast.Name)
+            and keyword.value.id == "processor"
+        ]
+        assert len(processor_keywords) == 1, (
+            f"{trainer_name} must receive processor=processor"
+        )
+
+
+def test_vlm_launcher_dispatches_on_async_grpo_enabled():
+    """Keep the VLM async recipe from silently using the synchronous trainer."""
+    launcher = Path(__file__).parents[2] / "examples/run_vlm_grpo.py"
+    tree = ast.parse(launcher.read_text())
+
+    async_branches = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "config.grpo.async_grpo.enabled"
+    ]
+    assert len(async_branches) == 1
+
+    async_branch = async_branches[0]
+    async_calls = {
+        node.func.id
+        for statement in async_branch.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    sync_calls = {
+        node.func.id
+        for statement in async_branch.orelse
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    assert "async_grpo_train" in async_calls
+    # Which trainer the else-branch ends up in is data_plane.enabled's decision,
+    # made inside select_sync_trainer at runtime; all this can see is that the
+    # branch calls whatever the factory handed back.
+    assert sync_calls & _sync_trainer_names(tree)
+
+
+def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
+    """Unwanted-token penalty requires explicit unwanted-token config.
+
+    Validates that token_ids.unwanted is present whenever penalize_unwanted_tokens
+    is enabled.
+    """
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids=None)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={})
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={"unwanted": []})
+
+    config = RewardPenaltyConfig(
+        penalize_unwanted_tokens=True,
+        token_ids={"unwanted": [2]},
+    )
+    assert config.token_ids is not None
+    assert config.token_ids.unwanted == [2]
+
+
 @pytest.mark.parametrize("config_file", config_files)
 def test_all_config_no_tp_size_accuracy_issues(config_file):
     """Test that all config files in examples/configs have no TP size >= 4 accuracy issues.
 
-    There is a known batch-variant accuracy issue with TP>=4 for both DTensor and Megatron backend.
-    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/dtensor-tp-accuracy.html#root-cause.
+    There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.
+    Related document: https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause.
     """
 
     skip_config_files = [
@@ -149,8 +317,8 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
         "grpo-qwen3-30ba3b-8n8g-megatron.yaml",
         "grpo-qwen3-32b-4n8g.yaml",
         "grpo-qwen3-32b-8n8g-async-1off.yaml",
-        "grpo-gemma3-27b-it-8n8g-fsdp2tp8-actckpt-long.yaml",
-        "grpo-gemma3-27b-it-8n4g-fsdp2tp4-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n8g-automodel-tp8-actckpt-long.yaml",
+        "grpo-gemma3-27b-it-8n4g-automodel-tp4-actckpt-long.yaml",
     ]
     if os.path.basename(config_file) in skip_config_files:
         pytest.skip(
@@ -177,7 +345,7 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
     if config_dict["policy"]["megatron_cfg"]["enabled"]:
         tp_size = config_dict["policy"]["megatron_cfg"]["tensor_model_parallel_size"]
     else:
-        tp_size = config_dict["policy"]["dtensor_cfg"]["tensor_parallel_size"]
+        tp_size = config_dict["policy"]["automodel_cfg"]["tensor_parallel_size"]
 
     train_micro_bs = config_dict["policy"]["train_micro_batch_size"]
     logprob_bs = config_dict["policy"]["logprob_batch_size"]
@@ -186,4 +354,68 @@ def test_all_config_no_tp_size_accuracy_issues(config_file):
         raise AssertionError(
             f"Config file {config_file} has TP size >= 4 accuracy issues. "
             "Please set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value."
+        )
+
+
+@pytest.mark.parametrize("config_file", full_config_files)
+def test_no_shipped_config_is_outdated(config_file):
+    """Test that every shipped config passes the same checks the entrypoints run.
+
+    Reusing check_outdated_config keeps this from drifting: a check added there is
+    enforced on the shipped configs without a second implementation here.
+    """
+    # Eval configs have a different structure from training configs, so the entrypoint
+    # checks do not apply to them. run_eval.py skips them for the same reason.
+    if "/evals/" in config_file:
+        pytest.skip("eval configs have a different structure from training configs")
+
+    print(f"\nValidating config file: {config_file}")
+
+    config = load_config_with_inheritance(config_file)
+    # resolve=False: the checked keys are never interpolations, and resolving would fail
+    # on the configs that interpolate an env var CI does not set.
+    config_dict = OmegaConf.to_container(config, resolve=False)
+
+    try:
+        check_outdated_config(config_dict)
+    except ValueError as e:
+        raise AssertionError(f"Config file {config_file} is outdated: {e}") from e
+
+
+# Keep only the regressions tracked in #4427 on DeepEP until they pass validation.
+DEEPEP_FALLBACK_RECIPES = {
+    Path("recipes/llm/sft-nanov3-30BA3B-2n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-nanov3-30BA3B-2n4g-automodel-ep4.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n8g-automodel-ep8.yaml"),
+    Path("recipes/llm/sft-gpt-oss-20b-1n4g-automodel-ep4.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v2.yaml"),
+    Path("recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml"),
+}
+
+
+@pytest.mark.parametrize("config_file", config_files)
+def test_automodel_moe_recipes_use_expected_dispatcher(
+    config_file: str,
+) -> None:
+    config = load_config_with_inheritance(config_file)
+    automodel_cfg = OmegaConf.select(config, "policy.automodel_cfg")
+    if (
+        automodel_cfg is None
+        or not automodel_cfg.enabled
+        or automodel_cfg.get("expert_parallel_size", 1) <= 1
+    ):
+        pytest.skip("Not an AutoModel expert-parallel recipe")
+
+    backend = automodel_cfg.automodel_kwargs.backend
+    assert "enable_deepep" not in backend
+    if Path(config_file).relative_to(configs_dir) in DEEPEP_FALLBACK_RECIPES:
+        assert backend.get("dispatcher") == "deepep"
+    else:
+        assert backend.get("dispatcher") in {"hybridep", "torch"}
+    if backend.dispatcher == "hybridep":
+        assert backend.get("experts") is not None, (
+            f"{config_file}: HybridEP must explicitly select an experts backend"
+        )
+        assert config.policy.make_sequence_length_divisible_by % 64 == 0, (
+            f"{config_file}: HybridEP input width must be padded to a multiple of 64"
         )

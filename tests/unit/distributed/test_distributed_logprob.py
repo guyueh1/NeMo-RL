@@ -25,11 +25,14 @@ import pytest
 import torch
 
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedCrossEntropyToFixedLogits,
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
+    ChunkedDistributedReverseKLToFixedLogits,
     DistributedLogprob,
     _compute_distributed_log_softmax,
+    get_next_token_logprobs_from_logits,
 )
 
 
@@ -401,5 +404,200 @@ def test_chunked_distributed_entropy(
         tp_size=tp_size,
         chunk_size=chunk_size,
         inference_only=inference_only,
+    )
+    distributed_test_runner(test_fn, world_size=tp_size)
+
+
+def _run_chunk_memory(rank, world_size, tp_size):
+    """Chunking must cut the vocab-parallel logprob call's peak memory by at
+    least one full-sequence fp32 logits copy (the eager cast it avoids)."""
+    tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    batch_size, seq_len, full_vocab_size = 1, 4096, 32768
+    vocab_part_size = full_vocab_size // tp_size
+    vocab_start_index = rank * vocab_part_size
+    vocab_end_index = (rank + 1) * vocab_part_size
+
+    torch.manual_seed(42)
+    full_logits = torch.randn(
+        batch_size, seq_len, full_vocab_size, device="cuda", dtype=torch.bfloat16
+    )
+    input_ids = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
+
+    def peak_bytes(chunk_size):
+        logits = (
+            full_logits[:, :, vocab_start_index:vocab_end_index]
+            .clone()
+            .detach()
+            .requires_grad_(True)
+        )
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        floor = torch.cuda.memory_allocated()
+        logprobs = get_next_token_logprobs_from_logits(
+            input_ids=input_ids,
+            next_token_logits=logits,
+            vocab_parallel_rank=rank,
+            vocab_parallel_group=tp_group,
+            chunk_size=chunk_size,
+        )
+        logprobs.sum().backward()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - floor
+        del logits, logprobs
+        torch.cuda.empty_cache()
+        return peak
+
+    peak_full = peak_bytes(None)
+    peak_chunked = peak_bytes(512)
+    one_fp32_logits_copy = seq_len * vocab_part_size * 4
+    assert peak_full - peak_chunked > one_fp32_logits_copy, (
+        f"chunked={peak_chunked} full={peak_full} need_saving>{one_fp32_logits_copy}"
+    )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_get_next_token_logprobs_chunking_reduces_memory(
+    distributed_test_runner, tp_size
+):
+    test_fn = functools.partial(_run_chunk_memory, tp_size=tp_size)
+    distributed_test_runner(test_fn, world_size=tp_size)
+
+
+def _run_chunk_equivalence(rank, world_size, tp_size, dtype):
+    """Forward logprobs and backward grad must match between chunk_size=None and chunk_size=32."""
+    tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    batch_size, seq_len, full_vocab_size = 2, 128, 2048
+    vocab_part_size = full_vocab_size // tp_size
+    vocab_start_index = rank * vocab_part_size
+    vocab_end_index = (rank + 1) * vocab_part_size
+
+    torch.manual_seed(42)
+    full_logits = torch.randn(
+        batch_size, seq_len, full_vocab_size, device="cuda", dtype=dtype
+    )
+    input_ids = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
+
+    def run(cs):
+        logits = (
+            full_logits[:, :, vocab_start_index:vocab_end_index]
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+        logprobs = get_next_token_logprobs_from_logits(
+            input_ids=input_ids,
+            next_token_logits=logits,
+            vocab_parallel_rank=rank,
+            vocab_parallel_group=tp_group,
+            chunk_size=cs,
+        )
+        logprobs.sum().backward()
+        return logprobs.detach(), logits.grad
+
+    logprobs_full, grad_full = run(None)
+    logprobs_chunked, grad_chunked = run(32)
+
+    torch.testing.assert_close(logprobs_chunked, logprobs_full, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(
+        grad_chunked.to(torch.float32),
+        grad_full.to(torch.float32),
+        rtol=1e-6,
+        atol=1e-6 if dtype == torch.float32 else 5e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "tp_size, dtype",
+    [
+        (1, torch.float32),
+        (2, torch.float32),
+        (1, torch.bfloat16),
+        (2, torch.bfloat16),
+    ],
+)
+def test_get_next_token_logprobs_chunk_equivalence(
+    distributed_test_runner, tp_size, dtype
+):
+    test_fn = functools.partial(_run_chunk_equivalence, tp_size=tp_size, dtype=dtype)
+    distributed_test_runner(test_fn, world_size=tp_size)
+
+
+# ---------------------------------------------------------------------------
+# opd_full student/teacher divergence kernels
+# ---------------------------------------------------------------------------
+
+
+def _run_student_teacher_divergence(rank, world_size, tp_size, chunk_size, kernel_name):
+    """Both opd_full kernels against a single-GPU baseline at real TP.
+
+    The CPU tests in test_model_utils.py neutralize the collectives, so they
+    only pin the TP=1 limit, where the teacher-side log-softmax needs no
+    cross-shard reduction at all. The nightly recipes self-distill, so every
+    per-vocabulary weight is zero there and a shard-local reduction is
+    indistinguishable from the global one. A teacher distinct from the student
+    at TP>1 is the only place the teacher-side normalization is observable.
+    """
+    kernel = {
+        "reverse_kl": ChunkedDistributedReverseKLToFixedLogits,
+        "cross_entropy": ChunkedDistributedCrossEntropyToFixedLogits,
+    }[kernel_name]
+    tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    batch_size, seq_len, vocab_size = 2, 16, 256
+    vocab_part_size = vocab_size // tp_size
+    vocab_start_index = rank * vocab_part_size
+    vocab_end_index = (rank + 1) * vocab_part_size
+
+    torch.manual_seed(1337)
+    student_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+    teacher_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
+    grad_output = torch.randn(batch_size, seq_len, device="cuda")
+
+    baseline_student = student_logits.clone().detach().requires_grad_(True)
+    baseline_student_log_probs = torch.nn.functional.log_softmax(
+        baseline_student, dim=-1
+    )
+    baseline_teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim=-1)
+    baseline_probs = baseline_student_log_probs.exp()
+    if kernel_name == "reverse_kl":
+        baseline = (
+            baseline_probs * (baseline_student_log_probs - baseline_teacher_log_probs)
+        ).sum(dim=-1)
+    else:
+        baseline = (-baseline_probs * baseline_teacher_log_probs).sum(dim=-1)
+    baseline.backward(grad_output)
+    baseline_grad = baseline_student.grad[
+        :, :, vocab_start_index:vocab_end_index
+    ].clone()
+
+    local_student = (
+        student_logits[:, :, vocab_start_index:vocab_end_index]
+        .clone()
+        .detach()
+        .requires_grad_(True)
+    )
+    local_teacher = (
+        teacher_logits[:, :, vocab_start_index:vocab_end_index].clone().detach()
+    )
+
+    divergence = kernel.apply(local_student, local_teacher, chunk_size, tp_group, False)
+    torch.testing.assert_close(divergence, baseline.detach(), rtol=1e-4, atol=1e-4)
+
+    divergence.backward(grad_output)
+    torch.testing.assert_close(local_student.grad, baseline_grad, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("kernel_name", ["reverse_kl", "cross_entropy"])
+@pytest.mark.parametrize("tp_size, chunk_size", [(1, 5), (2, 4)])
+def test_student_teacher_divergence_kernels(
+    distributed_test_runner, tp_size, chunk_size, kernel_name
+):
+    test_fn = functools.partial(
+        _run_student_teacher_divergence,
+        tp_size=tp_size,
+        chunk_size=chunk_size,
+        kernel_name=kernel_name,
     )
     distributed_test_runner(test_fn, world_size=tp_size)

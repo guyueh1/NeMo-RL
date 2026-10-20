@@ -4,10 +4,10 @@
 
 ## Requirements
 
-YaRN is only supported with the **Megatron backend**. The DTensor (Automodel) backend will raise an assertion error if `rope_scaling.rope_type=yarn` is set. Make sure:
+YaRN is only supported with the **Megatron backend**. The Automodel backend will raise an assertion error if `rope_scaling.rope_type=yarn` is set. Make sure:
 
 1. Megatron submodules are initialized: `git submodule update --init --recursive`
-2. Megatron backend is enabled: `policy.megatron_cfg.enabled=True` and `policy.dtensor_cfg.enabled=False`
+2. Megatron backend is enabled: `policy.megatron_cfg.enabled=True` and `policy.automodel_cfg.enabled=False`
 
 ## Enablement
 
@@ -18,7 +18,7 @@ policy:
   max_total_sequence_length: 131072
   megatron_cfg:
     enabled: true
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   hf_config_overrides:
     rope_scaling:
@@ -89,7 +89,7 @@ Launch them the same way as any other recipe:
 uv run examples/run_sft.py \
     --config examples/configs/recipes/llm/sft-qwen3-0.6B-1n8g-megatron-yarn-128k.yaml
 
-uv run examples/run_grpo_math.py \
+uv run examples/run_grpo.py \
     --config examples/configs/recipes/llm/grpo-qwen2.5-1.5B-4n8g-megatron-yarn-256k.yaml
 ```
 

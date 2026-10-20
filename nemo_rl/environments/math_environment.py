@@ -58,6 +58,31 @@ def _mute_output():
         yield
 
 
+def _select_extracted_answer(
+    extracted_answer: Any, math_verify_impl: str
+) -> str | None:
+    """Pick the answer to record for a sample, or ``None`` if none is usable.
+
+    Never raises: an unparseable generation has to produce ``None`` here rather
+    than an exception, because the caller has already committed this sample's
+    score by the time it asks for the answer.
+    """
+    if math_verify_impl == "dapo_math_verify":
+        # This branch hands back a plain normalized string, not a (gold, pred) pair.
+        return extracted_answer if isinstance(extracted_answer, str) else None
+
+    if extracted_answer is None or len(extracted_answer) != 2:
+        return None
+    extracted_gold, extracted_prediction = extracted_answer
+    for pred in extracted_prediction:
+        if any(grader.verify(gold, pred) for gold in extracted_gold):
+            return pred
+    # Nothing matched, so every prediction is wrong; record the first one.
+    # ``extracted_prediction`` is a flat list[str] -- indexing it twice would
+    # take the first *character*, and it is empty when nothing parsed at all.
+    return extracted_prediction[0] if extracted_prediction else None
+
+
 @ray.remote  # pragma: no cover
 class HFVerifyWorker:
     def __init__(self) -> None:
@@ -95,6 +120,8 @@ class HFVerifyWorker:
         extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
+            score: float = 0.0
+            extracted: str | None = None
             try:
                 with _mute_output():
                     math_verify_impl = kwargs.get("math_verify_impl", "hf_math_verify")
@@ -113,28 +140,26 @@ class HFVerifyWorker:
                             f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
                         )
 
-                results.append(float(ret_score))
-
-                if return_extracted_answer:
-                    # Make sure the extracted answer is not None and is a list of two elements
-                    assert extracted_answer is not None
-                    assert len(extracted_answer) == 2
-                    extracted_gold, extracted_prediction = extracted_answer
-                    # Get the extracted answer with the same logic as in the HFVerifyWorker
-                    for pred in extracted_prediction:
-                        if any(grader.verify(gold, pred) for gold in extracted_gold):
-                            extracted_answers.append(pred)
-                            break
-                    else:
-                        # If no match is found, means all answers are incorrect, just use the first prediction
-                        extracted_answers.append(extracted_prediction[0][0])
+                score = float(ret_score)
 
             # It's possible to emit a TimeoutException and that wouldn't be caught since
             # it actually subclasses from BaseException and math-verify itself does not
             # to catch it.
             except (Exception, TimeoutException):
-                results.append(0.0)
-                extracted_answers.append(None)
+                score = 0.0
+            else:
+                # Outside the try on purpose: failing to record an answer must
+                # not retract a score the verifier already returned.
+                if return_extracted_answer:
+                    extracted = _select_extracted_answer(
+                        extracted_answer, math_verify_impl
+                    )
+
+            # Exactly one score and one answer per sample, on every path: both
+            # are consumed positionally against the batch downstream.
+            results.append(score)
+            if return_extracted_answer:
+                extracted_answers.append(extracted)
 
         if return_extracted_answer:
             return results, extracted_answers
@@ -233,10 +258,15 @@ class EnglishMultichoiceVerifyWorker:
 
 @ray.remote  # pragma: no cover
 class HFMultiRewardVerifyWorker:
+    # Reward component names returned by this worker.
+    REWARD_NAMES: list[str] = [
+        "reward/correctness",
+        "reward/integer",
+        "reward/format",
+    ]
+
     def __init__(self) -> None:
         logging.getLogger("math_multi_reward_verify").setLevel(logging.CRITICAL)
-
-        self.number_of_rewards = 3
 
         # Use Latex and plain math extraction from predictions
         # https://github.com/huggingface/Math-Verify?tab=readme-ov-file#extraction-targets
@@ -254,7 +284,10 @@ class HFMultiRewardVerifyWorker:
         ground_truths: list[str],
         return_extracted_answer: bool = False,
         **kwargs,
-    ) -> Union[list[list[float]], tuple[list[list[float]], list[str | None]]]:
+    ) -> Union[
+        dict[str, list[float]],
+        tuple[dict[str, list[float]], list[str | None]],
+    ]:
         """Verify the correctness of the predicted responses against the ground truth.
 
         Args:
@@ -262,9 +295,9 @@ class HFMultiRewardVerifyWorker:
             ground_truths: list[str]. The ground truth responses.
 
         Returns:
-            Union[list[float], tuple[list[float], list[str | None]]].
-            If return_extracted_answer is False, returns only the scores.
-            If return_extracted_answer is True, returns (scores, extracted_answers).
+            If return_extracted_answer is False, returns dict mapping reward component
+            names to per-sample scores.
+            If return_extracted_answer is True, returns (scores_dict, extracted_answers).
         """
 
         def extract_xml_answer(text: str) -> str:
@@ -297,7 +330,7 @@ class HFMultiRewardVerifyWorker:
 
             return rewards
 
-        results = [[] for _ in range(self.number_of_rewards)]
+        results: dict[str, list[float]] = {name: [] for name in self.REWARD_NAMES}
         extracted_answers: list[str | None] = []
 
         for response, ground_truth in zip(pred_responses, ground_truths):
@@ -312,9 +345,9 @@ class HFMultiRewardVerifyWorker:
                         f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify'"
                     )
 
-                results[0].extend(cor_reward)
-                results[1].extend(int_reward)
-                results[2].extend(format_reward)
+                results["reward/correctness"].extend(cor_reward)
+                results["reward/integer"].extend(int_reward)
+                results["reward/format"].extend(format_reward)
 
                 if return_extracted_answer:
                     extracted_answer = extract_xml_answer(response)
@@ -324,15 +357,13 @@ class HFMultiRewardVerifyWorker:
             # it actually subclasses from BaseException and math-verify itself does not
             # to catch it.
             except (Exception, TimeoutException):
-                results[0].append(0.0)
-                results[1].append(0.0)
-                results[2].append(0.0)
+                for name in self.REWARD_NAMES:
+                    results[name].append(0.0)
                 extracted_answers.append(None)
 
         if return_extracted_answer:
             return results, extracted_answers
         else:
-            # return results --> [[0,1,0], [0,2,0], .........]
             return results
 
 
@@ -375,10 +406,13 @@ class BaseMathEnvironment(EnvironmentInterface[MathEnvironmentMetadata]):
         Every rank will run this function, so you're free to use distributed
         calculations if you'd prefer for heavy metrics.
         """
-        # for multi-reward environment, index 0 always store corretness reward
-        rewards = (
-            batch["rewards"] if batch["rewards"].ndim == 1 else batch["rewards"][:, 0]
-        )
+        # For multi-reward environments the batch stores per-component reward
+        # tensors under named keys (e.g. "reward/correctness").  For single-reward
+        # environments it stores a flat Tensor under "rewards".
+        if "reward/correctness" in batch:
+            rewards = batch["reward/correctness"]
+        else:
+            rewards = batch["rewards"]
 
         # set a reward of 0 for any incorrectly ended sequences
         rewards = rewards * batch["is_end"]
@@ -581,9 +615,10 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
 
         worker_results = ray.get(futures)
 
-        # Flatten the results and extract both scores and answers
-        number_of_rewards = len(worker_results[0])
-        results = [[] for _ in range(number_of_rewards)]
+        # Flatten the results and extract both scores and answers.
+        # Each worker returns dict[str, list[float]] (or a tuple with extracted answers).
+        reward_names: list[str] | None = None
+        results: dict[str, list[float]] = {}
         extracted_answers: list[str | None] | None = (
             [] if return_extracted_answer else None
         )
@@ -593,23 +628,30 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
             if return_extracted_answer:
                 worker_scores, worker_answers = worker_result
                 extracted_answers.extend(worker_answers)
-            for i in range(number_of_rewards):
-                results[i].extend(worker_scores[i])
+            if reward_names is None:
+                reward_names = list(worker_scores.keys())
+                results = {name: [] for name in reward_names}
+            for name in reward_names:
+                results[name].extend(worker_scores[name])
 
+        correctness_key = "reward/correctness"
         observations = [
             {
                 "role": "environment",
                 "content": "Environment: correct"
-                if result
+                if score
                 else "Environment: incorrect",
             }
-            for result in results[0]  ## index 0 always store corretness reward
+            for score in results[correctness_key]
         ]
 
-        # create a tensor of rewards and done flags
-        rewards = torch.tensor(results).T.cpu()  ## Shape Batch_size, Number_rewards
-        ## hard fixed this done to
-        done = torch.ones(rewards.shape[0]).cpu()
+        # Build dict of reward tensors: {name: Tensor[B]}
+        rewards: dict[str, torch.Tensor] = {
+            name: torch.tensor(scores, dtype=torch.float32).cpu()
+            for name, scores in results.items()
+        }
+        batch_size = len(results[correctness_key])
+        done = torch.ones(batch_size).cpu()
         next_stop_strings = [None] * len(message_log_batch)
 
         return EnvironmentReturn(

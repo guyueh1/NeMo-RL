@@ -1,6 +1,6 @@
 # NeMo-RL
 
-NeMo-RL is an RLHF training framework built on Ray and PyTorch (FSDP2 / Megatron-Core). It supports algorithms like GRPO, DPO, and SFT for LLMs and VLMs.
+NeMo-RL is an RLHF training framework built on Ray and PyTorch (Automodel / Megatron-Core). It supports algorithms like GRPO, DPO, and SFT for LLMs and VLMs.
 
 ## Skills
 
@@ -27,14 +27,23 @@ skill keyword — infer it from the artifact you read.
 
 ## Code Review
 
+For formal GitHub reviews, comment `/review` or `/review mode=strict` on the PR.
+See CONTRIBUTING.md for service integration prerequisites. The existing
+repository review guidance and local interactive commands below are unchanged.
+
 Use `/review-pr <pr-number>` for interactive local PR review.
+
+Use `/review-pr-team <pr-number>` for a deeper review by a coordinated team of
+specialized agents (requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`).
 
 When reviewing code, follow these principles:
 
-- **Be concise and actionable.** Focus on bugs, logic errors, missing tests, outdated docs, and guideline violations.
-- **Do NOT flag:** style/formatting (linters handle it), minor naming suggestions, architectural opinions, or performance unless there is a clear measurable issue.
-- **High confidence only.** Only flag issues you are confident about. If unsure, skip it.
+- **Be concise and actionable.** Focus on bugs, logic errors, missing tests, outdated docs, and guideline violations. Lead with the issue, then a concrete suggested fix (name the file/function; give the snippet/schema when known).
+- **Do NOT flag:** style/formatting (linters handle it), minor naming suggestions, *subjective* architecture debates, or performance unless there is a clear measurable issue.
+- **DO flag concrete maintainability smells that have a clear fix** (these are not "architectural opinions"): side-channel/out-of-band state (e.g. setting an attribute the caller reads via `hasattr`), `dict[str, Any]` for known-field configs, inconsistent return types across siblings, and silent-on-misconfiguration paths. Raise them as low-severity suggestions.
+- **High confidence only — but verify the premise.** Only flag issues you are confident about; if unsure, skip it. When a finding hinges on how an external tool/API/env-var behaves, verify it against source/docs (with a permalink) before flagging — don't inflate confidence on an unverified premise.
 - **Verify upstream API usage.** When code calls into megatron-bridge, megatron-lm, automodel, or gym APIs, look up the actual API to verify correct usage. Evaluate each such call with scrutiny — don't assume the author got the signature, return type, or semantics right.
+- **Compare new components to their nearest internal analog.** A new worker group, estimator, or config block should mirror the established pattern (backend dispatch, override hooks, guards, typing, return shape) or justify diverging.
 - It is perfectly acceptable to have nothing to comment on. Say "LGTM" if so.
 
 ## Kubernetes / nrl-k8s

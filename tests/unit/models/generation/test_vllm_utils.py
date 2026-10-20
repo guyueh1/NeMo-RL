@@ -13,16 +13,36 @@
 # limitations under the License.
 
 import math
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.generation.vllm.utils import (
-    aggregate_spec_decode_counters,
-    compute_spec_decode_metrics,
-    format_prompt_for_vllm_generation,
+from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_FALLBACK_DTYPE,
+    get_num_routed_experts,
+    resolve_routed_experts_dtype,
 )
+from nemo_rl.models.generation.vllm import utils as vllm_utils
+from nemo_rl.models.generation.vllm.utils import (
+    R3_MISSING_ROUTE_SENTINEL,
+    aggregate_spec_decode_counters,
+    attach_routed_experts_to_chat_response_choices,
+    attach_token_information_to_chat_response_choices,
+    compute_engine_step_metrics,
+    compute_spec_decode_metrics,
+    encode_counter_key,
+    format_prompt_for_vllm_generation,
+    model_dump_chat_response_with_dynamic_message_fields,
+    pad_and_align_routed_expert_indices,
+)
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts
+
+
+def _decoded_routes(payload: str) -> list:
+    return decode_routed_experts(payload, dtype=torch.int32).tolist()
 
 
 def _mk_inputs(batch_size: int = 2, seq_len: int = 5):
@@ -57,7 +77,10 @@ def test_vllm_utils_vlm_with_images_and_text():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["<s>user: hi</s>", "<s>user: hello</s>"],
-            "vllm_images": [["img1"], ["img2a", "img2b"]],
+            "vllm_multi_modal_data": [
+                {"image": "img1"},
+                {"image": ["img2a", "img2b"]},
+            ],
         }
     )
 
@@ -69,6 +92,130 @@ def test_vllm_utils_vlm_with_images_and_text():
     assert prompts[1]["multi_modal_data"]["image"] == ["img2a", "img2b"]
 
 
+def test_vllm_utils_forwards_unknown_modality_keys():
+    """NeMo-RL forwards keys; the served vLLM model validates supported modalities."""
+    embedding = torch.ones(1, 2, 3)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "input_lengths": torch.tensor([2]),
+            "vllm_multi_modal_data": [{"image": "img", "conditioning": embedding}],
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+
+    multi_modal_data = prompts[0]["multi_modal_data"]
+    assert prompts[0]["prompt_token_ids"] == [1, 2]
+    assert multi_modal_data["image"] == "img"
+    assert multi_modal_data["conditioning"] is embedding
+
+
+@pytest.mark.parametrize("empty_value", [None, [], ()])
+@pytest.mark.parametrize("content", [None, "formatted prompt"])
+def test_vllm_utils_omits_empty_modality_values(
+    empty_value: None | list | tuple, content: str | None
+) -> None:
+    audio = (torch.ones(4), 16000)
+    rows = [{"image": empty_value}, {"image": empty_value, "audio": audio}]
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": [content, content],
+            "vllm_multi_modal_data": rows,
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+
+    assert prompts[0] == {"prompt_token_ids": input_ids[0].tolist()}
+    assert set(prompts[1]["multi_modal_data"]) == {"audio"}
+    assert prompts[1]["multi_modal_data"]["audio"] is audio
+    assert rows[1]["image"] is empty_value
+
+
+def test_vllm_utils_vlm_with_audio_and_video_intent_path():
+    """IntentTrain/IntentBench rollouts must surface both modalities to vLLM.
+
+    Asserts ``multi_modal_data`` contains both ``video`` and ``audio`` for the
+    same prompt. This is the regression bar for AC-3 of the audio+video intent
+    recipe; if either key is dropped at this site, vLLM rolls out a text-only /
+    single-modality prompt and the smoke run silently degrades.
+    """
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": ["<s>user: q1</s>", "<s>user: q2</s>"],
+            "vllm_multi_modal_data": [
+                {"video": "frames-1", "audio": ("audio-1", 16000)},
+                {"video": "frames-2", "audio": ("audio-2", 16000)},
+            ],
+            "task_name": ["intent-train", "intent-bench"],
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+    assert len(prompts) == 2
+    for i, prompt in enumerate(prompts):
+        assert "multi_modal_data" in prompt, (
+            f"prompt {i} missing multi_modal_data: keys={list(prompt)}"
+        )
+        mm = prompt["multi_modal_data"]
+        assert "video" in mm, f"prompt {i} dropped video: keys={list(mm)}"
+        assert "audio" in mm, f"prompt {i} dropped audio: keys={list(mm)}"
+    # The independent-streams path explicitly does not set
+    # mm_processor_kwargs={"use_audio_in_video": True} (Round 1 BitLesson
+    # BL-20260428-omni-use-audio-in-video). If a future change re-introduces
+    # that flag this assertion will need to be updated together with vLLM
+    # acceptance evidence.
+    for prompt in prompts:
+        assert "mm_processor_kwargs" not in prompt
+
+
+def test_vllm_utils_vlm_with_video_only():
+    """Video-only path (no audio, no images) produces multi_modal_data with video key only."""
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": ["<s>user: q1</s>", "<s>user: q2</s>"],
+            "vllm_multi_modal_data": [
+                {"video": "frames-1"},
+                {"video": "frames-2"},
+            ],
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+    assert len(prompts) == 2
+    for i, prompt in enumerate(prompts):
+        assert "multi_modal_data" in prompt, f"prompt {i} missing multi_modal_data"
+        mm = prompt["multi_modal_data"]
+        assert "video" in mm, f"prompt {i} missing video key"
+        assert "audio" not in mm, f"prompt {i} should not have audio key"
+        assert "image" not in mm, f"prompt {i} should not have image key"
+
+
+def test_vllm_utils_vlm_with_empty_media_fallback_to_tokens():
+    """Empty per-sample media should fall back to prompt_token_ids."""
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": ["a", "b"],
+            "vllm_multi_modal_data": [{}, {}],
+        }
+    )
+    prompts = format_prompt_for_vllm_generation(data)
+    assert all("prompt_token_ids" in p for p in prompts)
+
+
 def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
     input_ids, input_lengths = _mk_inputs()
     # images None triggers fallback
@@ -77,7 +224,7 @@ def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["a", "b"],
-            "vllm_images": None,
+            "vllm_multi_modal_data": None,
         }
     )
     prompts = format_prompt_for_vllm_generation(data_none)
@@ -89,33 +236,569 @@ def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": ["a", "b"],
-            "vllm_images": [[], []],
+            "vllm_multi_modal_data": [{}, {}],
         }
     )
     prompts = format_prompt_for_vllm_generation(data_empty)
     assert all("prompt_token_ids" in p for p in prompts)
 
 
-def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
+def test_vllm_utils_vlm_with_none_content_uses_updated_tokens_and_media():
     input_ids, input_lengths = _mk_inputs()
     data = BatchedDataDict(
         {
             "input_ids": input_ids,
             "input_lengths": input_lengths,
             "vllm_content": [None, None],
-            "vllm_images": [["img"], ["img"]],
+            "vllm_multi_modal_data": [{"image": "img"}, {"image": "img"}],
         }
     )
-    # even though images provided, None content should fallback to tokens
     prompts_all = format_prompt_for_vllm_generation(data)
     assert len(prompts_all) == 2
     assert all("prompt_token_ids" in p for p in prompts_all)
+    assert [p["multi_modal_data"]["image"] for p in prompts_all] == ["img", "img"]
+    assert (
+        prompts_all[1]["prompt_token_ids"] == input_ids[1, : input_lengths[1]].tolist()
+    )
 
     # single-sample API
     p0 = format_prompt_for_vllm_generation(data, sample_idx=0)
     p1 = format_prompt_for_vllm_generation(data, sample_idx=1)
     assert isinstance(p0, dict) and isinstance(p1, dict)
     assert "prompt_token_ids" in p0 and "prompt_token_ids" in p1
+    assert p0["multi_modal_data"]["image"] == "img"
+    assert p1["multi_modal_data"]["image"] == "img"
+
+
+def test_normalize_routed_experts_full_sequence_alignment():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.arange(5 * 3 * 2).reshape(5, 3, 2)
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=6,
+        padded_length=8,
+        device=torch.device("cpu"),
+    )
+
+    assert routed_experts.shape == (8, 3, 2)
+    assert routed_experts.dtype == ROUTED_EXPERTS_FALLBACK_DTYPE
+    assert torch.equal(
+        routed_experts[:5],
+        completion_output.routed_experts.to(ROUTED_EXPERTS_FALLBACK_DTYPE),
+    )
+    # The final token (position 5) and batch padding have no route.
+    assert routed_experts[5:].eq(R3_MISSING_ROUTE_SENTINEL).all()
+
+
+def test_normalize_routed_experts_concatenates_prompt_and_decode():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    request_output.prompt_routed_experts = torch.ones(
+        2, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
+    completion_output.routed_experts = 2 * torch.ones(
+        3, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=5,
+        padded_length=5,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(routed_experts[:2], request_output.prompt_routed_experts)
+    assert torch.equal(routed_experts[2:4], completion_output.routed_experts[:2])
+    assert routed_experts[4].eq(R3_MISSING_ROUTE_SENTINEL).all()
+
+
+def test_normalize_routed_experts_uses_missing_route_sentinel_for_last_token():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.tensor(
+        [
+            [[4, 5, 6], [7, 8, 9]],
+            [[1, 2, 3], [10, 11, 12]],
+        ],
+        dtype=ROUTED_EXPERTS_FALLBACK_DTYPE,
+    )
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=3,
+        padded_length=5,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(routed_experts[:2], completion_output.routed_experts)
+    assert routed_experts[2:].eq(R3_MISSING_ROUTE_SENTINEL).all()
+
+
+def test_normalize_routed_experts_final_token_is_sentinel_even_if_vllm_returns_route():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.tensor(
+        [
+            [[4, 5, 6], [7, 8, 9]],
+            [[1, 2, 3], [10, 11, 12]],
+            [[0, 0, 0], [0, 0, 0]],
+        ],
+        dtype=ROUTED_EXPERTS_FALLBACK_DTYPE,
+    )
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=3,
+        padded_length=3,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(routed_experts[:2], completion_output.routed_experts[:2])
+    assert routed_experts[2].eq(R3_MISSING_ROUTE_SENTINEL).all()
+
+
+def test_normalize_routed_experts_strict_mode_marks_missing_routes_for_fallback():
+    class Output:
+        pass
+
+    request_output = Output()
+    request_output.num_cached_tokens = 4
+    completion_output = Output()
+    completion_output.routed_experts = torch.ones(
+        2, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
+
+    routed_experts, stats = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=6,
+        padded_length=6,
+        device=torch.device("cpu"),
+        require_complete_routed_experts=True,
+        return_stats=True,
+    )
+
+    assert stats == {
+        "actual_routes": 2,
+        "expected_routes": 5,
+        "missing_routes": 3,
+        "surplus_routes": 0,
+    }
+    assert torch.equal(routed_experts[:2], completion_output.routed_experts)
+    assert torch.equal(
+        routed_experts[2:5],
+        torch.full(
+            (3, 1, 2), R3_MISSING_ROUTE_SENTINEL, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
+    )
+    assert routed_experts[5].eq(R3_MISSING_ROUTE_SENTINEL).all()
+
+
+def test_normalize_routed_experts_can_reject_missing_routes_when_fallback_disabled():
+    class Output:
+        pass
+
+    request_output = Output()
+    request_output.num_cached_tokens = 4
+    completion_output = Output()
+    completion_output.routed_experts = torch.ones(
+        2, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
+
+    with pytest.raises(ValueError, match="incomplete routed_experts"):
+        pad_and_align_routed_expert_indices(
+            request_output,
+            completion_output,
+            valid_length=6,
+            padded_length=6,
+            device=torch.device("cpu"),
+            require_complete_routed_experts=True,
+            allow_missing_routed_experts_fallback=False,
+        )
+
+
+def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
+    class Output:
+        pass
+
+    request_output = Output()
+    request_output.num_cached_tokens = 0
+    completion_output = Output()
+    completion_output.routed_experts = torch.ones(
+        4, 1, 2, dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+    )
+
+    with pytest.raises(ValueError, match="too many routed_experts routes"):
+        pad_and_align_routed_expert_indices(
+            request_output,
+            completion_output,
+            valid_length=3,
+            padded_length=3,
+            device=torch.device("cpu"),
+            require_complete_routed_experts=True,
+        )
+
+
+def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        prompt_routed_experts=torch.tensor(
+            [[[10]], [[11]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
+        outputs=[
+            SimpleNamespace(
+                index=1,
+                token_ids=[201, 202],
+                routed_experts=torch.tensor(
+                    [[[31]], [[32]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[200],
+                routed_experts=torch.tensor(
+                    [[[30]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            ),
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+    )
+
+    # Routes travel as a base64 string envelope, one opaque object per choice.
+    assert isinstance(response.choices[0].message.routed_experts, str)
+    assert _decoded_routes(response.choices[0].message.routed_experts) == [
+        [[10]],
+        [[11]],
+        [[30]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+    ]
+    assert _decoded_routes(response.choices[1].message.routed_experts) == [
+        [[10]],
+        [[11]],
+        [[31]],
+        [[32]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+    ]
+
+
+def test_attach_routed_experts_to_chat_response_choices_requires_routed_experts():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        outputs=[SimpleNamespace(index=0, token_ids=[200])],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match="did not include routed_experts"):
+        attach_routed_experts_to_chat_response_choices(
+            response,
+            final_res,
+            device=torch.device("cpu"),
+        )
+
+
+def test_attach_routed_experts_to_chat_response_choices_warns_on_missing_routes():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[200, 201],
+                routed_experts=torch.tensor(
+                    [[[10]], [[11]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+    logger = MagicMock()
+
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+        logger=logger,
+    )
+
+    logger.warning.assert_called_once_with(
+        "R3 router replay fallback: vLLM returned incomplete "
+        "routed_experts for chat choice_idx=%d, "
+        "missing_token_routes=%d, actual_routes=%d, "
+        "expected_routes=%d. Megatron will use its own router "
+        "for those missing token routes.",
+        0,
+        2,
+        2,
+        4,
+    )
+    assert _decoded_routes(response.choices[0].message.routed_experts) == [
+        [[10]],
+        [[11]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+        [[R3_MISSING_ROUTE_SENTINEL]],
+    ]
+
+
+def test_attach_routed_experts_to_chat_response_choices_raises_for_unmatched_choice():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        outputs=[
+            SimpleNamespace(
+                index=1,
+                token_ids=[200],
+                routed_experts=torch.tensor(
+                    [[[10]], [[11]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            )
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match=r"missing_choice_indices=\[0\]"):
+        attach_routed_experts_to_chat_response_choices(
+            response,
+            final_res,
+            device=torch.device("cpu"),
+        )
+
+
+def test_attach_token_information_to_chat_response_choices():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[
+            SimpleNamespace(index=1, token_ids=[], logprobs=None),
+            SimpleNamespace(
+                index=0,
+                token_ids=[201, 202],
+                logprobs=[
+                    {201: SimpleNamespace(logprob=-0.1)},
+                    {202: SimpleNamespace(logprob=-10000.0)},
+                ],
+            ),
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(),
+                logprobs=SimpleNamespace(
+                    content=[
+                        SimpleNamespace(token="decoded token", logprob=-10.0),
+                        SimpleNamespace(token="format is ignored", logprob=-20.0),
+                    ]
+                ),
+            ),
+            SimpleNamespace(
+                index=1,
+                message=SimpleNamespace(),
+                logprobs=SimpleNamespace(content=None),
+            ),
+        ],
+        model_dump=lambda: {
+            "choices": [
+                {"message": {"role": "assistant", "content": "first"}},
+                {"message": {"role": "assistant", "content": "second"}},
+            ]
+        },
+    )
+
+    attach_token_information_to_chat_response_choices(response, final_res)
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
+
+    assert response_dict["choices"][0]["message"]["prompt_token_ids"] == [
+        101,
+        102,
+        103,
+    ]
+    assert response_dict["choices"][0]["message"]["generation_token_ids"] == [201, 202]
+    assert response_dict["choices"][0]["message"]["generation_log_probs"] == [
+        -0.1,
+        -9999.0,
+    ]
+    assert response_dict["choices"][1]["message"]["prompt_token_ids"] == [
+        101,
+        102,
+        103,
+    ]
+    assert response_dict["choices"][1]["message"]["generation_token_ids"] == []
+    assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "logprobs", "error_match"),
+    [
+        (
+            [201, 202],
+            [{201: SimpleNamespace(logprob=-0.1)}],
+            "mismatched generation token IDs and log probabilities",
+        ),
+        (
+            [201],
+            [{999: SimpleNamespace(logprob=-0.1)}],
+            "did not include the selected token",
+        ),
+    ],
+)
+def test_attach_token_information_to_chat_response_choices_rejects_invalid_logprobs(
+    token_ids, logprobs, error_match
+):
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        outputs=[SimpleNamespace(index=0, token_ids=token_ids, logprobs=logprobs)],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        attach_token_information_to_chat_response_choices(response, final_res)
+
+
+@pytest.mark.parametrize(
+    ("prompt_token_ids", "outputs", "choice_indices", "error_match"),
+    [
+        (None, [], [], "did not include prompt_token_ids"),
+        (
+            [101],
+            [
+                SimpleNamespace(index=0, token_ids=[], logprobs=[]),
+                SimpleNamespace(index=0, token_ids=[], logprobs=[]),
+            ],
+            [0],
+            "duplicate generation output indices",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, token_ids=[], logprobs=[])],
+            [0, 0],
+            "duplicate response choice indices",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=1, token_ids=[], logprobs=[])],
+            [0],
+            "could not be matched to generation outputs",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, logprobs=[])],
+            [0],
+            "did not include token_ids",
+        ),
+        (
+            [101],
+            [SimpleNamespace(index=0, token_ids=[201], logprobs=None)],
+            [0],
+            "did not include logprobs",
+        ),
+    ],
+)
+def test_attach_token_information_to_chat_response_choices_rejects_invalid_structure(
+    prompt_token_ids, outputs, choice_indices, error_match
+):
+    final_res = SimpleNamespace(
+        prompt_token_ids=prompt_token_ids,
+        outputs=outputs,
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=choice_index, message=SimpleNamespace())
+            for choice_index in choice_indices
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match=error_match):
+        attach_token_information_to_chat_response_choices(response, final_res)
+
+
+def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        prompt_routed_experts=torch.tensor(
+            [[[10]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+        ),
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[201],
+                logprobs=[{201: SimpleNamespace(logprob=-0.1)}],
+                routed_experts=torch.tensor(
+                    [[[20]]], dtype=ROUTED_EXPERTS_FALLBACK_DTYPE
+                ),
+            )
+        ],
+    )
+
+    class Response:
+        choices = [
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(),
+            )
+        ]
+
+        def model_dump(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello",
+                        }
+                    }
+                ]
+            }
+
+    response = Response()
+    attach_token_information_to_chat_response_choices(response, final_res)
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+    )
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
+
+    message = response_dict["choices"][0]["message"]
+    assert message["routed_experts"] == response.choices[0].message.routed_experts
+    assert message["prompt_token_ids"] == [101, 102]
+    assert message["generation_token_ids"] == [201]
+    assert message["generation_log_probs"] == [-0.1]
 
 
 @pytest.mark.vllm
@@ -181,3 +864,318 @@ def test_compute_spec_decode_metrics():
     assert math.isclose(metrics["vllm/spec_acceptance_length"], 3.4, rel_tol=1e-6)
     # acceptance_rate = accepted / draft_tokens = 240 / 300 = 0.8
     assert math.isclose(metrics["vllm/spec_acceptance_rate"], 0.8, rel_tol=1e-6)
+
+
+def _engine_snapshot(
+    prompt_tokens: float,
+    generation_tokens: float,
+    prompt_sum: float,
+    prompt_count: float,
+    gen_sum: float,
+    gen_count: float,
+    finished: dict[str, float],
+) -> dict[str, float]:
+    """Build a counter snapshot in the shape the worker reports."""
+    snapshot: dict[str, float] = {
+        "vllm:prompt_tokens": prompt_tokens,
+        "vllm:generation_tokens": generation_tokens,
+        encode_counter_key("vllm:request_prompt_tokens", "sum"): prompt_sum,
+        encode_counter_key("vllm:request_prompt_tokens", "count"): prompt_count,
+        encode_counter_key("vllm:request_generation_tokens", "sum"): gen_sum,
+        encode_counter_key("vllm:request_generation_tokens", "count"): gen_count,
+    }
+    for reason, value in finished.items():
+        snapshot[
+            encode_counter_key("vllm:request_success", f"finished_reason={reason}")
+        ] = value
+    return snapshot
+
+
+def test_engine_step_metrics_reports_token_length_and_outcome_deltas():
+    start = _engine_snapshot(
+        1000.0, 500.0, 1000.0, 10.0, 500.0, 10.0, {"stop": 8.0, "abort": 2.0}
+    )
+    # Over the step: 400 prompt tokens across 4 requests (mean 100), 600
+    # generated across 4 (mean 150), 3 finished normally and 1 was aborted.
+    end = _engine_snapshot(
+        1400.0, 1100.0, 1400.0, 14.0, 1100.0, 14.0, {"stop": 11.0, "abort": 3.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/prompt_tokens"] == 400.0
+    assert metrics["vllm/generation_tokens"] == 600.0
+    assert math.isclose(metrics["vllm/prompt_length_mean"], 100.0)
+    assert math.isclose(metrics["vllm/generation_length_mean"], 150.0)
+    assert metrics["vllm/generations_ok"] == 3.0
+    assert metrics["vllm/generations_failed"] == 1.0
+
+
+def test_length_is_truncation_aware_not_a_failure():
+    """``length`` means max_tokens was reached, which is routine in RL.
+
+    Counting it as a failure would report most of a well-behaved run as failed.
+    """
+    start = _engine_snapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {"length": 0.0})
+    end = _engine_snapshot(10.0, 10.0, 10.0, 1.0, 10.0, 1.0, {"length": 5.0})
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/generations_ok"] == 5.0
+    assert metrics["vllm/generations_failed"] == 0.0
+
+
+def test_an_unknown_finish_reason_counts_as_failed_not_dropped():
+    """``ok + failed`` must stay equal to the engine's own total.
+
+    vLLM has grown finish reasons before, so a reason this code has never heard
+    of has to land somewhere rather than vanish from both counters.
+    """
+    start = _engine_snapshot(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {})
+    end = _engine_snapshot(
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, {"stop": 4.0, "some_future_reason": 6.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert metrics["vllm/generations_ok"] == 4.0
+    assert metrics["vllm/generations_failed"] == 6.0
+    assert metrics["vllm/generations_ok"] + metrics["vllm/generations_failed"] == 10.0
+
+
+def test_a_step_that_served_no_request_omits_the_means():
+    """A zero-count histogram is "no data", not a zero-length sequence."""
+    snapshot = _engine_snapshot(5.0, 5.0, 100.0, 2.0, 100.0, 2.0, {"stop": 1.0})
+
+    metrics = compute_engine_step_metrics(snapshot, snapshot)
+
+    assert "vllm/prompt_length_mean" not in metrics
+    assert "vllm/generation_length_mean" not in metrics
+
+
+def test_a_renamed_series_is_omitted_rather_than_reported_as_zero():
+    """vLLM renames these across releases; a gap beats a plausible-looking 0."""
+    metrics = compute_engine_step_metrics({}, {})
+
+    assert metrics == {}
+
+
+@pytest.mark.vllm
+def test_engine_metric_names_match_vllm():
+    """The series names are copies of vLLM's, so they can go stale silently.
+
+    A renamed series is omitted rather than reported as zero, which is the
+    right runtime behaviour but leaves no error to notice -- the dashboard just
+    loses a line. Checking the copies against vLLM's own declarations turns
+    that into a test failure at the version bump that causes it.
+    """
+    pytest.importorskip("vllm")
+
+    import inspect
+
+    from vllm.v1.engine import FINISH_REASON_STRINGS
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+    from nemo_rl.models.generation.vllm.metric_names import (
+        FINISHED_REASON_LABEL,
+        GENERATION_LENGTH_HISTOGRAMS,
+        GENERATION_TOKEN_COUNTERS,
+        OK_FINISH_REASONS,
+        PROMPT_LENGTH_HISTOGRAMS,
+        PROMPT_TOKEN_COUNTERS,
+        REQUEST_SUCCESS_COUNTERS,
+    )
+
+    # vLLM declares each of these as a literal ``name=`` on the collector, so
+    # the names it registers are readable straight off the source. Reading the
+    # registry instead would mean standing up an engine.
+    declared = inspect.getsource(PrometheusStatLogger)
+    expected = (
+        *PROMPT_TOKEN_COUNTERS,
+        *GENERATION_TOKEN_COUNTERS,
+        *PROMPT_LENGTH_HISTOGRAMS,
+        *GENERATION_LENGTH_HISTOGRAMS,
+        *REQUEST_SUCCESS_COUNTERS,
+    )
+    missing = [name for name in expected if f'name="{name}"' not in declared]
+
+    assert not missing, (
+        f"vLLM no longer declares {missing}; these step metrics will silently "
+        "stop being reported. Update nemo_rl/models/generation/vllm/metric_names.py."
+    )
+    assert f'"{FINISHED_REASON_LABEL}"' in declared
+    # Copied from vLLM too. A reason that stops existing would be counted as
+    # failed forever, which is the same silent-drift failure as a renamed series.
+    assert OK_FINISH_REASONS <= set(FINISH_REASON_STRINGS)
+
+
+def test_a_counter_that_went_backwards_is_omitted_rather_than_negative():
+    """These totals are summed over workers, so a drop means an engine restarted.
+
+    restart_shard replaces a worker's engine and its counters start from zero,
+    so the step's true count is unknown -- reporting end minus start would put
+    a negative token count on the dashboard.
+    """
+    start = _engine_snapshot(
+        1000.0, 500.0, 1000.0, 10.0, 500.0, 10.0, {"stop": 8.0, "abort": 2.0}
+    )
+    # One of two workers restarted, so the fleet totals are below where they
+    # were, except generation_tokens which still grew overall.
+    end = _engine_snapshot(
+        400.0, 900.0, 400.0, 4.0, 900.0, 12.0, {"stop": 3.0, "abort": 1.0}
+    )
+
+    metrics = compute_engine_step_metrics(start, end)
+
+    assert "vllm/prompt_tokens" not in metrics
+    assert "vllm/generations_ok" not in metrics
+    assert "vllm/generations_failed" not in metrics
+    # The series that did grow is still reported.
+    assert metrics["vllm/generation_tokens"] == 400.0
+
+
+def test_engine_counters_survive_worker_aggregation():
+    """The engine series must not be dropped by the spec-decode filter.
+
+    They were: one substring check discarded every non-spec-decode series, so
+    the tokens and outcomes crossed the wire on every step and were thrown away.
+    """
+    counters = aggregate_spec_decode_counters(
+        [
+            {"vllm:prompt_tokens": 100.0, "vllm:num_requests_running": 3.0},
+            {"vllm:prompt_tokens": 50.0},
+        ]
+    )
+
+    assert counters["vllm:prompt_tokens"] == 150.0
+    # Still filtered: forwarding the whole ~40-series snapshot would put
+    # unbounded, version-dependent cardinality on the step metrics.
+    assert "vllm:num_requests_running" not in counters
+
+
+def test_near_miss_sibling_series_are_not_swept_in():
+    """The kept names are matched exactly, not as prefixes.
+
+    vLLM really ships ``vllm:prompt_tokens_by_source`` and
+    ``vllm:prompt_tokens_cached`` alongside ``vllm:prompt_tokens``. A prefix
+    test would forward both on every step for nothing, and the ``_by_source``
+    one is labelled, so it would arrive collapsed and meaningless.
+    """
+    counters = aggregate_spec_decode_counters(
+        [
+            {
+                "vllm:prompt_tokens": 100.0,
+                "vllm:prompt_tokens_by_source": 60.0,
+                "vllm:prompt_tokens_cached": 40.0,
+            }
+        ]
+    )
+
+    assert set(counters) == {"vllm:prompt_tokens"}
+
+
+def test_resolve_routed_experts_dtype_boundaries():
+    assert resolve_routed_experts_dtype(None) == ROUTED_EXPERTS_FALLBACK_DTYPE
+    assert resolve_routed_experts_dtype(8) == torch.int8
+    assert resolve_routed_experts_dtype(128) == torch.int8
+    assert resolve_routed_experts_dtype(129) == torch.int16
+    assert resolve_routed_experts_dtype(256) == torch.int16
+    assert resolve_routed_experts_dtype(32768) == torch.int16
+    assert resolve_routed_experts_dtype(32769) == torch.int32
+
+
+def test_get_num_routed_experts_across_config_conventions():
+    qwen_moe = SimpleNamespace(num_experts=128)
+    deepseek = SimpleNamespace(n_routed_experts=256)
+    mixtral = SimpleNamespace(num_local_experts=8)
+    dense = SimpleNamespace()
+    vlm = SimpleNamespace(text_config=SimpleNamespace(num_experts=128))
+
+    assert get_num_routed_experts(qwen_moe) == 128
+    assert get_num_routed_experts(deepseek) == 256
+    assert get_num_routed_experts(mixtral) == 8
+    assert get_num_routed_experts(dense) is None
+    assert get_num_routed_experts(vlm) == 128
+
+
+def test_pad_and_align_uses_resolved_dtype():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.arange(5 * 3 * 2).reshape(5, 3, 2) % 128
+
+    routed_experts = pad_and_align_routed_expert_indices(
+        request_output,
+        completion_output,
+        valid_length=6,
+        padded_length=8,
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int8,
+    )
+
+    assert routed_experts.dtype == torch.int8
+    assert torch.equal(
+        routed_experts[:5], completion_output.routed_experts.to(torch.int8)
+    )
+
+
+def test_pad_and_align_rejects_expert_ids_overflowing_dtype(monkeypatch):
+    monkeypatch.setattr(vllm_utils, "G_ROUTED_EXPERTS_RANGE_CHECKED", False)
+
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.full((2, 1, 2), 200)
+
+    with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
+        pad_and_align_routed_expert_indices(
+            request_output,
+            completion_output,
+            valid_length=3,
+            padded_length=3,
+            device=torch.device("cpu"),
+            routed_experts_dtype=torch.int8,
+        )
+
+
+def _generation_stub(counters):
+    """Enough of a ``VllmGeneration`` to call ``get_step_metrics`` unbound.
+
+    Constructing the real class needs a Ray cluster and a loaded engine, and
+    none of that is what this exercises.
+    """
+    return SimpleNamespace(
+        _step_metrics_snapshot=counters,
+        _get_raw_spec_counters=lambda: counters,
+    )
+
+
+def test_step_metrics_survive_an_unreadable_engine_snapshot():
+    """A metrics failure must cost the metrics, not the run.
+
+    All four callers do ``metrics.update(policy_generation.get_step_metrics())``
+    with no guard, so anything raising in here ends training. The inputs are
+    vLLM's Prometheus series, whose names and shapes move between releases.
+    """
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:num_preemptions_total": 1.0})
+    stub._get_raw_spec_counters = MagicMock(side_effect=RuntimeError("reader gone"))
+
+    assert VllmGeneration.get_step_metrics(stub) == {}
+    # Reset even on failure, so the next step's snapshot is not seen as a double.
+    assert stub._step_metrics_snapshot is None
+
+
+def test_step_metrics_are_returned_when_the_snapshot_reads_cleanly():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({})
+    metrics = VllmGeneration.get_step_metrics(stub)
+
+    assert isinstance(metrics, dict)
+    assert stub._step_metrics_snapshot is None
