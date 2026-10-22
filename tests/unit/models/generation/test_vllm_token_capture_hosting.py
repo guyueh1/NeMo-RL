@@ -263,6 +263,36 @@ def _worker_with_capture(sink: _MemorySink):
     return worker
 
 
+@pytest.mark.parametrize(
+    ("logprobs", "top_logprobs"),
+    [(False, 4), (True, None), (True, 0), (True, 2), (True, 8)],
+)
+def test_capture_rejects_mismatched_http_topk(logprobs, top_logprobs):
+    worker = _worker_with_capture(_MemorySink())
+    worker._capture_top_logprobs = 4
+    request = SimpleNamespace(logprobs=logprobs, top_logprobs=top_logprobs)
+    admission = CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
+
+    with pytest.raises(ValueError, match="top_logprobs=4 over HTTP"):
+        VllmAsyncGenerationWorkerImpl._begin_request_capture(
+            worker, request, [10, 11], admission=admission
+        )
+    assert worker._capture_calls == {}
+
+
+def test_capture_accepts_matching_http_topk():
+    worker = _worker_with_capture(_MemorySink())
+    worker._capture_top_logprobs = 4
+    request = SimpleNamespace(logprobs=True, top_logprobs=4)
+    admission = CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
+
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker, request, [10, 11], admission=admission
+    )
+    assert id(request) in worker._capture_calls
+    assert request.top_logprobs == 4
+
+
 class _MemoryPrefixSource:
     def __init__(self, deltas: dict[str, list[int]]) -> None:
         self.deltas = deltas

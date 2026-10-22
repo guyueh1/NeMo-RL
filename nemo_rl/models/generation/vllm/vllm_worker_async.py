@@ -736,6 +736,15 @@ class VllmAsyncGenerationWorkerImpl(
             admission = self._capture_admission(request)
             if admission is None:
                 return
+        if self._capture_top_logprobs and (
+            not getattr(request, "logprobs", False)
+            or getattr(request, "top_logprobs", None) != self._capture_top_logprobs
+        ):
+            raise ValueError(
+                "Captured score-centering requests must set logprobs=true and "
+                f"top_logprobs={self._capture_top_logprobs} over HTTP. "
+                "Use a Gym capture adapter that preserves top_logprobs."
+            )
         call = capture.begin_call(
             admission,
             prefix_token_ids=prefix_token_ids,
@@ -1316,16 +1325,6 @@ class VllmAsyncGenerationWorkerImpl(
             # Ledger-authoritative token capture: the call identity the ledger
             # attaches (rollout_id, call_id, parent_call_id, prev_len, mode).
             ng_capture: Optional[dict[str, Any]] = None
-
-            def to_sampling_params(self, *args, **kwargs):
-                params = super().to_sampling_params(*args, **kwargs)
-                # Captured calls also carry the sampler's top-k
-                # (token_capture.top_logprobs). Only the engine's count changes:
-                # the response is still cut at request.top_logprobs (0), so
-                # nothing extra reaches the JSON.
-                if self.ng_capture and worker_self._capture_top_logprobs:
-                    params.logprobs = worker_self._capture_top_logprobs
-                return params
 
         # vLLM 0.25 routes both /v1/chat/completions and /tokenize through
         # OnlineRenderer.preprocess_chat, so the prefix-token override
