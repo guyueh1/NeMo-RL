@@ -1397,6 +1397,25 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "loss_fn.score_centering requires token_capture.top_logprobs > 0"
             )
         generation_cfg = master_config.policy["generation"]
+        temperature = generation_cfg["temperature"]
+        logprobs_mode = (generation_cfg.get("vllm_cfg") or {}).get("logprobs_mode")
+        if logprobs_mode is None:
+            logprobs_mode = (generation_cfg.get("vllm_kwargs") or {}).get(
+                "logprobs_mode"
+            )
+        if temperature <= 0 or not math.isfinite(temperature):
+            raise ValueError(
+                "loss_fn.score_centering requires a finite positive sampling temperature"
+            )
+        if logprobs_mode not in (None, "raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                "loss_fn.score_centering requires log probabilities, not raw/processed logits"
+            )
+        if logprobs_mode != "processed_logprobs" and temperature != 1.0:
+            raise ValueError(
+                "loss_fn.score_centering requires policy.generation.vllm_cfg.logprobs_mode="
+                "processed_logprobs when policy.generation.temperature != 1.0"
+            )
         if (
             generation_cfg.get("top_p") != 1.0
             or generation_cfg.get("top_k") is not None

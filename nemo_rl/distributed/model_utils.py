@@ -1695,7 +1695,7 @@ def get_next_token_logprobs_from_logits(
         next_token_logprobs = torch.nn.functional.log_softmax(
             next_token_logits_wo_last, dim=-1
         )
-        next_tokens = input_ids[:, 1:].cuda()  # Skip first token
+        next_tokens = input_ids[:, 1:].to(next_token_logits.device)  # Skip first token
         logprobs = next_token_logprobs.gather(
             dim=-1, index=next_tokens.unsqueeze(-1)
         ).squeeze(-1)

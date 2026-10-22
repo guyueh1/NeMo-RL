@@ -477,13 +477,18 @@ def test_stage_sampler_topk_rides_the_staged_row(
     k = 3
     staged = {}
     for call_idx, record in enumerate(records):
-        assert sink.stage(record).ok
         generated = int(sum(record.token_mask_delta))
         ids = torch.arange(generated * k, dtype=torch.int32).reshape(generated, k)
         ids = ids + 100 * (call_idx + 1)
         logprobs = -(torch.arange(generated * k, dtype=torch.float32) + 1) / 10
         logprobs = logprobs.reshape(generated, k)
-        sink.stage_sampler_topk(record.staging_key, ids, logprobs)
+        assert sink.stage(
+            record,
+            attachments={
+                "sampler_topk_token_ids": ids,
+                "sampler_topk_logprobs": logprobs,
+            },
+        ).ok
         staged[record.staging_key] = (ids, logprobs)
     keys = [record.staging_key for record in records]
 
@@ -495,13 +500,85 @@ def test_stage_sampler_topk_rides_the_staged_row(
         assert item.sampler_topk[1].dtype == torch.float32
         assert torch.equal(item.sampler_topk[0], ids)
         assert torch.equal(item.sampler_topk[1], logprobs)
-    # The second put left the digest-covered columns untouched.
+    # Auxiliary attachments leave the digest-covered columns untouched.
     assert [item.snapshot.model_dump() for item in fetched] == [
         record.model_dump(exclude={"extras"}) for record in records
     ]
     assert all(
         item.sampler_topk is None for item in source.fetch_for_finalization(keys)
     )
+
+
+def test_sampler_topk_and_media_share_one_put():
+    records, _, _ = build_fixture_artifacts("single_call")
+    sink = object.__new__(TQTokenSink)
+    sink._capture_media = True
+    sink._media_pixel_dtype = torch.bfloat16
+    sink._store = MagicMock()
+    media = _still()
+    ids, logprobs = torch.zeros(1, 2, dtype=torch.int32), torch.zeros(1, 2)
+    assert sink.stage(
+        records[0],
+        attachments={
+            **media,
+            "sampler_topk_token_ids": ids,
+            "sampler_topk_logprobs": logprobs,
+        },
+    ).ok
+    sink._store.put.assert_called_once()
+    fields = sink._store.put.call_args.args[1]
+    assert fields["media_present"].item()
+    torch.testing.assert_close(fields["sampler_topk_token_ids"], ids.unsqueeze(0))
+    torch.testing.assert_close(fields["sampler_topk_logprobs"], logprobs.unsqueeze(0))
+    assert fields["media_imgs"].dtype == media["imgs"].dtype
+    sink._store.clear.assert_not_called()
+
+
+def test_sampler_topk_write_failure_discards_partial_row():
+    records, _, _ = build_fixture_artifacts("single_call")
+    record = records[0]
+    sink = object.__new__(TQTokenSink)
+    sink._capture_media = False
+    sink._store = MagicMock()
+    partial = {}
+
+    def partial_put(key, fields, **kwargs):
+        partial[key] = {"token_ids_delta": fields["token_ids_delta"]}
+        assert "sampler_topk_token_ids" in fields
+        assert "sampler_topk_logprobs" in fields
+        raise RuntimeError("sampler column write failed")
+
+    sink._store.put.side_effect = partial_put
+    sink._store.clear.side_effect = lambda keys: [
+        partial.pop(key, None) for key in keys
+    ]
+    result = sink.stage(
+        record,
+        attachments={
+            "sampler_topk_token_ids": torch.zeros(1, 2, dtype=torch.int32),
+            "sampler_topk_logprobs": torch.zeros(1, 2),
+        },
+    )
+    assert not result.ok
+    assert "sampler column write failed" in result.error
+    sink._store.put.assert_called_once()
+    sink._store.clear.assert_called_once_with([record.staging_key])
+    assert partial == {}
+
+
+@pytest.mark.parametrize("missing", ["sampler_topk_token_ids", "sampler_topk_logprobs"])
+def test_sampler_topk_incomplete_attachments_fail_before_write(missing):
+    records, _, _ = build_fixture_artifacts("single_call")
+    sink = object.__new__(TQTokenSink)
+    sink._capture_media = False
+    sink._store = MagicMock()
+    attachments = {
+        "sampler_topk_token_ids": torch.zeros(1, 2, dtype=torch.int32),
+        "sampler_topk_logprobs": torch.zeros(1, 2),
+    }
+    del attachments[missing]
+    assert not sink.stage(records[0], attachments=attachments).ok
+    sink._store.put.assert_not_called()
 
 
 def test_fetch_topk_fails_for_a_row_without_it(tq_client, staging_partition_with_topk):

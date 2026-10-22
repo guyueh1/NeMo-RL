@@ -924,15 +924,18 @@ class VllmAsyncGenerationWorkerImpl(
         coords vouch for both and any failure is ``capture_failed`` at call
         time. Token ids, logprobs, and routes are stripped after staging, so
         the worker->gate hop carries the completion and coords only.
-        The sampler top-k tensors are stripped before serialization and staged separately.
+        Sampler tensors ride as opaque attachments in that same staging write.
         """
         sampler_topk = None
         for choice in content.get("choices") or []:
             message = choice.get("message")
-            if isinstance(message, dict) and "sampler_topk_token_ids" in message:
+            if isinstance(message, dict) and (
+                "sampler_topk_token_ids" in message
+                or "sampler_topk_logprobs" in message
+            ):
                 sampler_topk = (
-                    message.pop("sampler_topk_token_ids"),
-                    message.pop("sampler_topk_logprobs"),
+                    message.pop("sampler_topk_token_ids", None),
+                    message.pop("sampler_topk_logprobs", None),
                 )
         state = self._capture_calls.pop(id(request), None)
         if state is None:
@@ -962,18 +965,22 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        coords = self.token_capture.complete_call_from_response(
-            call,
-            payload,
-            attachments=state.media.tensors if state.media is not None else None,
-        )
-        if sampler_topk is not None and coords.disposition == "staged":
-            try:
-                self._staging_sink.stage_sampler_topk(coords.staging_key, *sampler_topk)
-            except Exception:  # noqa: BLE001 — the finalizer rejects a row without its top-k
-                LOGGER.exception(
-                    "staging the sampler top-k failed for %s", coords.staging_key
-                )
+        attachments = dict(state.media.tensors) if state.media is not None else {}
+        if sampler_topk is not None:
+            attachments.update(
+                sampler_topk_token_ids=sampler_topk[0],
+                sampler_topk_logprobs=sampler_topk[1],
+            )
+        if self._capture_top_logprobs > 0 and sampler_topk is None:
+            coords = self.token_capture.fail_call(
+                call, reason="missing sampler top-k tensors"
+            )
+        else:
+            coords = self.token_capture.complete_call_from_response(
+                call,
+                payload,
+                attachments=attachments or None,
+            )
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             # Token arrays and delta-aligned routes were staged to TQ above;

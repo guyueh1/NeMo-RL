@@ -51,6 +51,21 @@ if TYPE_CHECKING:
     )
 
 
+def _validate_score_centering_data(data: BatchedDataDict[Any]) -> None:
+    """Reject missing sampler inputs before computing trainer logprobs."""
+    missing = [
+        key
+        for key in ("sampler_topk_token_ids", "sampler_topk_logprobs")
+        if key not in data
+    ]
+    if missing:
+        raise ValueError(
+            f"Score centering requires {', '.join(missing)}: use SingleController "
+            "with NeMo Gym + vLLM, token_capture.enabled=true and "
+            "token_capture.top_logprobs > 0."
+        )
+
+
 def _prepare_opd_full_loss_input(
     logits: torch.Tensor,
     data: BatchedDataDict[Any],
@@ -241,6 +256,8 @@ def prepare_loss_input(
     Returns:
         tuple(loss_input, maybe_updated_data)
     """
+    if getattr(loss_fn, "score_centering", False):
+        _validate_score_centering_data(data)
     if loss_fn.input_type == LossInputType.LOGIT:
         loss_input = {"logits": logits}
 
@@ -499,6 +516,8 @@ def prepare_packed_loss_input(
         "vocab_parallel_rank must be provided with vocab_parallel_group."
     )
 
+    if getattr(loss_fn, "score_centering", False):
+        _validate_score_centering_data(data)
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]
     input_is_prepacked = "cu_seqlens" in data

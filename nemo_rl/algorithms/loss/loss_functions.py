@@ -254,8 +254,8 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     enable_torch_compile: bool = False
     # Score centering (arXiv:2609.20807): per token, add A * sum_v sg(c_v) log p_v
     # over the sampler's top-k ids so the update subtracts the sampler-expected
-    # (TIS-weighted) score. Needs token_capture.top_logprobs > 0; composes only
-    # with importance sampling off or token-level "tis".
+    # weighted score. Needs token_capture.top_logprobs > 0; supports IS off,
+    # token-level untruncated IS, TIS and ICEPOP.
     score_centering: bool = False
 
 
@@ -269,6 +269,8 @@ class ClippedPGLossDataDict(TypedDict):
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
+    sampler_topk_token_ids: NotRequired[torch.Tensor]
+    sampler_topk_logprobs: NotRequired[torch.Tensor]
     __extra__: Any
 
 

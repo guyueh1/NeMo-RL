@@ -46,6 +46,7 @@ from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     ChainPrefixCache,
     StagedPrefix,
+    TQTokenSink,
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
@@ -59,7 +60,6 @@ class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
         self.attachments: list[dict | None] = []
-        self.sampler_topk: list[tuple[str, torch.Tensor, torch.Tensor]] = []
 
     def stage(
         self, record: StagedCallRecord, *, attachments: dict | None = None
@@ -67,13 +67,6 @@ class _MemorySink:
         self.records.append(record)
         self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
-
-    def stage_sampler_topk(
-        self, staging_key, sampler_topk_token_ids, sampler_topk_logprobs
-    ) -> None:
-        self.sampler_topk.append(
-            (staging_key, sampler_topk_token_ids, sampler_topk_logprobs)
-        )
 
 
 def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
@@ -584,7 +577,7 @@ def _content_with_topk(gen_ids, logprobs):
     return content
 
 
-def test_request_capture_stages_topk_after_the_call():
+def test_request_capture_stages_topk_with_the_call():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _text_root_request()
@@ -598,8 +591,10 @@ def test_request_capture_stages_topk_after_the_call():
     )
 
     assert content["ng_commit_coords"]["disposition"] == "staged"
-    # The top-k lands on the staged row's key, after the digest-covered put.
-    assert sink.sampler_topk == [(sink.records[0].staging_key, ids, logprobs)]
+    assert len(sink.records) == 1
+    assert sink.attachments == [
+        {"sampler_topk_token_ids": ids, "sampler_topk_logprobs": logprobs}
+    ]
     # It never crosses the worker -> gate hop.
     assert content["choices"] == [
         {"index": 0, "message": {"role": "assistant", "content": "x"}}
@@ -608,7 +603,8 @@ def test_request_capture_stages_topk_after_the_call():
 
 def test_request_capture_skips_topk_when_the_call_did_not_stage():
     class _RejectingSink(_MemorySink):
-        def stage(self, record: StagedCallRecord) -> StageResult:
+        def stage(self, record: StagedCallRecord, *, attachments=None) -> StageResult:
+            assert attachments["sampler_topk_token_ids"].shape == (1, 2)
             return StageResult(ok=False, staging_key=record.staging_key, error="down")
 
     sink = _RejectingSink()
@@ -621,7 +617,7 @@ def test_request_capture_skips_topk_when_the_call_did_not_stage():
     )
 
     assert content["ng_commit_coords"]["disposition"] == "capture_failed"
-    assert sink.sampler_topk == []
+    assert sink.records == []
     assert "sampler_topk_token_ids" not in content["choices"][0]["message"]
 
 
@@ -636,7 +632,46 @@ def test_request_capture_drops_topk_from_uncaptured_responses():
 
     assert "sampler_topk_token_ids" not in out["choices"][0]["message"]
     assert "sampler_topk_logprobs" not in out["choices"][0]["message"]
-    assert sink.sampler_topk == []
+    assert sink.records == []
+
+
+def test_request_capture_missing_required_topk_fails_before_staging():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _text_root_request()
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    worker._capture_top_logprobs = 2
+    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _served_content([13], [-0.1])
+    )
+    assert out["ng_commit_coords"]["disposition"] == "capture_failed"
+    assert sink.records == []
+    assert worker._capture_calls == {}
+
+
+def test_request_capture_topk_partial_write_returns_capture_failed():
+    sink = object.__new__(TQTokenSink)
+    sink._capture_media = False
+    sink._store = MagicMock()
+
+    def failed_put(key, fields, **kwargs):
+        assert "token_ids_delta" in fields
+        assert "sampler_topk_token_ids" in fields
+        raise RuntimeError("top-k storage unavailable")
+
+    sink._store.put.side_effect = failed_put
+    worker = _worker_with_capture(sink)
+    request = _text_root_request()
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, _content_with_topk([13], [-0.1])
+    )
+    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    sink._store.put.assert_called_once()
+    sink._store.clear.assert_called_once_with(["r0/c1"])
+    assert "sampler_topk_token_ids" not in content["choices"][0]["message"]
+    assert "sampler_topk_logprobs" not in content["choices"][0]["message"]
+    assert worker._capture_calls == {}
 
 
 def test_request_capture_abort_fails_the_call_and_drains_state():

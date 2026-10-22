@@ -30,7 +30,7 @@ digest recomputation over fetched values is byte-exact. Route payloads never
 ride inside snapshots: the source returns them as separate ``RouteFragment``
 values keyed by staging key, digest-verified by the plan executor at point of
 use. With ``token_capture.top_logprobs`` the worker adds two more jagged
-columns to the row after the digest-covered put (``stage_sampler_topk``): the
+columns to the same staging put through the opaque attachment mapping: the
 sampler's top-k ids and log-probs of the call's generated tokens. They are not
 digest-covered; the finalizer checks their shape against the generated length.
 """
@@ -458,7 +458,7 @@ class TQTokenSink:
         *,
         attachments: Mapping[str, Any] | None = None,
     ) -> StageResult:
-        """Write the token row and its media attachments in one ``put``.
+        """Write tokens, media and sampler attachments in one ``put``.
 
         Success is returned only after the combined write was acknowledged,
         so ``staged`` coordinates vouch for tokens and pixels together. TQ has
@@ -472,11 +472,40 @@ class TQTokenSink:
         key = record.staging_key
         write_started = False
         try:
-            if attachments is not None and not self._capture_media:
+            remaining = dict(attachments) if attachments is not None else None
+            sampler_columns: dict[str, torch.Tensor] = {}
+            if remaining is not None and any(
+                key in remaining for key in SAMPLER_TOPK_FIELDS
+            ):
+                if not all(key in remaining for key in SAMPLER_TOPK_FIELDS):
+                    raise ValueError(
+                        "sampler top-k attachments require both IDs and logprobs"
+                    )
+                ids = remaining.pop(SAMPLER_TOPK_TOKEN_IDS_FIELD)
+                logprobs = remaining.pop(SAMPLER_TOPK_LOGPROBS_FIELD)
+                if (
+                    not isinstance(ids, torch.Tensor)
+                    or not isinstance(logprobs, torch.Tensor)
+                    or ids.ndim != 2
+                    or ids.shape != logprobs.shape
+                    or ids.dtype != torch.int32
+                    or logprobs.dtype != torch.float32
+                    or ids.device.type != "cpu"
+                    or logprobs.device.type != "cpu"
+                ):
+                    raise ValueError(
+                        "sampler top-k attachments require matching CPU [T, K] int32 IDs and float32 logprobs"
+                    )
+                sampler_columns = {
+                    SAMPLER_TOPK_TOKEN_IDS_FIELD: ids.unsqueeze(0),
+                    SAMPLER_TOPK_LOGPROBS_FIELD: logprobs.unsqueeze(0),
+                }
+                remaining = remaining or None
+            if remaining is not None and not self._capture_media:
                 raise ValueError(
                     "media attachments require a media-enabled staging partition"
                 )
-            media = validate_media_tensors(attachments)
+            media = validate_media_tensors(remaining)
             media_columns: dict[str, torch.Tensor] | None = None
             if self._capture_media:
                 if self._media_pixel_dtype is None:
@@ -603,6 +632,7 @@ class TQTokenSink:
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
             if media_columns is not None:
                 field_dict.update(media_columns)
+            field_dict.update(sampler_columns)
             tags = [
                 {
                     "rollout_id": record.rollout_id,
@@ -656,27 +686,6 @@ class TQTokenSink:
                 type(error).__name__,
                 error,
             )
-
-    def stage_sampler_topk(
-        self,
-        staging_key: str,
-        sampler_topk_token_ids: torch.Tensor,
-        sampler_topk_logprobs: torch.Tensor,
-    ) -> None:
-        """Add the sampler's top-k (``[generated_len, k]`` ids and log-probs) to a staged row.
-
-        A second put on the same key: TransferQueue merges columns per
-        (sample, field) and keeps the row's tags. Unlike ``stage`` this raises
-        on failure; the caller logs it and the finalizer rejects the rollout
-        when the row lacks the columns.
-        """
-        self._store.put(
-            staging_key,
-            {
-                SAMPLER_TOPK_TOKEN_IDS_FIELD: sampler_topk_token_ids.unsqueeze(0),
-                SAMPLER_TOPK_LOGPROBS_FIELD: sampler_topk_logprobs.unsqueeze(0),
-            },
-        )
 
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""

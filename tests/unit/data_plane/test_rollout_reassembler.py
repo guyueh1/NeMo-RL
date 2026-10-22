@@ -402,7 +402,6 @@ def _stage_fixture_with_topk(
     sink = TQTokenSink(tq_client, staging_partition=STAGING_PARTITION_TOPK)
     fragments = {}
     for call_idx, record in enumerate(records):
-        assert sink.stage(record).ok
         generated = int(sum(record.token_mask_delta))
         ids = torch.arange(generated * TOPK, dtype=torch.int32).reshape(generated, TOPK)
         ids = ids + 100 * (call_idx + 1)
@@ -410,7 +409,13 @@ def _stage_fixture_with_topk(
         logprobs = logprobs.reshape(generated, TOPK) / 10
         if record.model_call_id == short_call:
             ids, logprobs = ids[:-1], logprobs[:-1]
-        sink.stage_sampler_topk(record.staging_key, ids, logprobs)
+        assert sink.stage(
+            record,
+            attachments={
+                "sampler_topk_token_ids": ids,
+                "sampler_topk_logprobs": logprobs,
+            },
+        ).ok
         fragments[record.model_call_id] = (ids, logprobs)
     expected_ids, expected_logprobs = [], []
     for call_id, carry_len, _generation_len in row.link_spans:

@@ -107,8 +107,8 @@ def extract_score_centering_samples(
                 or isinstance(lp, bool)
                 or not isinstance(lp, Real)
                 or not math.isfinite(lp)
-                or lp < min_logprob
-                or lp > 1e-5
+                or float(lp) < min_logprob
+                or float(lp) > 1e-5
             ):
                 raise ValueError("Invalid sampler top-k token id or log probability")
     ranked = [

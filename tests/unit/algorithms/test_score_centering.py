@@ -1,11 +1,73 @@
 """Score-centering weights and masking against full-distribution references."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_score_centering_prepare_loss_input_values_and_gradients():
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import prepare_loss_input
+
+    torch.manual_seed(19)
+    logits = torch.randn(2, 5, 7, requires_grad=True)
+    ids = torch.randint(0, 7, (2, 5, 3))
+    data = BatchedDataDict(
+        {
+            "input_ids": ids[..., 0],
+            "sampler_topk_token_ids": ids,
+            "sampler_topk_logprobs": torch.zeros_like(ids, dtype=torch.float32),
+        }
+    )
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+    prepared, _ = prepare_loss_input(logits, data, loss_fn, chunk_size=2)
+    reference = logits[:, :-1].log_softmax(-1).gather(-1, ids[:, 1:])
+    torch.testing.assert_close(prepared["policy_logprobs_at_sampler_topk"], reference)
+    torch.testing.assert_close(prepared["next_token_logprobs"], reference[..., 0])
+    actual_grad = torch.autograd.grad(
+        prepared["policy_logprobs_at_sampler_topk"].sum(), logits, retain_graph=True
+    )[0]
+    torch.testing.assert_close(
+        actual_grad, torch.autograd.grad(reference.sum(), logits)[0]
+    )
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("missing", ["sampler_topk_token_ids", "sampler_topk_logprobs"])
+def test_score_centering_preparation_rejects_missing_sampler_data(packed, missing):
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import (
+        prepare_loss_input,
+        prepare_packed_loss_input,
+    )
+
+    data = {
+        "input_ids": torch.zeros(1, 4, dtype=torch.long),
+        "sampler_topk_token_ids": torch.zeros(1, 4, 2, dtype=torch.int32),
+        "sampler_topk_logprobs": torch.zeros(1, 4, 2),
+    }
+    del data[missing]
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+    with pytest.raises(
+        ValueError, match=f"{missing}.*SingleController.*token_capture.top_logprobs"
+    ):
+        if packed:
+            prepare_packed_loss_input(
+                torch.randn(1, 4, 7),
+                data,
+                loss_fn,
+                (0, 4),
+                (0, 4),
+                vocab_parallel_rank=0,
+                vocab_parallel_group=object(),
+            )
+        else:
+            prepare_loss_input(torch.randn(1, 4, 7), data, loss_fn)
 
 
 @pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])

@@ -96,10 +96,12 @@ policy:
 ```
 
 `top_logprobs` controls how many candidates are recorded; it does not truncate
-sampling. `max_logprobs` must be at least that count. Use temperature 1 and
+sampling. `max_logprobs` must be at least that count. Use positive temperature and
 `processed_logprobs` to keep the reported sampler probabilities consistent
 with the distribution being sampled. Startup validation checks the top-p and
-top-k filters, but does not currently enforce temperature or logprob mode.
+top-k filters and rejects nonpositive/nonfinite temperatures. Raw/default logprobs
+are accepted only at temperature 1; non-unit temperatures require processed
+logprobs. Other sampling processors must not change the distribution when using raw logprobs.
 
 To enable TIS, replace the four IS settings with:
 
@@ -126,6 +128,9 @@ zero instead of being clamped. Both the head and modeled tail use this rule.
 2. vLLM resolves that request normally. The worker checks that the requested K
    matches its configured capture count and extracts the engine's top-k IDs
    and logprobs before response serialization.
+   Tokens, processed media and sampler tensors are written in one staging
+   operation. A failed write returns `capture_failed` and attempts to discard
+   any partial row before acknowledgement.
 3. The worker stages `sampler_topk_token_ids` as int32 and
    `sampler_topk_logprobs` as float32. It removes the arrays from the HTTP
    response, which retains completion content and capture acknowledgement.
@@ -209,6 +214,14 @@ activity, and zero invalid-row and poisoned-rollout metrics. The
 executed. This smoke does not establish convergence, large-K performance, or
 TP/CP correctness. Separate packed TP/CP unit tests compare values and gradients
 against an unpacked, full-vocabulary reference and require GPUs.
+
+The L1 plan discovers `L1_Functional_Tests_ScoreCentering_Distributed.sh` for
+packed and unpacked TP/CP gradient checks, including TP=2/CP=2. This entrypoint
+requires four visible GPUs and bypasses `tests/run_unit.sh`'s two-GPU mask:
+
+```bash
+uv run --no-sync bash tests/functional/L1_Functional_Tests_ScoreCentering_Distributed.sh
+```
 
 ## Implementation
 

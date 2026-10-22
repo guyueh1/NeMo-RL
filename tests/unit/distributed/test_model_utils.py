@@ -2181,7 +2181,11 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
         cu_seqlens_q=lengths,
         cu_seqlens_q_padded=padded,
     )
-    data = {"input_ids": ids[..., 0], "sampler_topk_token_ids": ids}
+    data = {
+        "input_ids": ids[..., 0],
+        "sampler_topk_token_ids": ids,
+        "sampler_topk_logprobs": torch.zeros_like(ids, dtype=torch.float32),
+    }
     loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
     prepared, _ = prepare_packed_loss_input(
         local,
@@ -2216,10 +2220,6 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
         prepared["next_token_logprobs"] * mask[..., 0], expected[..., 0] * mask[..., 0]
     )
     torch.testing.assert_close(actual * mask, expected * mask, atol=1e-6, rtol=1e-5)
-    if device == "cpu" and cp_size > 1:
-        # The preexisting AllGatherCPTensor backward requires CUDA. CPU runs
-        # can still check the real distributed CP forward and row ordering.
-        return
     ((actual * mask).sum() / cp_size).backward()
     (expected * mask).sum().backward()
     reference_grad = pack_rows(full.grad)
@@ -2228,10 +2228,10 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
     torch.testing.assert_close(local.grad, reference_grad, atol=1e-6, rtol=1e-5)
 
 
-@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2)])
+@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
 def test_score_centering_packed_tp_cp(distributed_test_runner, tp_size, cp_size):
     if torch.cuda.device_count() < tp_size * cp_size:
-        pytest.skip("Packed TP/CP gradient test requires two GPUs")
+        pytest.skip(f"Packed TP/CP gradient test requires {tp_size * cp_size} GPUs")
     distributed_test_runner(
         functools.partial(
             _run_score_centering_packed_equivalence,
