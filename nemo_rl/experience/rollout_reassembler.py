@@ -438,7 +438,9 @@ class RolloutReassembler:
             ids_parts: list[torch.Tensor] = []
             logprob_parts: list[torch.Tensor] = []
             for call_id, carry_len, generation_len in row.link_spans:
-                fragment_ids, fragment_logprobs = fetched_by_call[call_id].sampler_topk
+                sampler_topk = fetched_by_call[call_id].sampler_topk
+                assert sampler_topk is not None
+                fragment_ids, fragment_logprobs = sampler_topk
                 expected_shape = (generation_len, self._top_logprobs)
                 if (
                     tuple(fragment_ids.shape) != expected_shape
@@ -849,6 +851,9 @@ class RolloutReassembler:
             logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
             sample_mask[i] = float(loss_multiplier)
             if sampler_topk_token_ids is not None:
+                assert sampler_topk_logprobs is not None
+                assert row.sampler_topk_token_ids is not None
+                assert row.sampler_topk_logprobs is not None
                 sampler_topk_token_ids[i, :length] = row.sampler_topk_token_ids
                 sampler_topk_logprobs[i, :length] = row.sampler_topk_logprobs
 
