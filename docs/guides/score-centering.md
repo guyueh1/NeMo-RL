@@ -1,0 +1,185 @@
+# Score Centering
+
+Score centering adds a correction to the policy-gradient objective when the
+rollout sampler and training policy assign different probabilities to tokens.
+Enable it with `loss_fn.score_centering: true`; it is disabled by default.
+
+The current rollout integration requires SingleController, NeMo Gym, vLLM, and
+token capture with a positive top-k logprob count. The functional test uses
+Megatron training. This feature is experimental: distributed integration and
+training convergence need validation for the intended model and layout.
+
+## Objective
+
+Let `p(v)` be the current training policy, `q(v)` the rollout sampler, and `H`
+the sampler's top-k token set at one generated position. The sampler supplies
+both token IDs and logprobs for `H`. The trainer computes its own logprobs at
+those same IDs, normalized over the full vocabulary rather than just `H`.
+
+The estimator models the unobserved sampler tail as a rescaled training-policy
+tail:
+
+```text
+rho = (1 - sum_H q(v)) / max(1 - sum_H p(v), 1e-6)
+q(v) ≈ rho * p(v) outside H
+```
+
+The per-token correction is:
+
+```text
+C = sum_H stop_gradient(m(v) - alpha * p(v)) * log p(v)
+L = L_base + A * C
+```
+
+Here `A` is the token advantage and `L_base` is the existing actor objective,
+including its clipping and configured importance-sampling correction. The
+coefficients depend on the importance-sampling mode:
+
+| Mode | Head mass `m(v)` | Tail coefficient `alpha` |
+|---|---|---|
+| IS off | `q(v)` | `rho` |
+| Token-level TIS with bounds `[lo, hi]` | `clamp(p(v), lo*q(v), hi*q(v))` | `clamp(1, lo*rho, hi*rho)` |
+
+Only `log p(v)` carries gradients through this correction. The captured head
+retains its original probability mass; it is not renormalized to one. The loss
+applies the existing token/sample masks and normalization to `A * C`.
+
+This implementation adds a correction to the existing clipped objective; it
+does not replace it with centered REINFORCE or exactly center every possible
+PPO clipped gradient. In particular, the ordinary sampled-token IS ratio uses
+the previous policy, while the head correction uses the current policy.
+`force_on_policy_ratio: true` selects the detached current policy for the
+ordinary ratio and requires one optimizer update per rollout batch.
+
+## Configuration
+
+Apply these settings to a SingleController NeMo Gym GRPO configuration with
+the TransferQueue data plane and async vLLM serving already configured:
+
+```yaml
+loss_fn:
+  score_centering: true
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_ratio: null
+
+token_capture:
+  enabled: true
+  top_logprobs: 16
+
+policy:
+  sequence_packing:
+    enabled: false
+    fuse_loss: false
+  logprob_chunk_size: 128
+  megatron_cfg:
+    enabled: true
+    use_fused_linear_logprobs: false
+  generation:
+    backend: vllm
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    vllm_cfg:
+      async_engine: true
+      logprobs_mode: processed_logprobs
+    vllm_kwargs:
+      max_logprobs: 16
+```
+
+`top_logprobs` controls how many candidates are recorded; it does not truncate
+sampling. `max_logprobs` must be at least that count. Use temperature 1 and
+`processed_logprobs` to keep the reported sampler probabilities consistent
+with the distribution being sampled. Startup validation checks the top-p and
+top-k filters, but does not currently enforce temperature or logprob mode.
+
+To enable TIS, replace the four IS settings with:
+
+```yaml
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio_min: 0.5
+  truncated_importance_sampling_ratio: 2.0
+```
+
+Untruncated IS, ICEPOP, `seq-mask-tis`, and sequence-level IS are currently
+rejected when score centering is enabled, even though the ordinary loss
+supports them.
+
+## Data Flow
+
+1. NeMo-RL configures Gym to send `logprobs=true, top_logprobs=K` in each policy
+   HTTP request. The Gym capture adapter preserves the explicit count.
+2. vLLM resolves that request normally. The worker checks that the requested K
+   matches its configured capture count and extracts the engine's top-k IDs
+   and logprobs before response serialization.
+3. The worker stages `sampler_topk_token_ids` as int32 and
+   `sampler_topk_logprobs` as float32. It removes the arrays from the HTTP
+   response, which retains completion content and capture acknowledgement.
+4. The CPU finalizer checks fragment shapes, assembles token-aligned rollout
+   columns, and fills prompt/tool positions with zeros.
+5. The policy replica leader fetches the columns and broadcasts them to its
+   model-parallel workers. The trainer gathers differentiable
+   `policy_logprobs_at_sampler_topk`, aligned with the next-token predictions.
+6. `ClippedPGLossFn` uses those trainer logprobs and the sampler logprobs to
+   compute the correction.
+
+This requires the Gym capture adapter version pinned by this feature. An older
+adapter that overwrites `top_logprobs` with zero is rejected by the worker.
+The fields above are separate from the teacher/student top-k tensors used by
+on-policy distillation.
+
+## Supported Layouts and Costs
+
+- Megatron's ordinary loss preparation supports tensor/context parallel
+  top-k gathering. Single-device logits are also supported by the helper.
+- `sequence_packing.fuse_loss=true` is unsupported: packed loss preparation
+  does not produce the trainer top-k logprobs, and the loss assertion fails.
+  The example disables packing to use the ordinary preparation path.
+- Automodel context-parallel sharding and DTensor logits are unsupported.
+- Full-vocabulary on-policy distillation and fused linear logprobs are
+  rejected because this path needs ordinary vocabulary logits.
+- Extraction checks the candidate count and floors very negative logprobs to
+  `-9999`; it does not yet reject all malformed probability values or validate
+  that the head mass is at most one. NaN/Inf safety at masked positions needs
+  further hardening.
+
+Storage and transport grow linearly with K. IDs and sampler logprobs alone use
+`8 * T * K` bytes for T token positions, excluding copies, padding, metadata,
+and trainer tensors. At 32K positions this is 32 MiB for K=128 or 256 MiB for
+K=1024. Avoiding HTTP serialization removes JSON overhead; CPU staging,
+finalization, data-plane transport, replica broadcast, and trainer gathers
+still carry the top-k data. Large-K performance has not been benchmarked.
+
+## Functional Test
+
+In the configured NeMo-RL GPU environment, run:
+
+```bash
+uv run --no-sync bash tests/functional/grpo_score_centering_gym_single_controller.sh
+```
+
+The test adapts the existing SingleController Gym token-capture smoke. It
+requires two GPUs, the Gym dependencies, model/data access, and `HF_TOKEN` for
+the Workplace Assistant data preparation. It runs three training steps each
+with IS off and token-level TIS, using Qwen3-0.6B, Megatron, and async vLLM.
+It is registered in the full `L1_Functional_Tests_SingleController_3.sh` suite.
+
+The checks require three loss/head-mass records, finite loss and gradient
+norms, positive valid-token counts, head mass in `(0, 1.0001]`, finalizer
+activity, and zero invalid-row and poisoned-rollout metrics. The
+`train/score_centering_head_mass` metric proves the score-centering loss path
+executed. This smoke does not establish convergence, large-K performance, or
+TP/CP correctness.
+
+## Implementation
+
+- [Shared correction utility](../../nemo_rl/algorithms/loss/score_centering.py)
+- [Clipped policy-gradient loss](../../nemo_rl/algorithms/loss/loss_functions.py)
+- [Trainer top-k gather](../../nemo_rl/distributed/model_utils.py)
+- [Functional test](../../tests/functional/grpo_score_centering_gym_single_controller.sh)
+- [GRPO guide](grpo.md)
