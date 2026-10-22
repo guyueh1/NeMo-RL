@@ -22,6 +22,7 @@ def test_score_centering_request_and_sample_contract():
 
     output = SimpleNamespace(
         index=0,
+        token_ids=[9, 3],
         logprobs=[
             {
                 # The generated token is outside the head and arrives first.
@@ -47,7 +48,7 @@ def test_score_centering_request_and_sample_contract():
     assert sampler_ids.device.type == sampler_logprobs.device.type == "cpu"
     assert sampler_ids.tolist() == [[1, 2], [3, 4]]
     torch.testing.assert_close(
-        sampler_logprobs, torch.tensor([[-0.3, -1.8], [-0.1, -9999.0]])
+        sampler_logprobs, torch.tensor([[-0.3, -1.8], [-0.1, -10000.0]])
     )
     # The retained logprobs describe the full sampler distribution, not a
     # distribution renormalized over the chosen candidates.
@@ -57,7 +58,7 @@ def test_score_centering_request_and_sample_contract():
 @pytest.mark.parametrize("logprobs", [None, []])
 def test_score_centering_empty_completion(logprobs):
     sampler_ids, sampler_logprobs = extract_score_centering_samples(
-        SimpleNamespace(index=0, logprobs=logprobs), num_candidates=2
+        SimpleNamespace(index=0, token_ids=[], logprobs=logprobs), num_candidates=2
     )
     assert sampler_ids.shape == sampler_logprobs.shape == (0, 2)
     assert sampler_ids.dtype == torch.int32
@@ -66,7 +67,7 @@ def test_score_centering_empty_completion(logprobs):
 
 def test_score_centering_rejects_incomplete_candidates():
     output = SimpleNamespace(
-        index=0, logprobs=[{1: SimpleNamespace(rank=1, logprob=-0.1)}]
+        index=0, token_ids=[1], logprobs=[{1: SimpleNamespace(rank=1, logprob=-0.1)}]
     )
     with pytest.raises(RuntimeError, match="fewer than top_k"):
         extract_score_centering_samples(output, num_candidates=2)
@@ -86,3 +87,49 @@ def test_score_centering_rejects_inconsistent_request(request_fields):
 def test_score_centering_rejects_zero_candidates():
     with pytest.raises(ValueError, match="candidate count must be positive"):
         build_score_centering_request_overrides(num_candidates=0)
+
+
+@pytest.mark.parametrize(
+    ("token_id", "logprob"),
+    [
+        (-1, -1.0),
+        (True, -1.0),
+        (2**31, -1.0),
+        (1, float("nan")),
+        (1, float("inf")),
+        (1, -float("inf")),
+        (1, 0.1),
+        (1, True),
+        (1, -1e300),
+    ],
+)
+def test_score_centering_rejects_invalid_probabilities(token_id, logprob):
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[1],
+        logprobs=[{token_id: SimpleNamespace(rank=1, logprob=logprob)}],
+    )
+    with pytest.raises(ValueError, match="Invalid sampler"):
+        extract_score_centering_samples(output, num_candidates=1)
+
+
+def test_score_centering_rejects_excess_probability_mass():
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[1],
+        logprobs=[
+            {
+                1: SimpleNamespace(rank=1, logprob=-0.1),
+                2: SimpleNamespace(rank=2, logprob=-0.1),
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="exceed unit mass"):
+        extract_score_centering_samples(output, num_candidates=2)
+
+
+def test_score_centering_rejects_missing_logprob_rows():
+    with pytest.raises(RuntimeError, match="generated token count"):
+        extract_score_centering_samples(
+            SimpleNamespace(index=0, token_ids=[1], logprobs=None), num_candidates=1
+        )

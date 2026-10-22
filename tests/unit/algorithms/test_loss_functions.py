@@ -3564,8 +3564,8 @@ def _expected_gradient_under_sampler(loss_fn, z, q, head):
     return expected, metrics
 
 
-@pytest.mark.parametrize("importance_sampling", [False, True])
-def test_score_centering_cancels_the_drift_under_the_sampler(importance_sampling):
+@pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
+def test_score_centering_cancels_the_drift_under_the_sampler(mode):
     """With the switch on, the sampler-expected update is zero under a constant advantage.
 
     That is the paper's defining property: a constant advantage carries no
@@ -3574,16 +3574,19 @@ def test_score_centering_cancels_the_drift_under_the_sampler(importance_sampling
     z, q, head = _score_centering_distributions(12, seed=0)
     common = dict(
         reference_policy_kl_penalty=0.0,
-        use_importance_sampling_correction=importance_sampling,
-        truncated_importance_sampling_type="tis" if importance_sampling else None,
-        truncated_importance_sampling_ratio=5.0 if importance_sampling else None,
-        truncated_importance_sampling_ratio_min=0.2 if importance_sampling else None,
+        use_importance_sampling_correction=mode != "off",
+        truncated_importance_sampling_type=mode if mode in ("tis", "icepop") else None,
+        truncated_importance_sampling_ratio=5.0 if mode in ("tis", "icepop") else None,
+        truncated_importance_sampling_ratio_min=0.2
+        if mode in ("tis", "icepop")
+        else None,
     )
     plain = ClippedPGLossFn(ClippedPGLossConfig(**common))
     centered = ClippedPGLossFn(ClippedPGLossConfig(score_centering=True, **common))
 
     drift, _ = _expected_gradient_under_sampler(plain, z, q, head)
-    assert drift.abs().max() > 1e-3
+    if mode != "is":
+        assert drift.abs().max() > 1e-3
 
     cancelled, metrics = _expected_gradient_under_sampler(centered, z, q, head)
     torch.testing.assert_close(cancelled, torch.zeros_like(z), atol=1e-9, rtol=0.0)
@@ -3600,8 +3603,8 @@ def test_score_centering_cancels_the_drift_under_the_sampler(importance_sampling
     [
         dict(
             use_importance_sampling_correction=True,
-            truncated_importance_sampling_type="icepop",
-            truncated_importance_sampling_ratio=5.0,
+            truncated_importance_sampling_type="seq-mask-tis",
+            truncated_importance_sampling_ratio=2.0,
             truncated_importance_sampling_ratio_min=0.5,
         ),
         dict(
@@ -3609,7 +3612,6 @@ def test_score_centering_cancels_the_drift_under_the_sampler(importance_sampling
             sequence_level_importance_ratios=True,
             token_level_loss=False,
         ),
-        dict(use_importance_sampling_correction=True),
     ],
 )
 def test_score_centering_rejects_unsupported_importance_sampling(overrides):

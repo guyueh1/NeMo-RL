@@ -1,5 +1,5 @@
 #!/bin/bash
-# Reuse the two-GPU SC+Gym capture smoke for both supported IS configurations.
+# Reuse the two-GPU SC+Gym capture smoke for all supported token-level IS modes.
 # One GPU trains Qwen3-0.6B with Megatron and one serves async vLLM.
 set -euo pipefail
 
@@ -9,7 +9,7 @@ BASE_TEST=$SCRIPT_DIR/grpo_async_gym_single_controller.sh
 
 cd "$PROJECT_ROOT"
 
-for IS_MODE in off tis; do
+for IS_MODE in off is tis icepop; do
     EXP_NAME=grpo_score_centering_gym_single_controller_$IS_MODE
     EXP_DIR=$SCRIPT_DIR/$EXP_NAME
     IS_OVERRIDES=(
@@ -18,10 +18,14 @@ for IS_MODE in off tis; do
         ++loss_fn.truncated_importance_sampling_ratio_min=null
         loss_fn.truncated_importance_sampling_ratio=null
     )
-    if [[ "$IS_MODE" == tis ]]; then
+    PACK_LOSS=false
+    if [[ "$IS_MODE" == is ]]; then
+        IS_OVERRIDES[0]=loss_fn.use_importance_sampling_correction=true
+    elif [[ "$IS_MODE" == tis || "$IS_MODE" == icepop ]]; then
+        PACK_LOSS=true
         IS_OVERRIDES=(
             loss_fn.use_importance_sampling_correction=true
-            ++loss_fn.truncated_importance_sampling_type=tis
+            ++loss_fn.truncated_importance_sampling_type=$IS_MODE
             ++loss_fn.truncated_importance_sampling_ratio_min=0.5
             loss_fn.truncated_importance_sampling_ratio=2.0
         )
@@ -38,8 +42,8 @@ for IS_MODE in off tis; do
         ++loss_fn.force_on_policy_ratio=true \
         loss_fn.reference_policy_kl_penalty=0 \
         grpo.skip_reference_policy_logprobs_calculation=true \
-        policy.sequence_packing.enabled=false \
-        ++policy.sequence_packing.fuse_loss=false \
+        policy.sequence_packing.enabled=$PACK_LOSS \
+        ++policy.sequence_packing.fuse_loss=$PACK_LOSS \
         ++policy.megatron_cfg.use_fused_linear_logprobs=false \
         policy.logprob_chunk_size=128 \
         policy.generation.temperature=1.0 \

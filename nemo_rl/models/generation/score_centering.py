@@ -20,6 +20,8 @@ pair of sampler token IDs and their sampler logprobs. Staging consumes this
 tensor contract regardless of how the candidates were selected.
 """
 
+import math
+from numbers import Real
 from typing import Any, TypedDict
 
 import torch
@@ -92,6 +94,23 @@ def extract_score_centering_samples(
     """
     if num_candidates <= 0:
         raise ValueError("Score-centering candidate count must be positive")
+    if len(output.logprobs or []) != len(output.token_ids):
+        raise RuntimeError("Sampler top-k rows must match the generated token count")
+    max_token_id = torch.iinfo(torch.int32).max
+    min_logprob = torch.finfo(torch.float32).min
+    for position in output.logprobs or []:
+        for token_id, entry in position.items():
+            lp = entry.logprob
+            if (
+                type(token_id) is not int
+                or not 0 <= token_id <= max_token_id
+                or isinstance(lp, bool)
+                or not isinstance(lp, Real)
+                or not math.isfinite(lp)
+                or lp < min_logprob
+                or lp > 1e-5
+            ):
+                raise ValueError("Invalid sampler top-k token id or log probability")
     ranked = [
         sorted(position.items(), key=lambda item: item[1].rank)[:num_candidates]
         for position in output.logprobs or []
@@ -102,16 +121,18 @@ def extract_score_centering_samples(
             f"while extracting score-centering samples: choice_idx={output.index}, "
             f"top_k={num_candidates}."
         )
+    for row in ranked:
+        if len({token_id for token_id, _ in row}) != num_candidates:
+            raise ValueError("Sampler top-k token ids must be unique")
+        if sum(math.exp(entry.logprob) for _, entry in row) > 1.0001:
+            raise ValueError("Sampler top-k probabilities exceed unit mass")
     sampler_ids = torch.tensor(
         [[token_id for token_id, _ in row] for row in ranked],
         dtype=torch.int32,
         device="cpu",
     ).reshape(-1, num_candidates)
     sampler_logprobs = torch.tensor(
-        [
-            [max(float(entry.logprob), VLLM_LOGPROB_FLOOR) for _, entry in row]
-            for row in ranked
-        ],
+        [[float(entry.logprob) for _, entry in row] for row in ranked],
         dtype=torch.float32,
         device="cpu",
     ).reshape(-1, num_candidates)

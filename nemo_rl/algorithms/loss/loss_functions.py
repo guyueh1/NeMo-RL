@@ -519,21 +519,24 @@ class ClippedPGLossFn(LossFunction):
             )
             assert not self.sequence_level_importance_ratios and (
                 not self.use_importance_sampling_correction
-                or self.truncated_importance_sampling_type == "tis"
+                or self.truncated_importance_sampling_type in (None, "tis", "icepop")
             ), (
                 "score_centering composes only with importance sampling off or "
-                "token-level 'tis' (the sampler-expected weighted score has a closed "
-                "form there)"
+                "token-level untruncated IS, 'tis', or 'icepop'"
             )
-        # Bounds of the token-level TIS clamp; they set the effective centering mass.
-        self._score_centering_is_bounds = (
-            (
+        self._score_centering_is_mode = (
+            (self.truncated_importance_sampling_type or "is")
+            if self.use_importance_sampling_correction
+            else "off"
+        )
+        # Bounds set the effective head and tail masses for TIS/ICEPOP.
+        self._score_centering_is_bounds: tuple[float, float] | None = None
+        if self.score_centering and self._score_centering_is_mode in ("tis", "icepop"):
+            assert self.truncated_importance_sampling_ratio is not None
+            self._score_centering_is_bounds = (
                 self.truncated_importance_sampling_ratio_min or 0.0,
                 self.truncated_importance_sampling_ratio,
             )
-            if self.score_centering and self.use_importance_sampling_correction
-            else None
-        )
 
         # Advertise, per returned metric, the global denominator it was
         # normalized by (see MetricNormalizer). Built here — next to the flags
@@ -749,6 +752,22 @@ class ClippedPGLossFn(LossFunction):
         # rows without response loss tokens.
         sample_mask = sample_mask * token_mask.bool().any(dim=-1)
         mask = token_mask * sample_mask.unsqueeze(-1)
+        if self.score_centering:
+            # Mask before exponentiation: multiplying NaNs by zero afterwards
+            # cannot prevent contamination of either the loss or its gradient.
+            active = mask.bool()
+            curr_logprobs = torch.where(active, curr_logprobs, 0.0)
+            generation_logprobs = torch.where(active, generation_logprobs, 0.0)
+            advantages = torch.where(active, advantages.detach(), 0.0)
+            if prev_logprobs is not None:
+                prev_logprobs = torch.where(active, prev_logprobs, 0.0)
+            if self.reference_policy_kl_penalty != 0:
+                reference_policy_logprobs = torch.where(
+                    active, reference_policy_logprobs, 0.0
+                )
+                curr_logprobs_unfiltered = torch.where(
+                    active, curr_logprobs_unfiltered, 0.0
+                )
         full_metrics = self.metrics_level == "full"
         need_importance_weights = (
             full_metrics or self.use_importance_sampling_correction
@@ -1064,7 +1083,9 @@ class ClippedPGLossFn(LossFunction):
             centering, head_mass = compute_score_centering_term(
                 policy_logprobs_at_sampler_topk,
                 sampler_topk_logprobs=data["sampler_topk_logprobs"][:, 1:],
-                tis_bounds=self._score_centering_is_bounds,
+                importance_sampling_mode=self._score_centering_is_mode,
+                is_bounds=self._score_centering_is_bounds,
+                token_mask=mask,
             )
             correction = advantages * centering
             if self.loss_type == LossType.TOKEN_LEVEL:

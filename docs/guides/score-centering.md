@@ -38,11 +38,16 @@ coefficients depend on the importance-sampling mode:
 | Mode | Head mass `m(v)` | Tail coefficient `alpha` |
 |---|---|---|
 | IS off | `q(v)` | `rho` |
+| Untruncated token-level IS | `p(v)` | `1` |
 | Token-level TIS with bounds `[lo, hi]` | `clamp(p(v), lo*q(v), hi*q(v))` | `clamp(1, lo*rho, hi*rho)` |
+| Token-level ICEPOP with bounds `[lo, hi]` | `p(v)` if `p(v)/q(v)` is in bounds, otherwise `0` | `1` if `1/rho` is in bounds, otherwise `0` |
 
 Only `log p(v)` carries gradients through this correction. The captured head
 retains its original probability mass; it is not renormalized to one. The loss
 applies the existing token/sample masks and normalization to `A * C`.
+Masked logprobs are neutralized before exponentiation. An ICEPOP rejection of
+the sampled token does not mask the head/tail correction. Under untruncated
+IS, the head and tail coefficients cancel and the correction is zero.
 
 This implementation adds a correction to the existing clipped objective; it
 does not replace it with centered REINFORCE or exactly center every possible
@@ -106,9 +111,11 @@ loss_fn:
   truncated_importance_sampling_ratio: 2.0
 ```
 
-Untruncated IS, ICEPOP, `seq-mask-tis`, and sequence-level IS are currently
-rejected when score centering is enabled, even though the ordinary loss
-supports them.
+For untruncated IS, set `use_importance_sampling_correction: true` and leave
+the truncation type and both bounds `null`. For ICEPOP, use the TIS example
+with `truncated_importance_sampling_type: icepop`; out-of-bounds weights become
+zero instead of being clamped. Both the head and modeled tail use this rule.
+`seq-mask-tis` and sequence-level IS remain unsupported with score centering.
 
 ## Data Flow
 
@@ -156,16 +163,19 @@ sampling without replacement or change the current top-k estimator.
 
 - Megatron's ordinary loss preparation supports tensor/context parallel
   top-k gathering. Single-device logits are also supported by the helper.
-- `sequence_packing.fuse_loss=true` is unsupported: packed loss preparation
-  does not produce the trainer top-k logprobs, and the loss assertion fails.
-  The example disables packing to use the ordinary preparation path.
+- Internal sequence packing supports `sequence_packing.fuse_loss=true`:
+  sampler IDs are packed and shifted per sequence, TP gathers the full-vocabulary
+  logprobs, and CP shards are reconstructed separately for each padded sequence.
+  Externally prepacked inputs are rejected. The example above uses the ordinary
+  unpacked path; enable both packing and `fuse_loss` for the packed path.
 - Automodel context-parallel sharding and DTensor logits are unsupported.
 - Full-vocabulary on-policy distillation and fused linear logprobs are
   rejected because this path needs ordinary vocabulary logits.
-- Extraction checks the candidate count and floors very negative logprobs to
-  `-9999`; it does not yet reject all malformed probability values or validate
-  that the head mass is at most one. NaN/Inf safety at masked positions needs
-  further hardening.
+- Extraction checks the generated-token count, candidate count, unique IDs,
+  nonnegative int32-compatible IDs, finite float32-representable logprobs, logprobs no larger
+  than `1e-5`, and head mass no larger than `1.0001`. Finite sampler logprobs
+  are preserved without flooring or renormalization. These checks apply before
+  staging; ignored prompt/tool positions are still zero-filled by the finalizer.
 
 Storage and transport grow linearly with K. IDs and sampler logprobs alone use
 `8 * T * K` bytes for T token positions, excluding copies, padding, metadata,
@@ -185,7 +195,9 @@ uv run --no-sync bash tests/functional/grpo_score_centering_gym_single_controlle
 The test adapts the existing SingleController Gym token-capture smoke. It
 requires two GPUs, the Gym dependencies, model/data access, and `HF_TOKEN` for
 the Workplace Assistant data preparation. It runs three training steps each
-with IS off and token-level TIS, using Qwen3-0.6B, Megatron, and async vLLM.
+with IS off, untruncated IS, TIS, and ICEPOP, using Qwen3-0.6B, Megatron, and
+async vLLM. TIS and ICEPOP enable internal packing with `fuse_loss=true`; the
+other two modes use unpacked preparation.
 It is registered in the full `L1_Functional_Tests_SingleController_3.sh` suite.
 
 The checks require three loss/head-mass records, finite loss and gradient
@@ -193,7 +205,8 @@ norms, positive valid-token counts, head mass in `(0, 1.0001]`, finalizer
 activity, and zero invalid-row and poisoned-rollout metrics. The
 `train/score_centering_head_mass` metric proves the score-centering loss path
 executed. This smoke does not establish convergence, large-K performance, or
-TP/CP correctness.
+TP/CP correctness. Separate packed TP/CP unit tests compare values and gradients
+against an unpacked, full-vocabulary reference and require GPUs.
 
 ## Implementation
 

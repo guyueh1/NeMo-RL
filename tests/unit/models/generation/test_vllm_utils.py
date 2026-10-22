@@ -679,12 +679,12 @@ def test_attach_sampler_topk_logprobs_to_chat_response_choices():
                 index=0,
                 token_ids=[7, 9, 5],
                 logprobs=[
-                    # Sampled token inside the top-2: exactly k entries; the floor applies.
+                    # Sampled token inside the top-2: exactly k entries; finite logprobs are retained.
                     _ranked((7, -0.2, 1), (8, -10000.0, 2)),
                     # Sampled token outside the top-2: k + 1 entries, ranks pick the head.
-                    _ranked((9, -3.0, 7), (1, -0.1, 1), (2, -0.9, 2)),
+                    _ranked((9, -3.0, 7), (1, -0.7, 1), (2, -0.9, 2)),
                     # A tie at the boundary still yields exactly k entries.
-                    _ranked((5, -0.7, 2), (3, -0.3, 1), (4, -0.7, 2)),
+                    _ranked((5, -1.2, 2), (3, -0.8, 1), (4, -1.2, 2)),
                 ],
             ),
             SimpleNamespace(index=1, token_ids=[], logprobs=[]),
@@ -707,7 +707,7 @@ def test_attach_sampler_topk_logprobs_to_chat_response_choices():
     assert logprobs.dtype == torch.float32
     assert ids.tolist() == [[7, 8], [1, 2], [3, 5]]
     torch.testing.assert_close(
-        logprobs, torch.tensor([[-0.2, -9999.0], [-0.1, -0.9], [-0.3, -0.7]])
+        logprobs, torch.tensor([[-0.2, -10000.0], [-0.7, -0.9], [-0.8, -1.2]])
     )
     empty = response_dict["choices"][1]["message"]
     assert tuple(empty["sampler_topk_token_ids"].shape) == (0, 2)

@@ -1711,6 +1711,8 @@ def get_policy_logprobs_at_sampler_topk(
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
+    cu_seqlens_q: Optional[CpuIntTuple] = None,
+    cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
 ) -> torch.Tensor:
     """Next-token log-probs at each position's sampler top-k ids.
 
@@ -1731,6 +1733,9 @@ def get_policy_logprobs_at_sampler_topk(
         chunk_size: Sequence-dim chunk size for the vocab-parallel path
             (policy.logprob_chunk_size); the whole sequence when None.
         cp_sharder: Automodel context-parallel sharder; not supported here.
+        cu_seqlens_q: CPU unpadded boundaries for internally packed rows.
+        cu_seqlens_q_padded: CPU padded boundaries for those same rows.
+            With packing, CP shards are reconstructed separately per sequence.
 
     Returns:
         Log-probs ``[B, S - 1, k]``.
@@ -1741,46 +1746,113 @@ def get_policy_logprobs_at_sampler_topk(
         raise NotImplementedError(
             "score centering supports the Megatron vocab-parallel and single-device paths"
         )
-    target = sampler_topk_token_ids.to(
-        device=next_token_logits.device, dtype=torch.int64
-    )
-    target = target.roll(shifts=-1, dims=1)
-    if vocab_parallel_group is None:
-        logprobs = torch.nn.functional.log_softmax(
-            next_token_logits.to(torch.float32), dim=-1
+    if (cu_seqlens_q is None) != (cu_seqlens_q_padded is None):
+        raise ValueError(
+            "Both packed sequence boundary tuples must be supplied together"
         )
-        return logprobs.gather(dim=-1, index=target)[:, :-1]
-
-    assert vocab_parallel_rank is not None, (
-        "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+    if chunk_size is None:
+        chunk_size = int(next_token_logits.shape[1])
+    sampler_topk_token_ids = sampler_topk_token_ids.to(
+        device=next_token_logits.device, dtype=torch.long
     )
-    vocab_part_size = int(next_token_logits.shape[-1])
     cp_size = (
         1
         if context_parallel_group is None
         else torch.distributed.get_world_size(context_parallel_group)
     )
-    pad_len = next_token_logits.shape[1] * cp_size - target.shape[1]
-    if pad_len > 0:
-        target = torch.nn.functional.pad(target, (0, 0, 0, pad_len), value=0)
-    cp_rank = torch.distributed.get_rank(context_parallel_group)
-    target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
-    logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
-        next_token_logits,
-        target,
-        vocab_parallel_rank * vocab_part_size,
-        (vocab_parallel_rank + 1) * vocab_part_size,
-        chunk_size if chunk_size is not None else int(next_token_logits.shape[1]),
-        vocab_parallel_group,
-        False,
+    cp_rank = (
+        0
+        if context_parallel_group is None
+        else torch.distributed.get_rank(context_parallel_group)
     )
-    if cp_size > 1:
-        logprobs = allgather_cp_sharded_tensor(
-            logprobs, context_parallel_group, seq_dim=1
+    if cu_seqlens_q is not None:
+        from nemo_rl.algorithms.loss.utils import _pack_input_ids
+
+        assert cu_seqlens_q_padded is not None
+        targets = torch.stack(
+            [
+                _pack_input_ids(
+                    sampler_topk_token_ids[..., i],
+                    cu_seqlens_q,
+                    cu_seqlens_q_padded,
+                    cp_rank=cp_rank,
+                    cp_size=cp_size,
+                    roll_shift=-1,
+                )
+                for i in range(sampler_topk_token_ids.shape[-1])
+            ],
+            dim=-1,
         )
-    if pad_len > 0:
-        logprobs = logprobs[:, :-pad_len]
-    return logprobs[:, :-1]
+    else:
+        full_width = next_token_logits.shape[1] * cp_size
+        if sampler_topk_token_ids.shape[1] > full_width:
+            raise ValueError(
+                "Sampler top-k sequence is longer than trainer next_token_logits"
+            )
+        padding = sampler_topk_token_ids.new_zeros(
+            sampler_topk_token_ids.shape[0],
+            full_width - sampler_topk_token_ids.shape[1],
+            sampler_topk_token_ids.shape[-1],
+        )
+        targets = torch.cat([sampler_topk_token_ids, padding], dim=1).roll(-1, dims=1)
+        if cp_size > 1:
+            targets = _get_tokens_on_this_cp_rank(targets, cp_rank, cp_size, seq_dim=1)
+
+    if vocab_parallel_group is not None:
+        assert vocab_parallel_rank is not None
+        local_vocab = next_token_logits.shape[-1]
+        head = ChunkedDistributedGatherLogprob.apply(
+            next_token_logits,
+            targets,
+            vocab_parallel_rank * local_vocab,
+            (vocab_parallel_rank + 1) * local_vocab,
+            chunk_size,
+            vocab_parallel_group,
+            False,
+        )
+    else:
+        # CPU/reference path: sequence chunking bounds the temporary FP32 vocab.
+        head = torch.cat(
+            [
+                next_token_logits[:, start : start + chunk_size]
+                .float()
+                .log_softmax(-1)
+                .gather(-1, targets[:, start : start + chunk_size])
+                for start in range(0, next_token_logits.shape[1], chunk_size)
+            ],
+            dim=1,
+        )
+
+    if cu_seqlens_q is None:
+        if cp_size > 1:
+            head = allgather_cp_sharded_tensor(head, context_parallel_group, seq_dim=1)
+        return head[:, : sampler_topk_token_ids.shape[1] - 1]
+
+    # Packed CP is load-balanced within each sequence, not across the full pack.
+    assert cu_seqlens_q_padded is not None
+    rows = []
+    for i in range(sampler_topk_token_ids.shape[0]):
+        start = int(cu_seqlens_q_padded[i])
+        end = int(cu_seqlens_q_padded[i + 1])
+        row = head[:, start // cp_size : end // cp_size]
+        if cp_size > 1:
+            row = allgather_cp_sharded_tensor(row, context_parallel_group, seq_dim=1)
+        width = min(end - start - 1, sampler_topk_token_ids.shape[1] - 1)
+        row = row[:, :width]
+        rows.append(
+            torch.cat(
+                [
+                    row,
+                    row.new_zeros(
+                        1,
+                        sampler_topk_token_ids.shape[1] - 1 - width,
+                        sampler_topk_token_ids.shape[-1],
+                    ),
+                ],
+                dim=1,
+            )
+        )
+    return torch.cat(rows, dim=0)
 
 
 @torch.no_grad()

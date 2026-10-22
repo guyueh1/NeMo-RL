@@ -502,6 +502,8 @@ def prepare_packed_loss_input(
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]
     input_is_prepacked = "cu_seqlens" in data
+    if getattr(loss_fn, "score_centering", False) and input_is_prepacked:
+        raise ValueError("Score centering does not support externally prepacked inputs")
     cp_size = (
         1
         if context_parallel_group is None
@@ -580,4 +582,17 @@ def prepare_packed_loss_input(
     loss_input = {"next_token_logprobs": logprobs}
     if need_top_k_or_top_p_filtering(sampling_params):
         loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
+    if getattr(loss_fn, "score_centering", False):
+        loss_input["policy_logprobs_at_sampler_topk"] = (
+            get_policy_logprobs_at_sampler_topk(
+                sampler_topk_token_ids=data["sampler_topk_token_ids"],
+                next_token_logits=logits,
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                chunk_size=chunk_size,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_q_padded=cu_seqlens_q_padded,
+            )
+        )
     return loss_input, data
