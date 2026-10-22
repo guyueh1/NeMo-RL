@@ -1703,8 +1703,8 @@ def get_next_token_logprobs_from_logits(
     return logprobs
 
 
-def get_next_token_topk_logprobs_from_logits(
-    topk_ids: torch.Tensor,
+def get_policy_logprobs_at_sampler_topk(
+    sampler_topk_token_ids: torch.Tensor,
     next_token_logits: torch.Tensor,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -1714,7 +1714,7 @@ def get_next_token_topk_logprobs_from_logits(
 ) -> torch.Tensor:
     """Next-token log-probs at each position's sampler top-k ids.
 
-    ``topk_ids`` is token-aligned like ``generation_logprobs`` (row t holds the
+    ``sampler_topk_token_ids`` is token-aligned like ``generation_logprobs`` (row t holds the
     ids the sampler ranked when it drew token t), so it is rolled by one to line
     up with the logits, which predict the next token; the result is aligned with
     :func:`get_next_token_logprobs_from_logits`. On the vocab-parallel path the
@@ -1723,7 +1723,7 @@ def get_next_token_topk_logprobs_from_logits(
     centering cancel in fp32 rather than in the logits' dtype.
 
     Args:
-        topk_ids: Sampler top-k ids ``[B, S, k]``, any integer dtype.
+        sampler_topk_token_ids: Sampler top-k ids ``[B, S, k]``, any integer dtype.
         next_token_logits: Logits ``[B, S, V]``, or the ``[B, S // CP, V // TP]`` shard.
         vocab_parallel_rank: Rank in the vocab parallel group (required with the group).
         vocab_parallel_group: Process group for vocab parallelism.
@@ -1741,7 +1741,9 @@ def get_next_token_topk_logprobs_from_logits(
         raise NotImplementedError(
             "score centering supports the Megatron vocab-parallel and single-device paths"
         )
-    target = topk_ids.to(device=next_token_logits.device, dtype=torch.int64)
+    target = sampler_topk_token_ids.to(
+        device=next_token_logits.device, dtype=torch.int64
+    )
     target = target.roll(shifts=-1, dims=1)
     if vocab_parallel_group is None:
         logprobs = torch.nn.functional.log_softmax(

@@ -45,10 +45,10 @@ from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
-    GENERATION_TOPK_IDS_FIELD,
-    GENERATION_TOPK_LOGPROBS_FIELD,
     MASK_SAMPLE,
     ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
     TRUNCATED,
 )
 from nemo_rl.data_plane.tq_token_sink import (
@@ -113,8 +113,8 @@ class FinalizedRollout:
     reward_metrics: dict[str, float] = field(default_factory=dict)
     # Sampler top-k per token (token_capture.top_logprobs): [len(token_ids), k]
     # int32 ids and float32 log-probs, zeros on carried tokens; None when off.
-    generation_topk_ids: Optional[torch.Tensor] = None
-    generation_topk_logprobs: Optional[torch.Tensor] = None
+    sampler_topk_token_ids: Optional[torch.Tensor] = None
+    sampler_topk_logprobs: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -377,7 +377,7 @@ class RolloutReassembler:
             fetched = self._source.fetch_for_finalization(
                 staging_keys,
                 include_route_fragments=fetch_fragments,
-                include_topk=self._top_logprobs > 0,
+                include_sampler_topk=self._top_logprobs > 0,
             )
         except KeyError as error:
             return rejected(f"missing_staging_row:{error}", staging_keys)
@@ -433,12 +433,12 @@ class RolloutReassembler:
         # The row is the chain's deltas back to back (carried tokens, then the
         # call's generated tokens); the staged top-k covers only the generated
         # part, so each span gets zeros for its carried tokens first.
-        generation_topk_ids = generation_topk_logprobs = None
+        sampler_topk_token_ids = sampler_topk_logprobs = None
         if self._top_logprobs > 0:
             ids_parts: list[torch.Tensor] = []
             logprob_parts: list[torch.Tensor] = []
             for call_id, carry_len, generation_len in row.link_spans:
-                fragment_ids, fragment_logprobs = fetched_by_call[call_id].topk
+                fragment_ids, fragment_logprobs = fetched_by_call[call_id].sampler_topk
                 expected_shape = (generation_len, self._top_logprobs)
                 if (
                     tuple(fragment_ids.shape) != expected_shape
@@ -451,8 +451,8 @@ class RolloutReassembler:
                     torch.zeros(carried, dtype=torch.float32),
                     fragment_logprobs,
                 ]
-            generation_topk_ids = torch.cat(ids_parts)
-            generation_topk_logprobs = torch.cat(logprob_parts)
+            sampler_topk_token_ids = torch.cat(ids_parts)
+            sampler_topk_logprobs = torch.cat(logprob_parts)
 
         route_plan = None
         routed_experts: Optional[torch.Tensor] = None
@@ -545,8 +545,8 @@ class RolloutReassembler:
             media=media,
             penalty_counts=penalty_counts,
             reward_metrics=reward_metrics,
-            generation_topk_ids=generation_topk_ids,
-            generation_topk_logprobs=generation_topk_logprobs,
+            sampler_topk_token_ids=sampler_topk_token_ids,
+            sampler_topk_logprobs=sampler_topk_logprobs,
         )
 
     def _resolve_media(
@@ -835,11 +835,11 @@ class RolloutReassembler:
         sample_mask = torch.zeros(n, dtype=torch.float32)
         lengths = torch.tensor(seq_lens, dtype=torch.long)
         rewards_t = torch.tensor([row.reward for row in rows], dtype=torch.float32)
-        topk_ids = topk_logprobs = None
+        sampler_topk_token_ids = sampler_topk_logprobs = None
         if self._top_logprobs > 0:
-            topk_shape = (n, max_len, self._top_logprobs)
-            topk_ids = torch.zeros(topk_shape, dtype=torch.int32)
-            topk_logprobs = torch.zeros(topk_shape, dtype=torch.float32)
+            sampler_topk_shape = (n, max_len, self._top_logprobs)
+            sampler_topk_token_ids = torch.zeros(sampler_topk_shape, dtype=torch.int32)
+            sampler_topk_logprobs = torch.zeros(sampler_topk_shape, dtype=torch.float32)
         for i, row in enumerate(rows):
             if not row.valid:
                 continue
@@ -848,9 +848,9 @@ class RolloutReassembler:
             token_mask[i, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
             logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
             sample_mask[i] = float(loss_multiplier)
-            if topk_ids is not None:
-                topk_ids[i, :length] = row.generation_topk_ids
-                topk_logprobs[i, :length] = row.generation_topk_logprobs
+            if sampler_topk_token_ids is not None:
+                sampler_topk_token_ids[i, :length] = row.sampler_topk_token_ids
+                sampler_topk_logprobs[i, :length] = row.sampler_topk_logprobs
 
         train_batch: dict[str, Any] = {
             "input_ids": input_ids,
@@ -866,9 +866,9 @@ class RolloutReassembler:
                 dtype=torch.bool,
             ),
         }
-        if topk_ids is not None:
-            train_batch[GENERATION_TOPK_IDS_FIELD] = topk_ids
-            train_batch[GENERATION_TOPK_LOGPROBS_FIELD] = topk_logprobs
+        if sampler_topk_token_ids is not None:
+            train_batch[SAMPLER_TOPK_TOKEN_IDS_FIELD] = sampler_topk_token_ids
+            train_batch[SAMPLER_TOPK_LOGPROBS_FIELD] = sampler_topk_logprobs
         if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
             has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
             if not has_routed_row and self._routed_dims is None and not valid_rows:

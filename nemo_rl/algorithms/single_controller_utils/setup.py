@@ -332,14 +332,14 @@ def _register_single_controller_partitions(
             enabled=r3_enabled,
         )
     else:
-        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, GENERATION_TOPK_FIELDS
+        from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS, SAMPLER_TOPK_FIELDS
 
         partition_fields = fields_with_optional_routed_experts(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
         if token_capture_cfg.top_logprobs > 0:
-            partition_fields.extend(GENERATION_TOPK_FIELDS)
+            partition_fields.extend(SAMPLER_TOPK_FIELDS)
     if include_multimodal_fields:
         partition_fields.extend(
             field
@@ -368,11 +368,7 @@ def _register_single_controller_partitions(
             fields=list(STAGING_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
             + (list(MEDIA_STAGING_FIELDS) if capture_media else [])
-            + (
-                list(GENERATION_TOPK_FIELDS)
-                if token_capture_cfg.top_logprobs > 0
-                else []
-            ),
+            + (list(SAMPLER_TOPK_FIELDS) if token_capture_cfg.top_logprobs > 0 else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )

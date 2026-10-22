@@ -41,7 +41,7 @@ from nemo_rl.distributed.model_utils import (
     get_cp_sharded_next_token_logprobs,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
-    get_next_token_topk_logprobs_from_logits,
+    get_policy_logprobs_at_sampler_topk,
 )
 from nemo_rl.utils.sequence_lengths import CpuIntTuple
 
@@ -291,9 +291,9 @@ def prepare_loss_input(
             loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
         if getattr(loss_fn, "score_centering", False):
             # Log-probs at the sampler's captured top-k ids, for score centering.
-            loss_input["next_token_topk_logprobs"] = (
-                get_next_token_topk_logprobs_from_logits(
-                    topk_ids=data["generation_topk_ids"],
+            loss_input["policy_logprobs_at_sampler_topk"] = (
+                get_policy_logprobs_at_sampler_topk(
+                    sampler_topk_token_ids=data["sampler_topk_token_ids"],
                     next_token_logits=logits,
                     vocab_parallel_rank=vocab_parallel_rank,
                     vocab_parallel_group=vocab_parallel_group,

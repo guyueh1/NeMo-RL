@@ -36,7 +36,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
     gather_logits_at_global_indices,
-    get_next_token_topk_logprobs_from_logits,
+    get_policy_logprobs_at_sampler_topk,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
@@ -280,7 +280,7 @@ class ModelUtilsTestActor:
         vocab_part_size = vocab_size // self.tp_size
         torch.manual_seed(7)  # identical full tensors on every rank
         full_logits = torch.randn(batch_size, seq_len, vocab_size, device="cuda")
-        topk_ids = torch.randint(
+        sampler_topk_token_ids = torch.randint(
             0,
             vocab_size,
             (batch_size, seq_len, top_k),
@@ -290,7 +290,7 @@ class ModelUtilsTestActor:
 
         reference_logits = full_logits.clone().requires_grad_(True)
         expected = torch.log_softmax(reference_logits, dim=-1)[:, :-1].gather(
-            dim=-1, index=topk_ids.long()[:, 1:]
+            dim=-1, index=sampler_topk_token_ids.long()[:, 1:]
         )
         expected.sum().backward()
 
@@ -299,8 +299,8 @@ class ModelUtilsTestActor:
         ]
         shard = _get_tokens_on_this_cp_rank(shard, cp_rank, self.cp_size, seq_dim=1)
         shard = shard.clone().requires_grad_(True)
-        actual = get_next_token_topk_logprobs_from_logits(
-            topk_ids=topk_ids,
+        actual = get_policy_logprobs_at_sampler_topk(
+            sampler_topk_token_ids=sampler_topk_token_ids,
             next_token_logits=shard,
             vocab_parallel_rank=tp_rank,
             vocab_parallel_group=tp_group,
@@ -418,17 +418,17 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
         cluster.shutdown()
 
 
-def test_get_next_token_topk_logprobs_from_logits_single_device():
+def test_get_policy_logprobs_at_sampler_topk_single_device():
     """The unsharded path is a rolled gather of the full log-softmax, with gradient."""
     torch.manual_seed(0)
     logits = torch.randn(2, 6, 11, requires_grad=True)
-    topk_ids = torch.randint(0, 11, (2, 6, 3), dtype=torch.int32)
+    sampler_topk_token_ids = torch.randint(0, 11, (2, 6, 3), dtype=torch.int32)
 
-    actual = get_next_token_topk_logprobs_from_logits(
-        topk_ids=topk_ids, next_token_logits=logits
+    actual = get_policy_logprobs_at_sampler_topk(
+        sampler_topk_token_ids=sampler_topk_token_ids, next_token_logits=logits
     )
     expected = torch.log_softmax(logits, dim=-1)[:, :-1].gather(
-        dim=-1, index=topk_ids.long()[:, 1:]
+        dim=-1, index=sampler_topk_token_ids.long()[:, 1:]
     )
 
     torch.testing.assert_close(actual, expected)
@@ -444,7 +444,7 @@ def test_get_next_token_topk_logprobs_from_logits_single_device():
         (2, 2),  # TP=2, CP=2
     ],
 )
-def test_get_next_token_topk_logprobs_from_logits_tp_cp(
+def test_get_policy_logprobs_at_sampler_topk_tp_cp(
     register_model_utils_test_actor, tp_cp_config
 ):
     """Score centering's head log-probs under TP and CP against a full-vocab reference."""

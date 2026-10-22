@@ -3547,14 +3547,14 @@ def _expected_gradient_under_sampler(loss_fn, z, q, head):
                 "reference_policy_logprobs": torch.zeros(1, 2, dtype=torch.float64),
                 "token_mask": torch.tensor([[0.0, 1.0]], dtype=torch.float64),
                 "sample_mask": torch.tensor([1.0], dtype=torch.float64),
-                "generation_topk_logprobs": torch.stack(
+                "sampler_topk_logprobs": torch.stack(
                     [torch.zeros(top_k, dtype=torch.float64), q[head].log()]
                 ).unsqueeze(0),
             }
         )
         loss, metrics = loss_fn(
             next_token_logprobs=logprobs[y].reshape(1, 1),
-            next_token_topk_logprobs=logprobs[head].reshape(1, 1, top_k),
+            policy_logprobs_at_sampler_topk=logprobs[head].reshape(1, 1, top_k),
             data=data,
             global_valid_seqs=torch.tensor(1.0),
             global_valid_toks=torch.tensor(1.0),

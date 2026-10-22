@@ -167,9 +167,9 @@ ROUTE_PASSTHROUGH_FLAG = "route_passthrough"
 # by loss_fn.score_centering: int32 ids and float32 log-probs, both ``[..., k]``.
 # Staging rows hold one call's generated positions; canonical rows are
 # token-aligned with zeros on prompt and tool tokens.
-GENERATION_TOPK_IDS_FIELD = "generation_topk_ids"
-GENERATION_TOPK_LOGPROBS_FIELD = "generation_topk_logprobs"
-GENERATION_TOPK_FIELDS = (GENERATION_TOPK_IDS_FIELD, GENERATION_TOPK_LOGPROBS_FIELD)
+SAMPLER_TOPK_TOKEN_IDS_FIELD = "sampler_topk_token_ids"
+SAMPLER_TOPK_LOGPROBS_FIELD = "sampler_topk_logprobs"
+SAMPLER_TOPK_FIELDS = (SAMPLER_TOPK_TOKEN_IDS_FIELD, SAMPLER_TOPK_LOGPROBS_FIELD)
 
 
 def fields_with_optional_routed_experts(

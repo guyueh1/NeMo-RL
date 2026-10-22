@@ -67,7 +67,7 @@ from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
-    attach_topk_logprobs_to_chat_response_choices,
+    attach_sampler_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
     validate_rollout_prompt,
     model_dump_chat_response_with_dynamic_message_fields,
@@ -921,13 +921,13 @@ class VllmAsyncGenerationWorkerImpl(
         the worker->gate hop carries the completion and coords only.
         The sampler top-k tensors are stripped before serialization and staged separately.
         """
-        topk = None
+        sampler_topk = None
         for choice in content.get("choices") or []:
             message = choice.get("message")
-            if isinstance(message, dict) and "generation_topk_ids" in message:
-                topk = (
-                    message.pop("generation_topk_ids"),
-                    message.pop("generation_topk_logprobs"),
+            if isinstance(message, dict) and "sampler_topk_token_ids" in message:
+                sampler_topk = (
+                    message.pop("sampler_topk_token_ids"),
+                    message.pop("sampler_topk_logprobs"),
                 )
         state = self._capture_calls.pop(id(request), None)
         if state is None:
@@ -962,9 +962,9 @@ class VllmAsyncGenerationWorkerImpl(
             payload,
             attachments=state.media.tensors if state.media is not None else None,
         )
-        if topk is not None and coords.disposition == "staged":
+        if sampler_topk is not None and coords.disposition == "staged":
             try:
-                self._staging_sink.stage_topk(coords.staging_key, *topk)
+                self._staging_sink.stage_sampler_topk(coords.staging_key, *sampler_topk)
             except Exception:  # noqa: BLE001 — the finalizer rejects a row without its top-k
                 LOGGER.exception(
                     "staging the sampler top-k failed for %s", coords.staging_key
@@ -1407,10 +1407,12 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res,
                     )
                     if request.ng_capture and worker_self._capture_top_logprobs:
-                        response = attach_topk_logprobs_to_chat_response_choices(
-                            response,
-                            final_res,
-                            top_k=worker_self._capture_top_logprobs,
+                        response = (
+                            attach_sampler_topk_logprobs_to_chat_response_choices(
+                                response,
+                                final_res,
+                                top_k=worker_self._capture_top_logprobs,
+                            )
                         )
 
                 if worker_self._return_routed_experts_enabled():

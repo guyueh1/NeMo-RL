@@ -674,7 +674,7 @@ def attach_token_information_to_chat_response_choices(
     return response
 
 
-def attach_topk_logprobs_to_chat_response_choices(
+def attach_sampler_topk_logprobs_to_chat_response_choices(
     response: Any,
     final_request_output: Any,
     *,
@@ -684,7 +684,7 @@ def attach_topk_logprobs_to_chat_response_choices(
 
     The engine reports the sampled token plus the top ``top_k`` candidates per
     position, each with its rank; the ``top_k`` lowest ranks are the sampler's
-    head. Sets ``generation_topk_ids`` (int32) and ``generation_topk_logprobs``
+    head. Sets ``sampler_topk_token_ids`` (int32) and ``sampler_topk_logprobs``
     (float32), both ``[generated_len, top_k]``, next to the fields attached by
     ``attach_token_information_to_chat_response_choices``, which already
     matched choices to generation outputs.
@@ -703,10 +703,10 @@ def attach_topk_logprobs_to_chat_response_choices(
                 f"while attaching top-k information: choice_idx={choice.index}, "
                 f"top_k={top_k}."
             )
-        choice.message.generation_topk_ids = torch.tensor(
+        choice.message.sampler_topk_token_ids = torch.tensor(
             [[token_id for token_id, _ in row] for row in ranked], dtype=torch.int32
         ).reshape(-1, top_k)
-        choice.message.generation_topk_logprobs = torch.tensor(
+        choice.message.sampler_topk_logprobs = torch.tensor(
             [
                 [max(float(entry.logprob), VLLM_LOGPROB_FLOOR) for _, entry in row]
                 for row in ranked
@@ -731,8 +731,8 @@ def model_dump_chat_response_with_dynamic_message_fields(
             "prompt_token_ids",
             "generation_token_ids",
             "generation_log_probs",
-            "generation_topk_ids",
-            "generation_topk_logprobs",
+            "sampler_topk_token_ids",
+            "sampler_topk_logprobs",
         ):
             field_value = getattr(message, field_name, None)
             if field_value is not None:

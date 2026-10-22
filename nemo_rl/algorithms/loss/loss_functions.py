@@ -685,7 +685,7 @@ class ClippedPGLossFn(LossFunction):
         opd_full_entropy: Optional[Tensor] = None,
         opd_full_cross_entropy: Optional[Tensor] = None,
         policy_support_mask: Optional[Tensor] = None,
-        next_token_topk_logprobs: Optional[Tensor] = None,
+        policy_logprobs_at_sampler_topk: Optional[Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -695,7 +695,7 @@ class ClippedPGLossFn(LossFunction):
             next_token_logprobs: Sampled-token log-probabilities ``[B, S - 1]``.
                 Required on the policy-gradient branch; on the ``opd_full``
                 branch only when ``reference_policy_kl_penalty`` is non-zero.
-            next_token_topk_logprobs: Log-probabilities at the sampler's top-k
+            policy_logprobs_at_sampler_topk: Log-probabilities at the sampler's top-k
                 ids ``[B, S - 1, k]``, required when ``score_centering`` is on.
             data: Microbatch with masks, advantages, and prior log-probabilities.
             global_valid_seqs: Global valid-sequence count for normalization.
@@ -1058,12 +1058,12 @@ class ClippedPGLossFn(LossFunction):
 
         score_centering_metrics: dict[str, Tensor] = {}
         if self.score_centering:
-            assert next_token_topk_logprobs is not None, (
-                "score_centering requires next_token_topk_logprobs from prepare_loss_input"
+            assert policy_logprobs_at_sampler_topk is not None, (
+                "score_centering requires policy_logprobs_at_sampler_topk from prepare_loss_input"
             )
             centering, head_mass = compute_score_centering_term(
-                next_token_topk_logprobs,
-                sampler_topk_logprobs=data["generation_topk_logprobs"][:, 1:],
+                policy_logprobs_at_sampler_topk,
+                sampler_topk_logprobs=data["sampler_topk_logprobs"][:, 1:],
                 tis_bounds=self._score_centering_is_bounds,
             )
             correction = advantages * centering

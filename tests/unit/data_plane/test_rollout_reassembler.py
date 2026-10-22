@@ -54,11 +54,11 @@ from nemo_rl.data.multimodal_utils import (  # noqa: E402
     row_shapes_key,
 )
 from nemo_rl.data_plane.schema import (  # noqa: E402
-    GENERATION_TOPK_FIELDS,
-    GENERATION_TOPK_IDS_FIELD,
-    GENERATION_TOPK_LOGPROBS_FIELD,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_FIELDS,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     MEDIA_STAGING_FIELDS,
@@ -351,7 +351,7 @@ TOPK = 3
 def topk_partitions(tq_client):
     tq_client.register_partition(
         partition_id=STAGING_PARTITION_TOPK,
-        fields=list(STAGING_FIELDS) + list(GENERATION_TOPK_FIELDS),
+        fields=list(STAGING_FIELDS) + list(SAMPLER_TOPK_FIELDS),
         num_samples=64,
         consumer_tasks=["finalize"],
     )
@@ -367,7 +367,7 @@ def topk_partitions(tq_client):
             "total_reward",
             "mask_sample",
             "truncated",
-            *GENERATION_TOPK_FIELDS,
+            *SAMPLER_TOPK_FIELDS,
         ],
         num_samples=64,
         consumer_tasks=["train"],
@@ -410,7 +410,7 @@ def _stage_fixture_with_topk(
         logprobs = logprobs.reshape(generated, TOPK) / 10
         if record.model_call_id == short_call:
             ids, logprobs = ids[:-1], logprobs[:-1]
-        sink.stage_topk(record.staging_key, ids, logprobs)
+        sink.stage_sampler_topk(record.staging_key, ids, logprobs)
         fragments[record.model_call_id] = (ids, logprobs)
     expected_ids, expected_logprobs = [], []
     for call_id, carry_len, _generation_len in row.link_spans:
@@ -443,15 +443,15 @@ def test_finalize_group_publishes_the_sampler_topk(tq_client, topk_partitions):
     )
 
     assert not finalized.dropped
-    assert set(GENERATION_TOPK_FIELDS) <= set(finalized.meta.fields)
+    assert set(SAMPLER_TOPK_FIELDS) <= set(finalized.meta.fields)
     rows = tq_client.get_samples(
         sample_ids=rollout_ids,
         partition_id=CANONICAL_PARTITION_TOPK,
-        select_fields=["token_mask", *GENERATION_TOPK_FIELDS],
+        select_fields=["token_mask", *SAMPLER_TOPK_FIELDS],
     )
     length = len(expected.token_ids)
-    ids = torch.as_tensor(rows[GENERATION_TOPK_IDS_FIELD][0])
-    logprobs = torch.as_tensor(rows[GENERATION_TOPK_LOGPROBS_FIELD][0])
+    ids = torch.as_tensor(rows[SAMPLER_TOPK_TOKEN_IDS_FIELD][0])
+    logprobs = torch.as_tensor(rows[SAMPLER_TOPK_LOGPROBS_FIELD][0])
     assert ids.dtype == torch.int32
     assert logprobs.dtype == torch.float32
     assert torch.equal(ids[:length], expected_ids)
@@ -460,7 +460,7 @@ def test_finalize_group_publishes_the_sampler_topk(tq_client, topk_partitions):
     generated = torch.as_tensor(rows["token_mask"][0]).flatten()[:length].bool()
     assert not ids[:length][~generated].any()
     assert ids[:length][generated].all()
-    placeholder = torch.as_tensor(rows[GENERATION_TOPK_IDS_FIELD][1])
+    placeholder = torch.as_tensor(rows[SAMPLER_TOPK_TOKEN_IDS_FIELD][1])
     assert tuple(placeholder.shape) == (1, TOPK)
     assert not placeholder.any()
 
@@ -910,9 +910,13 @@ def test_deferred_finalizer_rejects_invalid_routed_len(
 
     class _InjectedSource:
         def fetch_for_finalization(
-            self, staging_keys, *, include_route_fragments=False, include_topk=False
+            self,
+            staging_keys,
+            *,
+            include_route_fragments=False,
+            include_sampler_topk=False,
         ):
-            del staging_keys, include_route_fragments, include_topk
+            del staging_keys, include_route_fragments, include_sampler_topk
             return fetched
 
     finalizer._source = _InjectedSource()
@@ -1018,9 +1022,13 @@ def test_direct_extras_corruption_rejects_before_publication(
 
     class _InjectedSource:
         def fetch_for_finalization(
-            self, staging_keys, *, include_route_fragments=False, include_topk=False
+            self,
+            staging_keys,
+            *,
+            include_route_fragments=False,
+            include_sampler_topk=False,
         ):
-            del staging_keys, include_route_fragments, include_topk
+            del staging_keys, include_route_fragments, include_sampler_topk
             return fetched
 
     finalizer._source = _InjectedSource()

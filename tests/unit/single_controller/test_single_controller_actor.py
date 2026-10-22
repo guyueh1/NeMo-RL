@@ -69,9 +69,9 @@ from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
-    GENERATION_TOPK_FIELDS,
     GROUP_ID_TAG,
     ROLLOUT_METRICS,
+    SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS, STAGING_FIELDS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
@@ -103,7 +103,7 @@ def test_train_fields_add_the_sampler_topk_for_score_centering():
         score_centering=True,
     )
     assert "reference_policy_logprobs" not in without
-    assert with_topk == without + GENERATION_TOPK_FIELDS
+    assert with_topk == without + SAMPLER_TOPK_FIELDS
 
 
 class FakeWeightSynchronizer:

@@ -162,9 +162,9 @@ from nemo_rl.data_plane.observability import (
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
-    GENERATION_TOPK_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -335,7 +335,7 @@ def _train_fields_for_step(
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
     if score_centering:
-        fields += GENERATION_TOPK_FIELDS
+        fields += SAMPLER_TOPK_FIELDS
     return fields
 
 

@@ -18,7 +18,7 @@ import torch
 
 
 def compute_score_centering_term(
-    topk_logprobs: torch.Tensor,
+    policy_logprobs_at_sampler_topk: torch.Tensor,
     *,
     sampler_topk_logprobs: torch.Tensor,
     tis_bounds: tuple[float, float] | None,
@@ -40,7 +40,7 @@ def compute_score_centering_term(
     Adding this term does not center an arbitrary clipped PPO gradient exactly.
 
     Args:
-        topk_logprobs: Trainer log-probs at the sampler's top-k ids, ``[B, S, k]``,
+        policy_logprobs_at_sampler_topk: Trainer log-probs at the sampler's top-k ids, ``[B, S, k]``,
             carrying the gradient.
         sampler_topk_logprobs: The sampler's log-probs at those ids, ``[B, S, k]``.
         tis_bounds: ``(lo, hi)`` of the TIS clamp, or ``None`` when IS is off.
@@ -48,7 +48,7 @@ def compute_score_centering_term(
     Returns:
         The per-token term ``[B, S]`` and the sampler mass the head covers ``[B, S]``.
     """
-    p = topk_logprobs.detach().exp()
+    p = policy_logprobs_at_sampler_topk.detach().exp()
     q = sampler_topk_logprobs.exp()
     head_mass = q.sum(-1)
     rho = (1.0 - head_mass).clamp(min=0.0) / (1.0 - p.sum(-1)).clamp(min=1e-6)
@@ -59,4 +59,4 @@ def compute_score_centering_term(
         mass = torch.minimum(torch.maximum(p, lo * q), hi * q)
         alpha = torch.minimum(torch.maximum(torch.ones_like(rho), lo * rho), hi * rho)
     coefficients = mass - alpha.unsqueeze(-1) * p
-    return (coefficients * topk_logprobs).sum(-1), head_mass
+    return (coefficients * policy_logprobs_at_sampler_topk).sum(-1), head_mass

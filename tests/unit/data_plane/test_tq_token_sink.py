@@ -48,7 +48,7 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
     StagingSource as TokenSourceProtocol,
 )
 
-from nemo_rl.data_plane.schema import GENERATION_TOPK_FIELDS  # noqa: E402
+from nemo_rl.data_plane.schema import SAMPLER_TOPK_FIELDS  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     MEDIA_METADATA_FIELDS,
     MEDIA_STAGING_FIELDS,
@@ -460,7 +460,7 @@ def test_fetch_for_finalization_rejects_duplicate_request_keys(
 def staging_partition_with_topk(tq_client):
     tq_client.register_partition(
         partition_id=STAGING_PARTITION_TOPK,
-        fields=list(STAGING_FIELDS) + list(GENERATION_TOPK_FIELDS),
+        fields=list(STAGING_FIELDS) + list(SAMPLER_TOPK_FIELDS),
         num_samples=64,
         consumer_tasks=["finalize"],
     )
@@ -468,7 +468,9 @@ def staging_partition_with_topk(tq_client):
     tq_client.clear_samples(sample_ids=None, partition_id=STAGING_PARTITION_TOPK)
 
 
-def test_stage_topk_rides_the_staged_row(tq_client, staging_partition_with_topk):
+def test_stage_sampler_topk_rides_the_staged_row(
+    tq_client, staging_partition_with_topk
+):
     sink = TQTokenSink(tq_client, staging_partition=staging_partition_with_topk)
     source = TQTokenSource(tq_client, staging_partition=staging_partition_with_topk)
     records, _, _ = build_fixture_artifacts("worked_example")
@@ -481,23 +483,25 @@ def test_stage_topk_rides_the_staged_row(tq_client, staging_partition_with_topk)
         ids = ids + 100 * (call_idx + 1)
         logprobs = -(torch.arange(generated * k, dtype=torch.float32) + 1) / 10
         logprobs = logprobs.reshape(generated, k)
-        sink.stage_topk(record.staging_key, ids, logprobs)
+        sink.stage_sampler_topk(record.staging_key, ids, logprobs)
         staged[record.staging_key] = (ids, logprobs)
     keys = [record.staging_key for record in records]
 
-    fetched = source.fetch_for_finalization(keys, include_topk=True)
+    fetched = source.fetch_for_finalization(keys, include_sampler_topk=True)
 
     for item in fetched:
         ids, logprobs = staged[item.staging_key]
-        assert item.topk[0].dtype == torch.int32
-        assert item.topk[1].dtype == torch.float32
-        assert torch.equal(item.topk[0], ids)
-        assert torch.equal(item.topk[1], logprobs)
+        assert item.sampler_topk[0].dtype == torch.int32
+        assert item.sampler_topk[1].dtype == torch.float32
+        assert torch.equal(item.sampler_topk[0], ids)
+        assert torch.equal(item.sampler_topk[1], logprobs)
     # The second put left the digest-covered columns untouched.
     assert [item.snapshot.model_dump() for item in fetched] == [
         record.model_dump(exclude={"extras"}) for record in records
     ]
-    assert all(item.topk is None for item in source.fetch_for_finalization(keys))
+    assert all(
+        item.sampler_topk is None for item in source.fetch_for_finalization(keys)
+    )
 
 
 def test_fetch_topk_fails_for_a_row_without_it(tq_client, staging_partition_with_topk):
@@ -507,7 +511,9 @@ def test_fetch_topk_fails_for_a_row_without_it(tq_client, staging_partition_with
     assert sink.stage(records[0]).ok
 
     with pytest.raises(KeyError):
-        source.fetch_for_finalization([records[0].staging_key], include_topk=True)
+        source.fetch_for_finalization(
+            [records[0].staging_key], include_sampler_topk=True
+        )
 
 
 def test_stage_failure_reports_not_raises(staging_partition):

@@ -59,7 +59,7 @@ class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
         self.attachments: list[dict | None] = []
-        self.topk: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+        self.sampler_topk: list[tuple[str, torch.Tensor, torch.Tensor]] = []
 
     def stage(
         self, record: StagedCallRecord, *, attachments: dict | None = None
@@ -68,8 +68,12 @@ class _MemorySink:
         self.attachments.append(attachments)
         return StageResult(ok=True, staging_key=record.staging_key)
 
-    def stage_topk(self, staging_key, topk_ids, topk_logprobs) -> None:
-        self.topk.append((staging_key, topk_ids, topk_logprobs))
+    def stage_sampler_topk(
+        self, staging_key, sampler_topk_token_ids, sampler_topk_logprobs
+    ) -> None:
+        self.sampler_topk.append(
+            (staging_key, sampler_topk_token_ids, sampler_topk_logprobs)
+        )
 
 
 def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
@@ -542,10 +546,10 @@ def _text_root_request() -> _FakeRequest:
 def _content_with_topk(gen_ids, logprobs):
     content = _served_content(gen_ids, logprobs)
     content["choices"][0]["message"].update(
-        generation_topk_ids=torch.tensor(
+        sampler_topk_token_ids=torch.tensor(
             [[token_id, 1] for token_id in gen_ids], dtype=torch.int32
         ),
-        generation_topk_logprobs=torch.tensor([[lp, -5.0] for lp in logprobs]),
+        sampler_topk_logprobs=torch.tensor([[lp, -5.0] for lp in logprobs]),
     )
     return content
 
@@ -556,8 +560,8 @@ def test_request_capture_stages_topk_after_the_call():
     request = _text_root_request()
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
     content = _content_with_topk([13, 14], [-0.1, -0.2])
-    ids = content["choices"][0]["message"]["generation_topk_ids"]
-    logprobs = content["choices"][0]["message"]["generation_topk_logprobs"]
+    ids = content["choices"][0]["message"]["sampler_topk_token_ids"]
+    logprobs = content["choices"][0]["message"]["sampler_topk_logprobs"]
 
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker, request, content
@@ -565,7 +569,7 @@ def test_request_capture_stages_topk_after_the_call():
 
     assert content["ng_commit_coords"]["disposition"] == "staged"
     # The top-k lands on the staged row's key, after the digest-covered put.
-    assert sink.topk == [(sink.records[0].staging_key, ids, logprobs)]
+    assert sink.sampler_topk == [(sink.records[0].staging_key, ids, logprobs)]
     # It never crosses the worker -> gate hop.
     assert content["choices"] == [
         {"index": 0, "message": {"role": "assistant", "content": "x"}}
@@ -587,8 +591,8 @@ def test_request_capture_skips_topk_when_the_call_did_not_stage():
     )
 
     assert content["ng_commit_coords"]["disposition"] == "capture_failed"
-    assert sink.topk == []
-    assert "generation_topk_ids" not in content["choices"][0]["message"]
+    assert sink.sampler_topk == []
+    assert "sampler_topk_token_ids" not in content["choices"][0]["message"]
 
 
 def test_request_capture_drops_topk_from_uncaptured_responses():
@@ -600,9 +604,9 @@ def test_request_capture_drops_topk_from_uncaptured_responses():
         worker, plain, _content_with_topk([3], [-0.1])
     )
 
-    assert "generation_topk_ids" not in out["choices"][0]["message"]
-    assert "generation_topk_logprobs" not in out["choices"][0]["message"]
-    assert sink.topk == []
+    assert "sampler_topk_token_ids" not in out["choices"][0]["message"]
+    assert "sampler_topk_logprobs" not in out["choices"][0]["message"]
+    assert sink.sampler_topk == []
 
 
 def test_request_capture_abort_fails_the_call_and_drains_state():
