@@ -26,6 +26,7 @@ nemo_rl.models.megatron.setup, focusing on:
 
 import datetime
 import os
+import pickle
 import warnings
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -235,6 +236,11 @@ class TestValidateModelPaths:
         iter_dir.mkdir(parents=True)
         if complete:
             (iter_dir / "run_config.yaml").write_text("{}\n")
+            (iter_dir / "__0_0.distcp").write_bytes(b"model shard")
+            metadata = SimpleNamespace(
+                storage_data={"weight": SimpleNamespace(relative_path="__0_0.distcp")}
+            )
+            (iter_dir / ".metadata").write_bytes(pickle.dumps(metadata))
 
         config = {"model_name": "test-model"}
 
@@ -5194,7 +5200,11 @@ class TestForceSyncOptimizerFp32FromModel:
         a = self._make_distrib_opt(_HybridDeviceOptimizer)
         b = self._make_distrib_opt(_HybridDeviceOptimizer)
 
-        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+        chained = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+            ]
+        )
 
         setup_mod._force_sync_optimizer_fp32_from_model(chained, model=MagicMock())
 
@@ -5355,7 +5365,11 @@ class TestForceSyncModelFromOptimizerFp32:
         b = self._make_distrib_opt(
             _HybridDeviceOptimizer, model_values=(0.0, 0.0), master_values=(5.0, 6.0)
         )
-        chained = SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+        chained = SimpleNamespace(
+            chained_optimizers=[
+                SimpleNamespace(chained_optimizers=[a.distrib_opt, b.distrib_opt])
+            ]
+        )
 
         setup_mod._force_sync_model_from_optimizer_fp32(chained)
 

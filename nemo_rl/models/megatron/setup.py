@@ -189,6 +189,11 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
+        if hasattr(distrib_opt, "chained_optimizers"):
+            applied = False
+            for child in distrib_opt.chained_optimizers:
+                applied |= _sync_distrib_opt(child)
+            return applied
         try:
             from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
                 HybridDeviceOptimizer,
@@ -227,12 +232,7 @@ def _force_sync_optimizer_fp32_from_model(optimizer, model):
             hdo.update_fp32_param_by_new_param()
         return True
 
-    applied = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            applied |= _sync_distrib_opt(sub_opt)
-    else:
-        applied = _sync_distrib_opt(optimizer)
+    applied = _sync_distrib_opt(optimizer)
 
     if applied and rank == 0:
         print(
@@ -259,6 +259,11 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     def _sync_distrib_opt(distrib_opt):
+        if hasattr(distrib_opt, "chained_optimizers"):
+            applied = False
+            for child in distrib_opt.chained_optimizers:
+                applied |= _sync_distrib_opt(child)
+            return applied
         try:
             from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
                 HybridDeviceOptimizer,
@@ -286,12 +291,7 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
             model_chunk.start_param_sync(force_sync=True)
         return True
 
-    applied = False
-    if hasattr(optimizer, "chained_optimizers"):
-        for sub_opt in optimizer.chained_optimizers:
-            applied |= _sync_distrib_opt(sub_opt)
-    else:
-        applied = _sync_distrib_opt(optimizer)
+    applied = _sync_distrib_opt(optimizer)
 
     if applied and rank == 0:
         print(
@@ -2731,7 +2731,7 @@ def setup_model_and_optimizer(
         if optimizer is not None:
             if megatron_cfg.checkpoint.finetune:
                 _force_sync_optimizer_fp32_from_model(optimizer, model)
-            elif resume_checkpoint_exists:
+            elif resume_checkpoint_exists and megatron_cfg.checkpoint.load_optim:
                 _force_sync_model_from_optimizer_fp32(optimizer)
     torch.distributed.barrier()
 
