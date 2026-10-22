@@ -30,6 +30,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.openai_server_utils import PrefixSplice
+from nemo_rl.models.generation.score_centering import (
+    VLLM_LOGPROB_FLOOR,
+    extract_score_centering_samples,
+)
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.metric_names import (
     FINISHED_REASON_LABEL,
@@ -57,7 +61,6 @@ def _format_refit_key_error(label: str, keys: set[str]) -> str:
 
 
 R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
-VLLM_LOGPROB_FLOOR = -9999.0
 
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
@@ -693,26 +696,12 @@ def attach_sampler_topk_logprobs_to_chat_response_choices(
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
     for choice in getattr(response, "choices", []):
-        ranked = [
-            sorted(position.items(), key=lambda item: item[1].rank)[:top_k]
-            for position in outputs_by_index[choice.index].logprobs or []
-        ]
-        if any(len(row) != top_k for row in ranked):
-            raise RuntimeError(
-                "vLLM returned fewer than top_k log-probs for a generated position "
-                f"while attaching top-k information: choice_idx={choice.index}, "
-                f"top_k={top_k}."
-            )
-        choice.message.sampler_topk_token_ids = torch.tensor(
-            [[token_id for token_id, _ in row] for row in ranked], dtype=torch.int32
-        ).reshape(-1, top_k)
-        choice.message.sampler_topk_logprobs = torch.tensor(
-            [
-                [max(float(entry.logprob), VLLM_LOGPROB_FLOOR) for _, entry in row]
-                for row in ranked
-            ],
-            dtype=torch.float32,
-        ).reshape(-1, top_k)
+        (
+            choice.message.sampler_topk_token_ids,
+            choice.message.sampler_topk_logprobs,
+        ) = extract_score_centering_samples(
+            outputs_by_index[choice.index], num_candidates=top_k
+        )
 
     return response
 

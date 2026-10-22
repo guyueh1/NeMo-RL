@@ -96,6 +96,9 @@ from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
 )
+from nemo_rl.models.generation.score_centering import (
+    build_score_centering_request_overrides,
+)
 from nemo_rl.models.policy import PolicyConfig, TokenizerConfig
 from nemo_rl.telemetry.instrumentation import (
     accepts_trace_context,
@@ -845,10 +848,10 @@ Depending on your data shape, you may want to change these values."""
                 _external_staging_backend(token_capture) == "vllm_worker"
                 and token_capture.get("top_logprobs", 0) > 0
             ):
-                # Request the same count over HTTP that the engine collects.
-                # The worker stages these arrays before stripping its response.
                 policy_overrides.setdefault("sampling_overrides", {}).update(
-                    logprobs=True, top_logprobs=token_capture["top_logprobs"]
+                    build_score_centering_request_overrides(
+                        num_candidates=token_capture["top_logprobs"]
+                    )
                 )
             capture_dir = os.path.abspath(token_capture["capture_dir"])
             initial_global_config_dict["token_id_capture"] = {

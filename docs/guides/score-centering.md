@@ -133,6 +133,25 @@ adapter that overwrites `top_logprobs` with zero is rejected by the worker.
 The fields above are separate from the teacher/student top-k tensors used by
 on-policy distillation.
 
+### Extending Candidate Collection
+
+[The sampler adapter](../../nemo_rl/models/generation/score_centering.py)
+keeps request preparation and extraction behind three standalone functions:
+
+- `build_score_centering_request_overrides(num_candidates=K)` supplies the
+  HTTP fields that Gym merges into each policy request.
+- `validate_score_centering_request(request, num_candidates=K)` checks the
+  collection settings on the serving worker before capture admission.
+- `extract_score_centering_samples(output, num_candidates=K)` returns CPU
+  `(sampler_ids, sampler_logprobs)` tensors with shape `[generated_len, K]`,
+  int32 IDs, and float32 logprobs under the sampler distribution.
+
+Today these functions implement top-k collection. A future candidate-selection
+strategy can change request preparation, validation, and extraction together
+while preserving the tensor pair and the existing staging fields. The loss
+estimator must also match that strategy; this interface does not implement
+sampling without replacement or change the current top-k estimator.
+
 ## Supported Layouts and Costs
 
 - Megatron's ordinary loss preparation supports tensor/context parallel

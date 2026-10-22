@@ -54,6 +54,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.score_centering import validate_score_centering_request
 from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
 )
@@ -736,14 +737,9 @@ class VllmAsyncGenerationWorkerImpl(
             admission = self._capture_admission(request)
             if admission is None:
                 return
-        if self._capture_top_logprobs and (
-            not getattr(request, "logprobs", False)
-            or getattr(request, "top_logprobs", None) != self._capture_top_logprobs
-        ):
-            raise ValueError(
-                "Captured score-centering requests must set logprobs=true and "
-                f"top_logprobs={self._capture_top_logprobs} over HTTP. "
-                "Use a Gym capture adapter that preserves top_logprobs."
+        if self._capture_top_logprobs:
+            validate_score_centering_request(
+                request, num_candidates=self._capture_top_logprobs
             )
         call = capture.begin_call(
             admission,
