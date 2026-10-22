@@ -120,7 +120,9 @@ zero instead of being clamped. Both the head and modeled tail use this rule.
 ## Data Flow
 
 1. NeMo-RL configures Gym to send `logprobs=true, top_logprobs=K` in each policy
-   HTTP request. The Gym capture adapter preserves the explicit count.
+   HTTP request. Gym's final request preprocessing normalizes a missing/null
+   count to zero when logprobs are enabled and preserves an explicit count.
+   The capture adapter leaves that count unchanged.
 2. vLLM resolves that request normally. The worker checks that the requested K
    matches its configured capture count and extracts the engine's top-k IDs
    and logprobs before response serialization.
