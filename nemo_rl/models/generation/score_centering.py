@@ -63,6 +63,11 @@ def validate_score_centering_request(request: Any, *, num_candidates: int) -> No
         request: Resolved OpenAI-compatible chat request on the vLLM worker.
         num_candidates: Candidate count configured for capture.
     """
+    if getattr(request, "logprob_token_ids", None):
+        raise ValueError(
+            "Score-centering requests must omit logprob_token_ids: vLLM would "
+            "return specific IDs instead of the sampler's top-k head."
+        )
     expected = build_score_centering_request_overrides(num_candidates=num_candidates)
     if any(getattr(request, key, None) != value for key, value in expected.items()):
         raise ValueError(

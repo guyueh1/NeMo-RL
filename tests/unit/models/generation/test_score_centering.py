@@ -79,6 +79,23 @@ def test_score_centering_empty_completion(logprobs):
     assert sampler_logprobs.dtype == torch.float32
 
 
+@pytest.mark.parametrize("token_ids", [[1], [1, 2]])
+def test_score_centering_rejects_specific_logprob_ids(token_ids):
+    request = SimpleNamespace(
+        logprobs=True, top_logprobs=2, logprob_token_ids=token_ids
+    )
+    with pytest.raises(ValueError, match="omit logprob_token_ids"):
+        validate_score_centering_request(request, num_candidates=2)
+
+
+@pytest.mark.parametrize("token_ids", [None, []])
+def test_score_centering_allows_unset_specific_logprob_ids(token_ids):
+    request = SimpleNamespace(
+        logprobs=True, top_logprobs=2, logprob_token_ids=token_ids
+    )
+    validate_score_centering_request(request, num_candidates=2)
+
+
 def test_score_centering_rejects_incomplete_candidates():
     output = SimpleNamespace(
         index=0, token_ids=[1], logprobs=[{1: SimpleNamespace(rank=1, logprob=-0.1)}]

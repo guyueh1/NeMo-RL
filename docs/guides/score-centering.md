@@ -96,7 +96,10 @@ policy:
 ```
 
 `top_logprobs` controls how many candidates are recorded; it does not truncate
-sampling. `max_logprobs` must be at least that count. Use positive temperature and
+sampling. `max_logprobs` must be at least that count. Requests must omit nonempty
+`logprob_token_ids`: vLLM would return those specific IDs instead of its top-k
+head, even if the list contains K IDs. Such requests are rejected.
+Use positive temperature and
 `processed_logprobs` to keep the reported sampler probabilities consistent
 with the distribution being sampled. Startup validation checks the top-p and
 top-k filters and rejects nonpositive/nonfinite temperatures. Raw/default logprobs
