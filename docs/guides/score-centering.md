@@ -216,11 +216,14 @@ activity, and zero invalid-row and poisoned-rollout metrics. The
 `train/score_centering_head_mass` metric proves the score-centering loss path
 executed. This smoke does not establish convergence, large-K performance, or
 TP/CP correctness. Separate packed TP/CP unit tests compare values and gradients
-against an unpacked, full-vocabulary reference and require GPUs.
+against an unpacked, full-vocabulary reference.
 
 The L1 plan discovers `L1_Functional_Tests_ScoreCentering_Distributed.sh` for
-packed and unpacked TP/CP gradient checks, including TP=2/CP=2. This entrypoint
-requires four visible GPUs and bypasses `tests/run_unit.sh`'s two-GPU mask:
+packed and unpacked TP/CP checks. This entrypoint requires two visible GPUs
+for TP=2/CP=1 and TP=1/CP=2 on NCCL. It also runs packed value and gradient
+checks on CPU/Gloo with four processes for combined TP=2/CP=2, using the same
+reference and assertions as the GPU test. Combined four-GPU NCCL cases run
+when four GPUs are visible and are skipped on the two-GPU CI runners:
 
 ```bash
 uv run --no-sync bash tests/functional/L1_Functional_Tests_ScoreCentering_Distributed.sh

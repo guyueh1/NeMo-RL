@@ -13,6 +13,7 @@
 # limitations under the License.
 import functools
 import os
+from datetime import timedelta
 
 import pytest
 import ray
@@ -2240,4 +2241,33 @@ def test_score_centering_packed_tp_cp(distributed_test_runner, tp_size, cp_size)
             device="cuda",
         ),
         world_size=tp_size * cp_size,
+    )
+
+
+def _run_score_centering_packed_gloo(rank, tp_size, cp_size, init_file):
+    """Exercise combined TP/CP collectives without requiring four GPU devices."""
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=tp_size * cp_size,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        _run_score_centering_packed_equivalence(
+            rank, tp_size * cp_size, tp_size, cp_size, device="cpu"
+        )
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("tp_size,cp_size", [(2, 1), (1, 2), (2, 2)])
+def test_score_centering_packed_tp_cp_gloo(tmp_path, tp_size, cp_size):
+    """Retain combined TP=2/CP=2 value/gradient coverage on two-GPU CI runners."""
+    torch.multiprocessing.spawn(
+        _run_score_centering_packed_gloo,
+        args=(tp_size, cp_size, str(tmp_path / "gloo-init")),
+        nprocs=tp_size * cp_size,
+        join=True,
     )
