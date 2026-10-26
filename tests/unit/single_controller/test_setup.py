@@ -3976,7 +3976,9 @@ def test_token_capture_top_logprobs_reaches_partitions_workers_and_finalizers(
 
     with (
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+        ) as mock_gym,
         patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
         patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
         patch(
@@ -4000,6 +4002,7 @@ def test_token_capture_top_logprobs_reaches_partitions_workers_and_finalizers(
             top_logprobs > 0
         )
     generation, _ = patched_factories["_build_generation"].return_value
+    assert mock_gym.call_args.kwargs["token_capture"]["top_logprobs"] == top_logprobs
     _, setup_kwargs = generation.setup_token_capture.call_args
     assert setup_kwargs.get("top_logprobs", 0) == top_logprobs
     assert mock_finalizers.call_args.args[1].top_logprobs == top_logprobs
