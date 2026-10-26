@@ -1713,6 +1713,7 @@ def get_policy_logprobs_at_sampler_topk(
     cp_sharder: Optional["ContextParallelSharder"] = None,
     cu_seqlens_q: Optional[CpuIntTuple] = None,
     cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
+    packed_sampler_topk_token_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Next-token log-probs at each position's sampler top-k ids.
 
@@ -1737,6 +1738,9 @@ def get_policy_logprobs_at_sampler_topk(
         cu_seqlens_q_padded: CPU padded boundaries for those same rows.
             With packing, CP shards are reconstructed separately per sequence.
 
+        packed_sampler_topk_token_ids: Caller-packed, next-token-aligned IDs
+            ``[1, T // CP, k]``, required with packed boundaries.
+
     Returns:
         Log-probs ``[B, S - 1, k]``.
     """
@@ -1752,9 +1756,6 @@ def get_policy_logprobs_at_sampler_topk(
         )
     if chunk_size is None:
         chunk_size = int(next_token_logits.shape[1])
-    sampler_topk_token_ids = sampler_topk_token_ids.to(
-        device=next_token_logits.device, dtype=torch.long
-    )
     cp_size = (
         1
         if context_parallel_group is None
@@ -1766,24 +1767,15 @@ def get_policy_logprobs_at_sampler_topk(
         else torch.distributed.get_rank(context_parallel_group)
     )
     if cu_seqlens_q is not None:
-        from nemo_rl.algorithms.loss.utils import _pack_input_ids
-
-        assert cu_seqlens_q_padded is not None
-        targets = torch.stack(
-            [
-                _pack_input_ids(
-                    sampler_topk_token_ids[..., i],
-                    cu_seqlens_q,
-                    cu_seqlens_q_padded,
-                    cp_rank=cp_rank,
-                    cp_size=cp_size,
-                    roll_shift=-1,
-                )
-                for i in range(sampler_topk_token_ids.shape[-1])
-            ],
-            dim=-1,
+        if packed_sampler_topk_token_ids is None:
+            raise ValueError("Packed sampler IDs must be prepared by the loss caller")
+        targets = packed_sampler_topk_token_ids.to(
+            device=next_token_logits.device, dtype=torch.long
         )
     else:
+        sampler_topk_token_ids = sampler_topk_token_ids.to(
+            device=next_token_logits.device, dtype=torch.long
+        )
         full_width = next_token_logits.shape[1] * cp_size
         if sampler_topk_token_ids.shape[1] > full_width:
             raise ValueError(
@@ -1831,7 +1823,7 @@ def get_policy_logprobs_at_sampler_topk(
     # Packed CP is load-balanced within each sequence, not across the full pack.
     assert cu_seqlens_q_padded is not None
     rows = []
-    for i in range(sampler_topk_token_ids.shape[0]):
+    for i in range(len(cu_seqlens_q) - 1):
         start = int(cu_seqlens_q_padded[i])
         end = int(cu_seqlens_q_padded[i + 1])
         row = head[:, start // cp_size : end // cp_size]

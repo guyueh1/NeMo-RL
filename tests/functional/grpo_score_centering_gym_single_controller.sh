@@ -35,7 +35,7 @@ for IS_MODE in off is tis icepop; do
     # objective and ordinary logits path. This smoke is not a convergence test.
     SC_TEST_EXP_NAME="$EXP_NAME" RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
         ++token_capture.enabled=true \
-        ++token_capture.top_logprobs=16 \
+        ++policy.generation.top_logprobs=16 \
         ++loss_fn.score_centering=true \
         loss_fn.sequence_level_importance_ratios=false \
         loss_fn.token_level_loss=true \
@@ -50,7 +50,6 @@ for IS_MODE in off is tis icepop; do
         policy.generation.top_p=1.0 \
         policy.generation.top_k=null \
         ++policy.generation.vllm_cfg.logprobs_mode=processed_logprobs \
-        ++policy.generation.vllm_kwargs.max_logprobs=16 \
         grpo.max_num_steps=3 \
         "${IS_OVERRIDES[@]}"
 

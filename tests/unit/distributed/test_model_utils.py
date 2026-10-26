@@ -2136,6 +2136,7 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
 
     from nemo_rl.algorithms.loss.interfaces import LossInputType
     from nemo_rl.algorithms.loss.loss_input import prepare_packed_loss_input
+    from nemo_rl.algorithms.loss.utils import _pack_input_ids
 
     tp_groups = [
         torch.distributed.new_group([c * tp_size + t for t in range(tp_size)])
@@ -2181,6 +2182,9 @@ def _run_score_centering_packed_equivalence(rank, world_size, tp_size, cp_size, 
         chunk_size=2,
         cu_seqlens_q=lengths,
         cu_seqlens_q_padded=padded,
+        packed_sampler_topk_token_ids=_pack_input_ids(
+            ids, lengths, padded, cp_rank=cp_rank, cp_size=cp_size, roll_shift=-1
+        ),
     )
     data = {
         "input_ids": ids[..., 0],

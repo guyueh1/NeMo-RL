@@ -670,10 +670,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     defer_routed_experts_to_policy: bool = False
     # Fixed CPU finalizer pool size; actors are never automatically replaced.
     num_reassembler_workers: PositiveInt = 2
-    # Also stage the sampler's top-k log-probs for every generated token
-    # (0 = off); loss_fn.score_centering consumes them. Needs
-    # policy.generation.vllm_kwargs.max_logprobs >= top_logprobs.
-    top_logprobs: int = 0
 
 
 @dataclass(frozen=True)
@@ -1373,28 +1369,32 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "(env.should_use_nemo_gym=true) on SingleController"
         )
 
-    top_logprobs = master_config.token_capture.top_logprobs
+    generation_cfg = master_config.policy["generation"]
+    top_logprobs = generation_cfg.get("top_logprobs", 0)
+    if (
+        isinstance(top_logprobs, bool)
+        or not isinstance(top_logprobs, int)
+        or top_logprobs < 0
+    ):
+        raise ValueError("policy.generation.top_logprobs must be a nonnegative integer")
+    if top_logprobs > 0 and not master_config.loss_fn.score_centering:
+        raise ValueError(
+            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering; "
+            "set it to 0 or enable score centering"
+        )
     if top_logprobs > 0:
         if master_config.policy["generation"]["backend"] != "vllm":
             raise ValueError(
-                "token_capture.top_logprobs requires the vllm generation backend"
+                "policy.generation.top_logprobs requires the vllm generation backend"
             )
         if not master_config.token_capture.enabled:
             raise ValueError(
-                "token_capture.top_logprobs requires token_capture.enabled=true"
-            )
-        vllm_kwargs = master_config.policy["generation"].get("vllm_kwargs") or {}
-        max_logprobs = vllm_kwargs.get("max_logprobs")
-        if max_logprobs is None or max_logprobs < top_logprobs:
-            raise ValueError(
-                "token_capture.top_logprobs requires "
-                f"policy.generation.vllm_kwargs.max_logprobs >= {top_logprobs} "
-                "(vLLM's default is 20)"
+                "policy.generation.top_logprobs requires token_capture.enabled=true"
             )
     if master_config.loss_fn.score_centering:
         if top_logprobs == 0:
             raise ValueError(
-                "loss_fn.score_centering requires token_capture.top_logprobs > 0"
+                "loss_fn.score_centering requires policy.generation.top_logprobs > 0"
             )
         generation_cfg = master_config.policy["generation"]
         temperature = generation_cfg["temperature"]
@@ -1424,6 +1424,24 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "loss_fn.score_centering needs unfiltered sampling "
                 "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
                 "the sampling distribution"
+            )
+
+        automodel_cfg = master_config.policy.get("automodel_cfg") or {}
+        if automodel_cfg.get("enabled") and (
+            automodel_cfg["tensor_parallel_size"] > 1
+            or automodel_cfg["context_parallel_size"] > 1
+        ):
+            raise ValueError(
+                "loss_fn.score_centering supports Automodel only with "
+                "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+            )
+        megatron_cfg = master_config.policy.get("megatron_cfg") or {}
+        if megatron_cfg.get("enabled") and megatron_cfg.get(
+            "use_fused_linear_logprobs"
+        ):
+            raise ValueError(
+                "loss_fn.score_centering needs vocabulary logits; disable "
+                "policy.megatron_cfg.use_fused_linear_logprobs"
             )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:

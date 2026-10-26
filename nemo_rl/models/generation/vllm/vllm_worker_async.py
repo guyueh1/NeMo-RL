@@ -299,8 +299,7 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
 
         self._chain_prefix = ChainPrefixCache()
-        self._staging_sink: Any | None = None
-        # token_capture.top_logprobs: sampler top-k log-probs staged next to each
+        # policy.generation.top_logprobs: sampler top-k log-probs staged next to each
         # captured call's delta; 0 leaves captured calls as they are.
         self._capture_top_logprobs = 0
 
@@ -600,9 +599,9 @@ class VllmAsyncGenerationWorkerImpl(
         self,
         dp_cfg: dict[str, Any],
         staging_partition: str,
-        top_logprobs: int = 0,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -636,7 +635,6 @@ class VllmAsyncGenerationWorkerImpl(
             capture_media=capture_media,
             media_pixel_dtype=pixel_dtype,
         )
-        self._staging_sink = sink
         self._capture_top_logprobs = int(top_logprobs)
         if capture_media:
             # Omni-only: a new processor family must also change setup.py (driver
@@ -965,7 +963,7 @@ class VllmAsyncGenerationWorkerImpl(
                 prompt_len=len(prompt_token_ids),
                 generated_len=len(generated_token_ids),
             )
-        attachments = dict(state.media.tensors) if state.media is not None else {}
+        attachments = dict(state.media.tensors or {}) if state.media is not None else {}
         if sampler_topk is not None:
             attachments.update(
                 sampler_topk_token_ids=sampler_topk[0],
@@ -1409,12 +1407,12 @@ class VllmAsyncGenerationWorkerImpl(
                         final_res,
                     )
                     if request.ng_capture and worker_self._capture_top_logprobs:
-                        response = (
-                            attach_sampler_topk_logprobs_to_chat_response_choices(
-                                response,
-                                final_res,
-                                top_k=worker_self._capture_top_logprobs,
-                            )
+                        # Extraction scales with completion length and K.
+                        response = await asyncio.to_thread(
+                            attach_sampler_topk_logprobs_to_chat_response_choices,
+                            response,
+                            final_res,
+                            top_k=worker_self._capture_top_logprobs,
                         )
 
                 if worker_self._return_routed_experts_enabled():

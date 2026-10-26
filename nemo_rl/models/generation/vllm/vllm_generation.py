@@ -703,9 +703,9 @@ class VllmGeneration(GenerationInterface):
         self,
         dp_cfg: "DataPlaneConfig",
         staging_partition: str,
-        top_logprobs: int = 0,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 

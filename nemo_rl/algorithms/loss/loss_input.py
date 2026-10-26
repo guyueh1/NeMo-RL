@@ -62,7 +62,7 @@ def _validate_score_centering_data(data: BatchedDataDict[Any]) -> None:
         raise ValueError(
             f"Score centering requires {', '.join(missing)}: use SingleController "
             "with NeMo Gym + vLLM, token_capture.enabled=true and "
-            "token_capture.top_logprobs > 0."
+            "policy.generation.top_logprobs > 0."
         )
 
 
@@ -602,6 +602,14 @@ def prepare_packed_loss_input(
     if need_top_k_or_top_p_filtering(sampling_params):
         loss_input["policy_support_mask"] = ~torch.isneginf(logprobs)
     if getattr(loss_fn, "score_centering", False):
+        packed_sampler_ids = _pack_input_ids(
+            data["sampler_topk_token_ids"],
+            cu_seqlens_q,
+            cu_seqlens_q_padded,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            roll_shift=-1,
+        )
         loss_input["policy_logprobs_at_sampler_topk"] = (
             get_policy_logprobs_at_sampler_topk(
                 sampler_topk_token_ids=data["sampler_topk_token_ids"],
@@ -612,6 +620,7 @@ def prepare_packed_loss_input(
                 chunk_size=chunk_size,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_q_padded=cu_seqlens_q_padded,
+                packed_sampler_topk_token_ids=packed_sampler_ids,
             )
         )
     return loss_input, data

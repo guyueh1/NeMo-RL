@@ -3564,8 +3564,9 @@ def _expected_gradient_under_sampler(loss_fn, z, q, head):
     return expected, metrics
 
 
+@pytest.mark.parametrize("token_level_loss", [True, False])
 @pytest.mark.parametrize("mode", ["off", "is", "tis", "icepop"])
-def test_score_centering_cancels_the_drift_under_the_sampler(mode):
+def test_score_centering_cancels_the_drift_under_the_sampler(mode, token_level_loss):
     """With the switch on, the sampler-expected update is zero under a constant advantage.
 
     That is the paper's defining property: a constant advantage carries no
@@ -3574,6 +3575,7 @@ def test_score_centering_cancels_the_drift_under_the_sampler(mode):
     z, q, head = _score_centering_distributions(12, seed=0)
     common = dict(
         reference_policy_kl_penalty=0.0,
+        token_level_loss=token_level_loss,
         use_importance_sampling_correction=mode != "off",
         truncated_importance_sampling_type=mode if mode in ("tis", "icepop") else None,
         truncated_importance_sampling_ratio=5.0 if mode in ("tis", "icepop") else None,

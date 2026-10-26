@@ -68,7 +68,7 @@ def test_score_centering_preparation_rejects_missing_sampler_data(packed, missin
     del data[missing]
     loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
     with pytest.raises(
-        ValueError, match=f"{missing}.*SingleController.*token_capture.top_logprobs"
+        ValueError, match=f"{missing}.*SingleController.*policy.generation.top_logprobs"
     ):
         if packed:
             prepare_packed_loss_input(

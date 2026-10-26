@@ -73,7 +73,6 @@ loss_fn:
 
 token_capture:
   enabled: true
-  top_logprobs: 16
 
 policy:
   sequence_packing:
@@ -88,15 +87,16 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    top_logprobs: 16
     vllm_cfg:
       async_engine: true
       logprobs_mode: processed_logprobs
-    vllm_kwargs:
-      max_logprobs: 16
 ```
 
 `top_logprobs` controls how many candidates are recorded; it does not truncate
-sampling. `max_logprobs` must be at least that count. Requests must omit nonempty
+sampling. Setup raises vLLM's `max_logprobs` cap to at least that count when
+needed; an explicit `-1` (unlimited) cap is preserved. A positive count requires
+score centering and token capture. Requests must omit nonempty
 `logprob_token_ids`: vLLM would return those specific IDs instead of its top-k
 head, even if the list contains K IDs. Such requests are rejected.
 Use positive temperature and
@@ -125,7 +125,9 @@ zero instead of being clamped. Both the head and modeled tail use this rule.
 ## Data Flow
 
 1. NeMo-RL configures Gym to send `logprobs=true, top_logprobs=K` in each policy
-   HTTP request. Gym's final request preprocessing normalizes a missing/null
+   HTTP request. This applies to every request to the policy model server,
+   including uncaptured calls such as a judge routed to `policy_model`.
+   Uncaptured responses carry the top-k values over HTTP. Gym's final request preprocessing normalizes a missing/null
    count to zero when logprobs are enabled and preserves an explicit count.
    The capture adapter leaves that count unchanged.
 2. vLLM resolves that request normally. The worker checks that the requested K

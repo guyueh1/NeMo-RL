@@ -111,7 +111,7 @@ class FinalizedRollout:
     media: Optional[dict[str, PackedTensor]] = None
     penalty_counts: dict[str, int] = field(default_factory=dict)
     reward_metrics: dict[str, float] = field(default_factory=dict)
-    # Sampler top-k per token (token_capture.top_logprobs): [len(token_ids), k]
+    # Sampler top-k per token (policy.generation.top_logprobs): [len(token_ids), k]
     # int32 ids and float32 log-probs, zeros on carried tokens; None when off.
     sampler_topk_token_ids: Optional[torch.Tensor] = None
     sampler_topk_logprobs: Optional[torch.Tensor] = None
@@ -289,7 +289,7 @@ class RolloutReassembler:
         self._max_seq_len = int(max_seq_len)
         self._router_replay_enabled = router_replay_enabled
         self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
-        # token_capture.top_logprobs: sampler top-k columns to assemble (0 = none).
+        # policy.generation.top_logprobs: sampler top-k columns to assemble (0 = none).
         self._top_logprobs = int(top_logprobs)
         if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
             raise ValueError(

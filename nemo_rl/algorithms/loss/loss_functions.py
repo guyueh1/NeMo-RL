@@ -254,7 +254,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     enable_torch_compile: bool = False
     # Score centering (arXiv:2609.20807): per token, add A * sum_v sg(c_v) log p_v
     # over the sampler's top-k ids so the update subtracts the sampler-expected
-    # weighted score. Needs token_capture.top_logprobs > 0; supports IS off,
+    # weighted score. Needs policy.generation.top_logprobs > 0; supports IS off,
     # token-level untruncated IS, TIS and ICEPOP.
     score_centering: bool = False
 
@@ -754,22 +754,6 @@ class ClippedPGLossFn(LossFunction):
         # rows without response loss tokens.
         sample_mask = sample_mask * token_mask.bool().any(dim=-1)
         mask = token_mask * sample_mask.unsqueeze(-1)
-        if self.score_centering:
-            # Mask before exponentiation: multiplying NaNs by zero afterwards
-            # cannot prevent contamination of either the loss or its gradient.
-            active = mask.bool()
-            curr_logprobs = torch.where(active, curr_logprobs, 0.0)
-            generation_logprobs = torch.where(active, generation_logprobs, 0.0)
-            advantages = torch.where(active, advantages.detach(), 0.0)
-            if prev_logprobs is not None:
-                prev_logprobs = torch.where(active, prev_logprobs, 0.0)
-            if self.reference_policy_kl_penalty != 0:
-                reference_policy_logprobs = torch.where(
-                    active, reference_policy_logprobs, 0.0
-                )
-                curr_logprobs_unfiltered = torch.where(
-                    active, curr_logprobs_unfiltered, 0.0
-                )
         full_metrics = self.metrics_level == "full"
         need_importance_weights = (
             full_metrics or self.use_importance_sampling_correction
@@ -839,6 +823,8 @@ class ClippedPGLossFn(LossFunction):
         curr_logprobs = torch.where(mask.bool(), curr_logprobs, 0.0)
         prev_logprobs = torch.where(mask.bool(), prev_logprobs, 0.0)
         generation_logprobs = torch.where(mask.bool(), generation_logprobs, 0.0)
+        if self.score_centering:
+            advantages = torch.where(mask.bool(), advantages.detach(), 0.0)
         if self.seq_logprob_error_in_loss:
             seq_error_metrics["seq_logprob_error_valid_tokens"] = mask.sum().item()
             seq_error_metrics["seq_logprob_error_valid_seqs"] = sample_mask.sum().item()

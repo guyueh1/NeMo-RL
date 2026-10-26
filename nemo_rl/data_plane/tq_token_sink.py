@@ -29,7 +29,7 @@ the wire, matching ``compute_staging_digest``'s float32-bit-pattern scheme, so
 digest recomputation over fetched values is byte-exact. Route payloads never
 ride inside snapshots: the source returns them as separate ``RouteFragment``
 values keyed by staging key, digest-verified by the plan executor at point of
-use. With ``token_capture.top_logprobs`` the worker adds two more jagged
+use. With ``policy.generation.top_logprobs`` the worker adds two more jagged
 columns to the same staging put through the opaque attachment mapping: the
 sampler's top-k ids and log-probs of the call's generated tokens. They are not
 digest-covered; the finalizer checks their shape against the generated length.
@@ -994,7 +994,7 @@ class TQTokenSource:
         ``include_route_fragments=True`` to pull the payloads in the same
         batched read and receives them as ``RouteFragment`` values beside the
         base snapshots, never inside them. ``include_sampler_topk`` adds the sampler
-        top-k columns (``token_capture.top_logprobs``); a row without them
+        top-k columns (``policy.generation.top_logprobs``); a row without them
         fails the fetch like a missing row.
         """
         if not staging_keys:

@@ -340,7 +340,7 @@ def _register_single_controller_partitions(
             DP_TRAIN_FIELDS,
             enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
         )
-        if token_capture_cfg.top_logprobs > 0:
+        if master_config.policy["generation"]["top_logprobs"] > 0:
             partition_fields.extend(SAMPLER_TOPK_FIELDS)
     if include_multimodal_fields:
         partition_fields.extend(
@@ -370,7 +370,11 @@ def _register_single_controller_partitions(
             fields=list(STAGING_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else [])
             + (list(MEDIA_STAGING_FIELDS) if capture_media else [])
-            + (list(SAMPLER_TOPK_FIELDS) if token_capture_cfg.top_logprobs > 0 else []),
+            + (
+                list(SAMPLER_TOPK_FIELDS)
+                if master_config.policy["generation"]["top_logprobs"] > 0
+                else []
+            ),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
@@ -815,9 +819,12 @@ def _spinup_gym(
         enable_router_replay=enable_router_replay,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         policy_api_key=policy_api_key,
-        # Ledger config rides into Gym's policy model server.
+        # Capture transport config includes the generation request's candidate count.
         token_capture=(
-            master_config.token_capture.model_dump()
+            {
+                **master_config.token_capture.model_dump(),
+                "top_logprobs": generation_config["top_logprobs"],
+            }
             if master_config.token_capture.enabled
             else None
         ),
@@ -1105,6 +1112,14 @@ def setup_single_controller(
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    generation_config = master_config.policy["generation"]
+    # Normalize the optional request count once before partitions/workers start.
+    top_logprobs = generation_config.setdefault("top_logprobs", 0)
+    if top_logprobs > 0:
+        vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+        cap = vllm_kwargs.get("max_logprobs")
+        if cap is None or (cap != -1 and cap < top_logprobs):
+            vllm_kwargs["max_logprobs"] = top_logprobs
     resolved_reward_penalty_config = resolve_reward_penalty_config(
         master_config.reward_penalties,
         tokenizer,
@@ -2113,19 +2128,12 @@ def setup_single_controller(
     # Mooncake memory owners when storage_unit_segment_size > 0.
     storage_units = start_storage_units(dp_config, storage_unit_node_ids)
     if token_capture_cfg.enabled:
-        if token_capture_cfg.top_logprobs > 0:
-            media_columns = cast(VllmGeneration, generation).setup_token_capture(
-                dp_config,
-                token_capture_cfg.staging_partition,
-                capture_media=capture_media,
-                top_logprobs=token_capture_cfg.top_logprobs,
-            )
-        else:
-            media_columns = generation.setup_token_capture(
-                dp_config,
-                token_capture_cfg.staging_partition,
-                capture_media=capture_media,
-            )
+        media_columns = generation.setup_token_capture(
+            dp_config,
+            token_capture_cfg.staging_partition,
+            capture_media=capture_media,
+            top_logprobs=master_config.policy["generation"]["top_logprobs"],
+        )
         if capture_media and media_columns is None:
             raise RuntimeError(
                 "media capture is enabled but no serving worker reported the "
@@ -2200,7 +2208,7 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
-                top_logprobs=token_capture_cfg.top_logprobs,
+                top_logprobs=master_config.policy["generation"]["top_logprobs"],
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,
         )
