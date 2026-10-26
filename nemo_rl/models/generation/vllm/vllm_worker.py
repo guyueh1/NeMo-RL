@@ -66,8 +66,8 @@ from nemo_rl.models.generation.vllm.video_utils import (
 from nemo_rl.models.generation.vllm.worker_utils import (
     find_tokenizer_required_architectures,
     resolve_distributed_executor_backend,
-    resolve_vllm_dp_size,
     resolve_vllm_dp_settings,
+    resolve_vllm_dp_size,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
