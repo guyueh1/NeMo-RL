@@ -333,9 +333,6 @@ class GenerationSamplingParams:
     temperature: float
     top_p: float
     top_k: int | None
-    top_logprobs: NotRequired[
-        int
-    ]  # Sampler candidates per token; 0 disables collection.
 
     @classmethod
     def from_generation_config(
