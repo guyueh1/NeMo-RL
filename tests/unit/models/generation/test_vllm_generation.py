@@ -3994,6 +3994,98 @@ def test_vllm_non_divisible_batch_handling(policy):
     )
 
 
+def test_sync_vllm_dp_empty_shards_enter_engine_loop():
+    class EngineEntered(Exception):
+        pass
+
+    batch_size = 17
+    dp_size = 16
+    max_new_tokens = 5
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.ones((batch_size, 1), dtype=torch.long),
+            "input_lengths": torch.ones(batch_size, dtype=torch.long),
+        }
+    )
+    shards = batch.shard_by_batch_size(dp_size, allow_uneven_shards=True)
+    empty_ranks = 0
+    for data in shards:
+        row_count = len(data["input_ids"])
+        empty_ranks += row_count == 0
+        worker = object.__new__(VllmGenerationWorkerImpl)
+        worker.cfg = {
+            "vllm_cfg": {"async_engine": False},
+            "_pad_token_id": 0,
+            "top_k": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": max_new_tokens,
+            "stop_token_ids": None,
+        }
+        worker.tensor_parallel_size = 1
+        worker.expert_parallel_size = dp_size
+        worker.llm = MagicMock()
+        worker.llm.generate.side_effect = EngineEntered
+        worker.SamplingParams = MagicMock()
+        with pytest.raises(EngineEntered):
+            worker.generate(data)
+
+        if row_count == 0:
+            args, kwargs = worker.llm.generate.call_args
+            assert args[0] == [{"prompt_token_ids": [0]}]
+            assert kwargs == {"use_tqdm": False}
+            worker.SamplingParams.assert_called_once_with(
+                temperature=0.0, max_tokens=max_new_tokens, ignore_eos=True
+            )
+        else:
+            worker.llm.generate.assert_called_once()
+    assert empty_ranks == 7
+
+
+def test_sync_vllm_dp_empty_text_shards_enter_engine_loop():
+    class EngineEntered(Exception):
+        pass
+
+    batch_size = 17
+    dp_size = 16
+    max_new_tokens = 5
+    batch = BatchedDataDict({"prompts": ["prompt"] * batch_size})
+    shards = batch.shard_by_batch_size(dp_size, allow_uneven_shards=True)
+    empty_ranks = 0
+    for data in shards:
+        row_count = len(data["prompts"])
+        empty_ranks += row_count == 0
+        worker = object.__new__(VllmGenerationWorkerImpl)
+        worker.cfg = {
+            "vllm_cfg": {"async_engine": False},
+            "_pad_token_id": 0,
+            "top_k": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": max_new_tokens,
+            "stop_token_ids": None,
+        }
+        worker.tensor_parallel_size = 1
+        worker.expert_parallel_size = dp_size
+        worker.llm = MagicMock()
+        worker.llm.generate.side_effect = EngineEntered
+        worker.SamplingParams = MagicMock()
+        worker._tokenize_prompt_with_bos = lambda prompt: prompt
+        with pytest.raises(EngineEntered):
+            worker.generate_text(data)
+
+        if row_count == 0:
+            args, kwargs = worker.llm.generate.call_args
+            assert args[0] == [{"prompt_token_ids": [0]}]
+            assert kwargs == {"use_tqdm": False}
+            worker.SamplingParams.assert_called_once_with(
+                temperature=0.0, max_tokens=max_new_tokens, ignore_eos=True
+            )
+        else:
+            worker.llm.generate.assert_called_once()
+    assert empty_ranks == 7
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_engine", [True, False])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])

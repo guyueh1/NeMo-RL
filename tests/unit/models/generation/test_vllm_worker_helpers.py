@@ -22,6 +22,8 @@ from nemo_rl.models.generation.vllm.worker_utils import (
     resolve_distributed_executor_backend,
     resolve_vllm_dp_group,
     resolve_vllm_dp_settings,
+    resolve_vllm_dp_size,
+    resolve_vllm_rank_prefixes,
 )
 
 
@@ -67,6 +69,30 @@ def test_find_tokenizer_required_architectures(architectures, expected):
 )
 def test_resolve_distributed_executor_backend(tp, pp, ep, expected):
     assert resolve_distributed_executor_backend(tp, pp, ep) == expected
+
+
+@pytest.mark.parametrize(("total_workers", "tp", "ep"), [(8, 1, 4), (32, 2, 16)])
+def test_resolve_vllm_rank_prefixes(total_workers, tp, ep):
+    vllm_dp_size = resolve_vllm_dp_size(tp, ep)
+    dp_size = total_workers // tp
+    prefixes = resolve_vllm_rank_prefixes(total_workers, dp_size, vllm_dp_size)
+    rollout_ranks = sorted(
+        prefixes[dp_rank] + dp_rank % vllm_dp_size * tp + tp_rank
+        for dp_rank in range(dp_size)
+        for tp_rank in range(tp)
+    )
+    assert rollout_ranks == list(range(total_workers))
+
+
+@pytest.mark.parametrize(
+    ("total_workers", "dp_size", "vllm_dp_size"),
+    [(0, 8, 4), (-8, 8, 4), (8, 0, 4), (7, 8, 4), (8, 3, 2), (8, 8, 0)],
+)
+def test_resolve_vllm_rank_prefixes_rejects_invalid_topology(
+    total_workers, dp_size, vllm_dp_size
+):
+    with pytest.raises(ValueError, match="Invalid vLLM DP worker topology"):
+        resolve_vllm_rank_prefixes(total_workers, dp_size, vllm_dp_size)
 
 
 @pytest.mark.parametrize(

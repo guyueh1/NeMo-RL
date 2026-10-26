@@ -45,10 +45,35 @@ def resolve_distributed_executor_backend(
 ) -> str | None:
     if tensor_parallel_size * pipeline_parallel_size > 1:
         return "ray"
-    if expert_parallel_size > tensor_parallel_size:
+    if resolve_vllm_dp_size(tensor_parallel_size, expert_parallel_size) > 1:
         # External DP actors already own one GPU each.
         return "uni"
     return None
+
+
+def resolve_vllm_dp_size(tensor_parallel_size: int, expert_parallel_size: int) -> int:
+    """Return the number of DP ranks in one vLLM instance."""
+    if expert_parallel_size <= tensor_parallel_size:
+        return 1
+    return expert_parallel_size // tensor_parallel_size
+
+
+def resolve_vllm_rank_prefixes(
+    total_workers: int, dp_size: int, vllm_dp_size: int
+) -> list[int]:
+    """Return the first rollout worker rank of each vLLM instance."""
+    if (
+        total_workers <= 0
+        or dp_size <= 0
+        or vllm_dp_size <= 0
+        or total_workers % dp_size != 0
+        or dp_size % vllm_dp_size != 0
+    ):
+        raise ValueError("Invalid vLLM DP worker topology")
+    workers_per_instance = total_workers // dp_size * vllm_dp_size
+    return [
+        dp_rank // vllm_dp_size * workers_per_instance for dp_rank in range(dp_size)
+    ]
 
 
 def resolve_data_parallel_local_rank(
@@ -68,7 +93,7 @@ def resolve_vllm_dp_group(
     expert_parallel_size: int,
 ) -> tuple[int, int, int]:
     """Return the vLLM DP size, DP rank, and global leader rank for a worker."""
-    vllm_dp_size = expert_parallel_size // tensor_parallel_size
+    vllm_dp_size = resolve_vllm_dp_size(tensor_parallel_size, expert_parallel_size)
     group_size = vllm_dp_size * tensor_parallel_size * pipeline_parallel_size
     rank_in_group = rank % group_size
     return (

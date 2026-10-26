@@ -65,6 +65,10 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_spec_decode_metrics,
     resolve_generation_worker_cls,
 )
+from nemo_rl.models.generation.vllm.worker_utils import (
+    resolve_vllm_dp_size,
+    resolve_vllm_rank_prefixes,
+)
 from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
@@ -253,7 +257,7 @@ class VllmGeneration(GenerationInterface):
                 "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
                 "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
             )
-        self.vllm_dp_size = self.ep_size // self.tp_size if self.ep_size > 1 else 1
+        self.vllm_dp_size = resolve_vllm_dp_size(self.tp_size, self.ep_size)
         assert self.dp_size % self.vllm_dp_size == 0, (
             f"Data parallel size ({self.dp_size}) must be a multiple of vLLM data parallel size ({self.vllm_dp_size})."
         )
@@ -826,19 +830,10 @@ class VllmGeneration(GenerationInterface):
             else "init_collective"
         )
 
-        # Prepare rank. When using vLLM DP, workers in same vLLM instance but different vLLM DP
-        # ranks have unique ranks, so the rank prefix for same vLLM instance are made the same.
         total_workers = len(self.worker_group.workers)
-        if self.dp_size == 0:
-            raise RuntimeError(
-                "Data parallel size is zero, cannot initialize collective."
-            )
-        workers_per_dp_rank = total_workers // self.dp_size
-        workers_per_vllm_instance = workers_per_dp_rank * self.vllm_dp_size
-        rank_prefix_list = []
-        for dp_rank in range(self.dp_size):
-            vllm_instance_idx = dp_rank // self.vllm_dp_size
-            rank_prefix_list.append(vllm_instance_idx * workers_per_vllm_instance)
+        rank_prefix_list = resolve_vllm_rank_prefixes(
+            total_workers, self.dp_size, self.vllm_dp_size
+        )
 
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(
@@ -997,6 +992,8 @@ class VllmGeneration(GenerationInterface):
         Only leaders are called: each one ``collective_rpc``s into its own TP/PP workers,
         so one Ray call per shard reaches every rank in it.
         """
+        if self.vllm_dp_size > 1:
+            raise RuntimeError("Partial-shard rebuild is not supported with vLLM DP")
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
