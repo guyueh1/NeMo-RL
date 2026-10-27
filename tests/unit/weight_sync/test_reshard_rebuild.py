@@ -169,7 +169,9 @@ class TestPlanRegeneration:
         sync, generation, _, _, _ = _reshard(dp_size=4)
         generation.vllm_dp_size = 2
 
-        with pytest.raises(RuntimeError, match="Partial-shard rebuild is not supported with vLLM DP"):
+        with pytest.raises(
+            RuntimeError, match="Partial-shard rebuild is not supported with vLLM DP"
+        ):
             sync.init_communicator()
 
     def test_the_plan_is_rebuilt_for_the_smaller_fleet(self):
