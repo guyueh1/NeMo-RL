@@ -66,7 +66,7 @@ from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
 )
-from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
@@ -1426,15 +1426,17 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the sampling distribution"
             )
 
-        automodel_cfg = master_config.policy.get("automodel_cfg") or {}
-        if automodel_cfg.get("enabled") and (
-            automodel_cfg["tensor_parallel_size"] > 1
-            or automodel_cfg["context_parallel_size"] > 1
-        ):
-            raise ValueError(
-                "loss_fn.score_centering supports Automodel only with "
-                "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
-            )
+        automodel_cfg = master_config.policy.get("automodel_cfg")
+        if automodel_cfg is not None and automodel_cfg["enabled"]:
+            enabled_automodel_cfg = cast(AutomodelConfig, automodel_cfg)
+            if (
+                enabled_automodel_cfg["tensor_parallel_size"] > 1
+                or enabled_automodel_cfg["context_parallel_size"] > 1
+            ):
+                raise ValueError(
+                    "loss_fn.score_centering supports Automodel only with "
+                    "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+                )
         megatron_cfg = master_config.policy.get("megatron_cfg") or {}
         if megatron_cfg.get("enabled") and megatron_cfg.get(
             "use_fused_linear_logprobs"

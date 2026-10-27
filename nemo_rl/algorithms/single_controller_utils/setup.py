@@ -1116,7 +1116,8 @@ def setup_single_controller(
     # Normalize the optional request count once before partitions/workers start.
     top_logprobs = generation_config.setdefault("top_logprobs", 0)
     if top_logprobs > 0:
-        vllm_kwargs = generation_config.setdefault("vllm_kwargs", {})
+        vllm_config = cast(VllmConfig, generation_config)
+        vllm_kwargs = vllm_config.setdefault("vllm_kwargs", {})
         cap = vllm_kwargs.get("max_logprobs")
         if cap is None or (cap != -1 and cap < top_logprobs):
             vllm_kwargs["max_logprobs"] = top_logprobs
