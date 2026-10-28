@@ -4034,6 +4034,7 @@ def test_sync_vllm_dp_empty_shards_enter_engine_loop():
         }
         worker.tensor_parallel_size = 1
         worker.expert_parallel_size = dp_size
+        worker._native_lora_request = None
         worker.llm = MagicMock()
         worker.llm.generate.side_effect = EngineEntered
         worker.SamplingParams = MagicMock()
@@ -4077,6 +4078,7 @@ def test_sync_vllm_dp_empty_text_shards_enter_engine_loop():
         }
         worker.tensor_parallel_size = 1
         worker.expert_parallel_size = dp_size
+        worker._native_lora_request = None
         worker.llm = MagicMock()
         worker.llm.generate.side_effect = EngineEntered
         worker.SamplingParams = MagicMock()
