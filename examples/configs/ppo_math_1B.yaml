@@ -160,6 +160,10 @@ policy:
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
@@ -292,6 +296,8 @@ policy:
     val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    # LoRA refit representation for vLLM. Use merged only as an explicit opt-in.
+    lora_refit_mode: native
     mcore_generation_config:
       buffer_size_gb: 20
       cuda_graph_sizing_distribution: hybrid
@@ -384,6 +390,10 @@ value:
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
@@ -526,6 +536,7 @@ env:
 logger:
   log_dir: "logs"
   num_val_samples_to_print: 0
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false

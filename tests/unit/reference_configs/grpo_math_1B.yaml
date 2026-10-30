@@ -6,6 +6,10 @@ grpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
+  # Rows that vote in the advantage statistics (group baseline/std, GDPO/Reinforce++
+  # batch normalization, dynamic-sampling admission): include (default) every row,
+  # masked rewards too; exclude only rows with a nonzero loss weight. Loss masks unchanged.
+  masked_reward_policy: include
   use_leave_one_out_baseline: true
   val_period: 10
   val_start_at: -1
@@ -220,6 +224,10 @@ policy:
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
     cuda_graph_impl: "none"
     cuda_graph_modules: []
@@ -442,6 +450,7 @@ policy:
     # mcore for native refit.
     # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
     refit_transport: null
+    lora_refit_mode: native
     worker_extension_cls_fqn: null
     # Keep real-quant export tensors on CPU by default. Set false only for
     # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
@@ -580,6 +589,7 @@ env:
 logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  extra_backends: []
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
