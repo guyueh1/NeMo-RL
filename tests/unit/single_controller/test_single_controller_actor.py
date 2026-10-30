@@ -168,6 +168,7 @@ def _grpo_master_config(tmp_path) -> MasterConfig:
             "generation": {
                 "top_k": None,
                 "top_p": 1.0,
+                "top_logprobs": 0,
                 "colocated": {"enabled": False},
             },
         },
